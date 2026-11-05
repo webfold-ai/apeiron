@@ -3,7 +3,7 @@
 The crate needs Rust 1.89 or later. The default build has no dependencies beyond `libc` on Linux.
 
 ```sh
-git clone https://github.com/sanguinehost/apeiron
+git clone https://github.com/webfold-ai/apeiron
 cd apeiron
 cargo build --lib
 ```

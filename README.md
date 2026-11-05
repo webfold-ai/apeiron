@@ -18,7 +18,7 @@ The default build has no dependencies; Linux adds `libc` for thread affinity. Ru
 ## Use
 
 ```sh
-git clone https://github.com/sanguinehost/apeiron
+git clone https://github.com/webfold-ai/apeiron
 cd apeiron
 cargo build --lib
 ```

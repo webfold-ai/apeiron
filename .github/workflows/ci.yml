@@ -1,5 +1,5 @@
 # GitHub Actions CI workflow for the public release of apeiron.
-# Repository: github.com/sanguinehost/apeiron
+# Repository: github.com/webfold-ai/apeiron
 #
 # The `proof` job rebuilds the pinned Aeneas/Charon toolchain (`proof/bootstrap.sh`), checks the
 # committed extraction against the source (`proof/regen.sh --check`) and builds the Lean bridge

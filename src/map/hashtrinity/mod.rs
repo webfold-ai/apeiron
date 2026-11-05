@@ -185,6 +185,7 @@ mod side;
 use side::SideStore;
 mod overflow;
 use overflow::Overflow;
+mod reduce;
 mod algebra;
 mod freq;
 pub use algebra::*;

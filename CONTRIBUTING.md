@@ -1,5 +1,13 @@
 # Contributing to Sanguine Host
 
+> **This repository is the webfold-ai fork of apeiron.** The original project is
+> [sanguinehost/apeiron](https://github.com/sanguinehost/apeiron), written and run by its author,
+> Lucas "Paperboy" Rose-Winters ([@paperboygold](https://github.com/paperboygold)). He runs that
+> upstream repository and does not contribute to this fork. In this fork the code owner, and the
+> "top maintainer" named in the policy below, is [@yokoszn](https://github.com/yokoszn). Authorship
+> and copyright of the original work stay with Lucas Rose-Winters (see `NOTICE`). The rest of this
+> file is the upstream policy text, kept as published.
+
 Sanguine Host is maintained by Lucas Rose-Winters ([@paperboygold](https://github.com/paperboygold)).
 This policy applies to every repository in the [sanguinehost](https://github.com/sanguinehost)
 organisation. Each repository carries an identical copy of this file, followed by a section headed

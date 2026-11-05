@@ -555,6 +555,21 @@ macro_rules! int_monoid {
 }
 int_monoid!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
 
+macro_rules! float_monoid {
+    ($($t:ty),*) => {$(
+        impl Monoid for $t {
+            #[inline] fn identity() -> Self { 0.0 }
+            #[inline] fn combine(self, other: Self) -> Self { self + other }
+        }
+    )*};
+}
+// Honest scope of the float instance: `+` on floats is commutative but only approximately
+// associative, so a float is not a monoid in the exact sense the integers are. What the count face
+// and `Dense` need is weaker and true: `fuse` is elementwise (one addition per cell, each cell's
+// summands fixed), so no regrouping of one cell's history happens and the result does not depend on
+// the order cells are visited in.
+float_monoid!(f32, f64);
+
 // ── The table faces. Each is one `insert_with` with a fixed merge; the reader returns the identity
 //    on absence. ────────────────────────────────────────────────────────────────────────────────
 

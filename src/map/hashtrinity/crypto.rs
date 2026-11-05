@@ -17,11 +17,22 @@ use crate::map::hashtrinity::hex::ToHex;
 /// since sibling crates (`hashtrinity-webauthn`'s challenge generation) need it too — one RNG read
 /// site for the whole ecosystem, not a re-duplicated `/dev/urandom` open per crate.
 pub fn rand_bytes(n: usize) -> Vec<u8> {
+    try_rand_bytes(n).expect("kernel CSPRNG (/dev/urandom) unavailable")
+}
+
+/// Like [`rand_bytes`], but a missing or unreadable `/dev/urandom` (a sandbox or container without
+/// `/dev`, a restrictive Landlock policy, file-descriptor exhaustion) is an error the caller can
+/// handle or report, not a panic. Key material must never be silently weakened to get past it:
+/// there is no fallback source, and a short read is an error.
+///
+/// There is deliberately no dependency here: `std::random` is unstable, this module is
+/// `forbid(unsafe_code)` so it cannot call `getrandom(2)` itself, and the kernel CSPRNG is
+/// reachable through the one file read below.
+pub fn try_rand_bytes(n: usize) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
-    let mut f = std::fs::File::open("/dev/urandom").expect("open /dev/urandom");
     let mut b = vec![0u8; n];
-    f.read_exact(&mut b).expect("read /dev/urandom");
-    b
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    Ok(b)
 }
 
 mod ed25519 {

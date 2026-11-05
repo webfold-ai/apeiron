@@ -548,8 +548,25 @@ mod ed25519 {
         sig[32..].copy_from_slice(&s);
         sig
     }
+    /// S < L, compared as 256-bit little-endian integers (RFC 8032 section 5.1.7, step 1).
+    fn sc_is_canonical(s: &[u8; 32]) -> bool {
+        let limbs = [
+            u64::from_le_bytes(s[0..8].try_into().unwrap()),
+            u64::from_le_bytes(s[8..16].try_into().unwrap()),
+            u64::from_le_bytes(s[16..24].try_into().unwrap()),
+            u64::from_le_bytes(s[24..32].try_into().unwrap()),
+        ];
+        !ge_u256(&limbs, &L)
+    }
+
     /// Verify a 64-byte signature over `msg` for public key `pk` (RFC 8032). This is iroh's peer-signature check.
+    /// Rejects S >= L: otherwise S + L verifies too, and one signature has two valid encodings.
     pub fn ed25519_verify(pk: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
+        let mut s_bytes = [0u8; 32];
+        s_bytes.copy_from_slice(&sig[32..]);
+        if !sc_is_canonical(&s_bytes) {
+            return false;
+        }
         let a = match ge_frombytes(pk) {
             Some(a) => a,
             None => return false,

@@ -5,6 +5,9 @@
 //! clone and drain. The flood resistance itself is a statement about aimed keys and is measured in
 //! `hashdos`; these tests pin the equivalences the seeded path rests on.
 
+// Test indices are small (< 2^32); wrapping is impossible here.
+#![allow(clippy::cast_possible_wrap)]
+
 use apeiron::map::hashtrinity::{Coord, FoldKey, Table};
 
 #[test]
@@ -52,7 +55,7 @@ fn keyed_coordinates_depend_on_the_secret_and_are_pure() {
     );
     assert_eq!(FoldKey::new(9), FoldKey::new(9));
     assert_eq!(
-        format!("{:?}", a),
+        format!("{a:?}"),
         "FoldKey(..)",
         "the secret is not printed"
     );
@@ -96,7 +99,7 @@ fn seed_survives_growth_clone_and_drain() {
     }
     let c = t.clone();
     assert!(c.is_seeded());
-    assert!(c == t);
+    assert_eq!(c, t);
     let before = t.len();
     let drained: Vec<_> = t.drain().collect();
     assert_eq!(drained.len(), before);

@@ -345,7 +345,8 @@ impl<K: Coord, V, KS: KeyStore<K>> Drop for Table<K, V, KS> {
         }
         // the key store rides the same invariant; internally gated on needs_drop::<K>
         let coords = std::mem::take(&mut self.coords);
-        self.keys.drop_live(&coords);
+        // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+        unsafe { self.keys.drop_live(&coords) };
         // Side entries: `coords` holds reserved markers (never `is_live`), so every entry's key and
         // value is dropped by the side store itself.
         self.side.clear();
@@ -383,12 +384,14 @@ impl<K: Coord + Clone, V: Clone, KS: KeyStore<K>> Clone for Table<K, V, KS> {
         let side = SideStore {
             coords: self.side.coords.clone(),
             vals: side_vals,
-            keys: self.side.keys.clone_live(&side_live_mask),
+            // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+            keys: unsafe { self.side.keys.clone_live(&side_live_mask) },
             cap: self.side.coords.len(),
             _k: std::marker::PhantomData,
         };
         Table {
-            keys: self.keys.clone_live(&self.coords),
+            // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+            keys: unsafe { self.keys.clone_live(&self.coords) },
             coords,
             vals,
             side,
@@ -583,7 +586,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
         let home = self.home(coord);
         // SAFETY: home ∈ [0, len). The home hit reads one coord, confirms the key, then one value.
         let sc = unsafe { *self.coords.get_unchecked(home) };
-        if sc == coord && self.keys.matches(home, coord, k) {
+        // SAFETY: slot is live (the probe matched a live coordinate here).
+        if sc == coord && unsafe { self.keys.matches(home, coord, k) } {
             return Some(unsafe { self.vals.get_unchecked(home).assume_init_ref() });
         }
         // The direct-addressed face (`home == coord`, i.e. a coordinate below the array length) is
@@ -699,7 +703,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
                 unsafe { *self.coords.get_unchecked_mut(i) = TOMB };
                 self.len -= 1;
                 self.tombs += 1;
-                drop(self.keys.take_key(i, coord));
+                // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+                drop(unsafe { self.keys.take_key(i, coord) });
                 Some(old)
             }
             Capped::Vacant(_) => None,
@@ -782,7 +787,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
                 // SAFETY: probe returns an in-bounds EMPTY slot; coords, vals, keys share the index.
                 unsafe { *self.coords.get_unchecked_mut(i) = coord };
                 unsafe { *self.vals.get_unchecked_mut(i) = MaybeUninit::new(new) };
-                self.keys.set(i, k); // Stored: write the key; Regen: no-op
+                // SAFETY: slot is in bounds and vacant (the probe's EMPTY slot), so nothing is dropped.
+                unsafe { self.keys.set(i, k) }; // Stored: write the key; Regen: no-op
                 self.len += 1;
                 None
             }
@@ -877,7 +883,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
                 // SAFETY: probe returns an in-bounds EMPTY slot.
                 unsafe { *self.coords.get_unchecked_mut(i) = coord };
                 unsafe { *self.vals.get_unchecked_mut(i) = MaybeUninit::new(v) };
-                self.keys.set(i, k); // Stored: write the key; Regen: no-op
+                // SAFETY: slot is in bounds and vacant (the probe's EMPTY slot), so nothing is dropped.
+                unsafe { self.keys.set(i, k) }; // Stored: write the key; Regen: no-op
                 self.len += 1;
             }
             Capped::Blocked => {
@@ -937,7 +944,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
             if is_live(c) {
                 // Move the key out first so the keyed probe can confirm it: two distinct keys with
                 // equal coordinates must land on two slots of the rebuilt table, not one.
-                let key = self.keys.take_key(i, c);
+                // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+                let key = unsafe { self.keys.take_key(i, c) };
                 // SAFETY: live coord ⇒ value initialized. Move the value out and blank the source
                 // coord so the old table's Drop skips it.
                 let v = unsafe { self.vals.get_unchecked_mut(i).assume_init_read() };
@@ -1038,7 +1046,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
         let home = self.home(coord);
         // SAFETY: home ∈ [0, len).
         let sc = unsafe { *self.coords.get_unchecked(home) };
-        if sc == coord && self.keys.matches(home, coord, k) {
+        // SAFETY: slot is live (the probe matched a live coordinate here).
+        if sc == coord && unsafe { self.keys.matches(home, coord, k) } {
             return Some(unsafe { self.vals.get_unchecked(home).assume_init_ref() });
         }
         if sc == EMPTY {

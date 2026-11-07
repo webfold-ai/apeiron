@@ -263,14 +263,14 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
             Pick::Main(i) => {
                 let c = self.coords[i];
                 // SAFETY: the argmin ranged over occupied slots only ⇒ value initialized.
-                (self.keys.key(i, c), unsafe {
+                (unsafe { self.keys.key(i, c) }, unsafe {
                     self.vals.get_unchecked(i).assume_init_ref()
                 })
             }
             Pick::Side(i) => {
                 let c = self.side.coords[i];
                 // SAFETY: a side entry is occupied ⇒ value initialized.
-                (self.side.keys.key(i, c), unsafe {
+                (unsafe { self.side.keys.key(i, c) }, unsafe {
                     self.side.vals.get_unchecked(i).assume_init_ref()
                 })
             }

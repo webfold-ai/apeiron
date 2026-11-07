@@ -50,15 +50,18 @@ impl<K: Coord, V, KS: KeyStore<K>> SideStore<K, V, KS> {
             let mut i = 0;
             while i < self.coords.len() {
                 let c = self.coords[i];
-                let key = self.keys.take_key(i, c);
-                grown.set(i, key);
+                // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+                let key = unsafe { self.keys.take_key(i, c) };
+                // SAFETY: slot is in bounds and vacant (the probe's EMPTY slot), so nothing is dropped.
+                unsafe { grown.set(i, key) };
                 i += 1;
             }
             self.keys = grown;
             self.cap = new_cap;
         }
         let i = self.coords.len();
-        self.keys.set(i, k);
+        // SAFETY: slot is in bounds and vacant (the probe's EMPTY slot), so nothing is dropped.
+        unsafe { self.keys.set(i, k) };
         self.coords.push(coord);
         self.vals.push(MaybeUninit::new(v));
     }
@@ -69,7 +72,8 @@ impl<K: Coord, V, KS: KeyStore<K>> SideStore<K, V, KS> {
     pub(super) fn find(&self, coord: u64, k: &K) -> Option<usize> {
         let mut i = 0;
         while i < self.coords.len() {
-            if self.coords[i] == coord && self.keys.matches(i, coord, k) {
+            // SAFETY: slot is live (the probe matched a live coordinate here).
+            if self.coords[i] == coord && unsafe { self.keys.matches(i, coord, k) } {
                 return Some(i);
             }
             i += 1;
@@ -80,11 +84,14 @@ impl<K: Coord, V, KS: KeyStore<K>> SideStore<K, V, KS> {
     /// Remove entry `i`; its value must already have been moved out by the caller. The removed key is
     /// dropped, and the last entry is swapped into `i` — its key explicitly, since `KS` has no swap.
     pub(super) fn remove_entry(&mut self, i: usize) {
-        let gone = self.keys.take_key(i, self.coords[i]);
+        // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+        let gone = unsafe { self.keys.take_key(i, self.coords[i]) };
         let last = self.coords.len() - 1;
         if i != last {
-            let moved = self.keys.take_key(last, self.coords[last]);
-            self.keys.set(i, moved);
+            // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+            let moved = unsafe { self.keys.take_key(last, self.coords[last]) };
+            // SAFETY: slot is in bounds and vacant (the probe's EMPTY slot), so nothing is dropped.
+            unsafe { self.keys.set(i, moved) };
             self.coords.swap(i, last);
             self.vals.swap(i, last);
         }
@@ -99,12 +106,14 @@ impl<K: Coord, V, KS: KeyStore<K>> SideStore<K, V, KS> {
     pub(super) fn take_entry(&mut self, i: usize) -> (u64, K, V) {
         let c = self.coords[i];
         // SAFETY: entry `i` is occupied ⇒ its key and value are initialized.
-        let key = self.keys.take_key(i, c);
+        let key = unsafe { self.keys.take_key(i, c) };
         let val = unsafe { self.vals.get_unchecked_mut(i).assume_init_read() };
         let last = self.coords.len() - 1;
         if i != last {
-            let moved = self.keys.take_key(last, self.coords[last]);
-            self.keys.set(i, moved);
+            // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+            let moved = unsafe { self.keys.take_key(last, self.coords[last]) };
+            // SAFETY: slot is in bounds and vacant (the probe's EMPTY slot), so nothing is dropped.
+            unsafe { self.keys.set(i, moved) };
         }
         self.coords.swap(i, last);
         self.vals.swap(i, last);
@@ -135,7 +144,8 @@ impl<K: Coord, V, KS: KeyStore<K>> SideStore<K, V, KS> {
         let mut i = 0;
         while i < coords.len() {
             let c = coords[i];
-            drop(self.keys.take_key(i, c));
+            // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+            drop(unsafe { self.keys.take_key(i, c) });
             i += 1;
         }
     }
@@ -202,7 +212,8 @@ impl<K: Coord, V, KS: KeyStore<K>> Drop for MergeGuard<'_, K, V, KS> {
         match self.store {
             Store::Main => {
                 // The slot is already `TOMB` and its value is gone; drop the key it still holds.
-                drop(t.keys.take_key(self.slot, self.coord));
+                // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+                drop(unsafe { t.keys.take_key(self.slot, self.coord) });
                 t.len -= 1;
                 t.tombs += 1;
             }

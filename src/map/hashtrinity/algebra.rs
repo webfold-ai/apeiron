@@ -96,9 +96,13 @@ pub trait KeyStore<K: Coord>: Sized {
     /// Allocate a store for `n` slots.
     fn alloc(n: usize) -> Self;
     /// Record slot `i`'s key (Stored: keep it; Regen: a no-op — the address carries it).
-    fn set(&mut self, i: usize, k: K);
+    /// # Safety
+    /// `i` is in bounds and slot `i` is not live (a value there would be overwritten undropped).
+    unsafe fn set(&mut self, i: usize, k: K);
     /// Whether slot `i` holds key `q` (an exact compare; trivially true on the Regen path).
-    fn matches(&self, i: usize, coord: u64, q: &K) -> bool;
+    /// # Safety
+    /// Slot `i` is in bounds and live.
+    unsafe fn matches(&self, i: usize, coord: u64, q: &K) -> bool;
     /// Run `f` on a reference to slot `i`'s key (borrowed if stored, regenerated if not). The
     /// key-borrowing face the exact comparisons use without taking ownership of the key.
     ///
@@ -106,19 +110,29 @@ pub trait KeyStore<K: Coord>: Sized {
     /// Slot `i` must be live.
     unsafe fn with_key<R>(&self, i: usize, coord: u64, f: impl FnOnce(&K) -> R) -> R;
     /// Move slot `i`'s key into slot `j` of `dst` (used while growing).
-    fn migrate(&mut self, i: usize, dst: &mut Self, j: usize);
+    /// # Safety
+    /// Slot `i` of `self` is live and the caller stops treating it as live afterwards; `j` is in
+    /// bounds of `dst` and not live there.
+    unsafe fn migrate(&mut self, i: usize, dst: &mut Self, j: usize);
     /// Move slot `i`'s key out (Stored: take it; Regen: regenerate it).
-    fn take_key(&mut self, i: usize, coord: u64) -> K;
+    /// # Safety
+    /// Slot `i` is live; the caller blanks its coordinate, so the key is not read or dropped again.
+    unsafe fn take_key(&mut self, i: usize, coord: u64) -> K;
     /// Clone the LIVE keys (`is_live(coords[i])` — excludes `EMPTY` and a removed slot's `TOMB`)
     /// into a fresh store. Liveness is the caller's coordinate line — the store carries no
     /// discriminant of its own (see [`Stored`]).
     #[must_use]
-    fn clone_live(&self, coords: &[u64]) -> Self
+    /// # Safety
+    /// `coords.len()` does not exceed the store's slot count, and `coords[i]` is live exactly where
+    /// slot `i`'s key is initialized.
+    unsafe fn clone_live(&self, coords: &[u64]) -> Self
     where
         K: Clone;
     /// Drop the LIVE keys. Called by `Table`'s `Drop`; a no-op when `K` has no destructor or
     /// nothing is stored.
-    fn drop_live(&mut self, coords: &[u64]);
+    /// # Safety
+    /// As [`clone_live`](Self::clone_live); the keys are dropped, so they are not read again.
+    unsafe fn drop_live(&mut self, coords: &[u64]);
 }
 
 /// Key readback — the borrowed/owned key projection, split off [`KeyStore`] so the storage trait
@@ -136,7 +150,9 @@ pub trait KeyReadout<K: Coord>: KeyStore<K> {
         Self: 'a,
         K: 'a;
     /// The key at slot `i` — borrowed if stored, regenerated from `coord` if not.
-    fn key(&self, i: usize, coord: u64) -> Self::Key<'_>;
+    /// # Safety
+    /// Slot `i` is in bounds and live.
+    unsafe fn key(&self, i: usize, coord: u64) -> Self::Key<'_>;
     /// The readout of an already-materialized key `k` — the [`Overflow`](crate::map::hashtrinity::Overflow)
     /// tree stores keys inline rather than in the index-addressed store, so its iteration projects
     /// a key it holds directly. `&K` when stored; regenerated from the key's
@@ -147,7 +163,9 @@ pub trait KeyReadout<K: Coord>: KeyStore<K> {
         K: 'a;
     /// Whether the key at slot `i` is exactly the key a borrowed [`Locate`] view names. The borrowed
     /// faces' full-key confirmation — the twin of [`KeyStore::matches`], which takes an owned `&K`.
-    fn matches_locate<Q>(&self, i: usize, coord: u64, q: &Q) -> bool
+    /// # Safety
+    /// Slot `i` is in bounds and live.
+    unsafe fn matches_locate<Q>(&self, i: usize, coord: u64, q: &Q) -> bool
     where
         K: Eq,
         Q: Locate<K>;
@@ -180,12 +198,12 @@ impl<K: Coord + Eq> KeyStore<K> for Stored<K> {
         Stored(alloc_uninit_boxed(n))
     }
     #[inline]
-    fn set(&mut self, i: usize, k: K) {
+    unsafe fn set(&mut self, i: usize, k: K) {
         // only ever called on a previously-EMPTY slot — nothing to drop
         unsafe { *self.0.get_unchecked_mut(i) = MaybeUninit::new(k) };
     }
     #[inline]
-    fn matches(&self, i: usize, _coord: u64, q: &K) -> bool {
+    unsafe fn matches(&self, i: usize, _coord: u64, q: &K) -> bool {
         // When `coord` is injective, `coords[i] == q.coord()` (the caller's precondition) already
         // implies `self.0[i] == q`, so the stored-key load is redundant and is skipped. The branch
         // is on a const, so it folds away per `K` — no cost on the opaque-key path.
@@ -201,7 +219,7 @@ impl<K: Coord + Eq> KeyStore<K> for Stored<K> {
         f(unsafe { self.0.get_unchecked(i).assume_init_ref() })
     }
     #[inline]
-    fn migrate(&mut self, i: usize, dst: &mut Self, j: usize) {
+    unsafe fn migrate(&mut self, i: usize, dst: &mut Self, j: usize) {
         // SAFETY: src occupied ⇒ initialized; the caller blanks src's coord, so src's Drop skips it.
         unsafe {
             *dst.0.get_unchecked_mut(j) =
@@ -209,11 +227,11 @@ impl<K: Coord + Eq> KeyStore<K> for Stored<K> {
         };
     }
     #[inline]
-    fn take_key(&mut self, i: usize, _coord: u64) -> K {
+    unsafe fn take_key(&mut self, i: usize, _coord: u64) -> K {
         // SAFETY: occupied ⇒ initialized; the caller blanks the coord, so Drop skips it.
         unsafe { self.0.get_unchecked_mut(i).assume_init_read() }
     }
-    fn clone_live(&self, coords: &[u64]) -> Self
+    unsafe fn clone_live(&self, coords: &[u64]) -> Self
     where
         K: Clone,
     {
@@ -232,7 +250,7 @@ impl<K: Coord + Eq> KeyStore<K> for Stored<K> {
         }
         out
     }
-    fn drop_live(&mut self, coords: &[u64]) {
+    unsafe fn drop_live(&mut self, coords: &[u64]) {
         if std::mem::needs_drop::<K>() {
             let mut i = 0usize;
             while i < coords.len() {
@@ -254,7 +272,7 @@ impl<K: Coord + Eq> KeyReadout<K> for Stored<K> {
     where
         K: 'a;
     #[inline]
-    fn key(&self, i: usize, _coord: u64) -> &K {
+    unsafe fn key(&self, i: usize, _coord: u64) -> &K {
         // SAFETY: only called on an occupied slot — the invariant says initialized.
         unsafe { self.0.get_unchecked(i).assume_init_ref() }
     }
@@ -267,7 +285,7 @@ impl<K: Coord + Eq> KeyReadout<K> for Stored<K> {
         k
     }
     #[inline]
-    fn matches_locate<Q: Locate<K>>(&self, i: usize, coord: u64, q: &Q) -> bool {
+    unsafe fn matches_locate<Q: Locate<K>>(&self, i: usize, coord: u64, q: &Q) -> bool {
         q.same(self.key(i, coord))
     }
 }
@@ -284,9 +302,9 @@ impl<K: CoordInv + Eq> KeyStore<K> for Regen<K> {
         Regen(std::marker::PhantomData)
     }
     #[inline]
-    fn set(&mut self, _i: usize, _k: K) {} // the address is the key — nothing to store
+    unsafe fn set(&mut self, _i: usize, _k: K) {} // the address is the key — nothing to store
     #[inline]
-    fn matches(&self, _i: usize, _coord: u64, _q: &K) -> bool {
+    unsafe fn matches(&self, _i: usize, _coord: u64, _q: &K) -> bool {
         // `CoordInv` round-trips (`from_coord(k.coord()) == k`), so whenever this runs with
         // `coords[i] == coord` and `q.coord() == coord` — every caller's precondition — the key at
         // slot `i` IS `q`, and the compare is redundant. This is the same redundancy [`Stored`] skips
@@ -300,20 +318,20 @@ impl<K: CoordInv + Eq> KeyStore<K> for Regen<K> {
         f(&K::from_coord(coord))
     }
     #[inline]
-    fn migrate(&mut self, _i: usize, _dst: &mut Self, _j: usize) {} // regenerated in the new table
+    unsafe fn migrate(&mut self, _i: usize, _dst: &mut Self, _j: usize) {} // regenerated in the new table
     #[inline]
-    fn take_key(&mut self, _i: usize, coord: u64) -> K {
+    unsafe fn take_key(&mut self, _i: usize, coord: u64) -> K {
         K::from_coord(coord)
     }
     #[inline]
-    fn clone_live(&self, _coords: &[u64]) -> Self
+    unsafe fn clone_live(&self, _coords: &[u64]) -> Self
     where
         K: Clone,
     {
         Regen(std::marker::PhantomData) // nothing stored, nothing to clone
     }
     #[inline]
-    fn drop_live(&mut self, _coords: &[u64]) {} // nothing stored, nothing to drop
+    unsafe fn drop_live(&mut self, _coords: &[u64]) {} // nothing stored, nothing to drop
 }
 
 impl<K: CoordInv + Eq> KeyReadout<K> for Regen<K> {
@@ -322,7 +340,7 @@ impl<K: CoordInv + Eq> KeyReadout<K> for Regen<K> {
     where
         K: 'a;
     #[inline]
-    fn key(&self, _i: usize, coord: u64) -> K {
+    unsafe fn key(&self, _i: usize, coord: u64) -> K {
         K::from_coord(coord)
     }
     #[inline]
@@ -335,7 +353,7 @@ impl<K: CoordInv + Eq> KeyReadout<K> for Regen<K> {
         K::from_coord(k.coord())
     }
     #[inline]
-    fn matches_locate<Q: Locate<K>>(&self, _i: usize, coord: u64, q: &Q) -> bool {
+    unsafe fn matches_locate<Q: Locate<K>>(&self, _i: usize, coord: u64, q: &Q) -> bool {
         q.same(&self.key(_i, coord))
     }
 }
@@ -671,7 +689,8 @@ impl<K: Eq + Coord, KS: KeyStore<K>> Table<K, i64, KS> {
             Capped::Vacant(i) => {
                 unsafe { *self.coords.get_unchecked_mut(i) = coord };
                 unsafe { *self.vals.get_unchecked_mut(i) = MaybeUninit::new(v) };
-                self.keys.set(i, k);
+                // SAFETY: slot is in bounds and vacant (the probe's EMPTY slot), so nothing is dropped.
+                unsafe { self.keys.set(i, k) };
                 self.len += 1;
             }
             Capped::Blocked => {
@@ -871,7 +890,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
                 // `other`'s Drop skips it (and any remaining slots still drop once if `f` panics).
                 let v = unsafe { other.vals.get_unchecked_mut(i).assume_init_read() };
                 other.coords[i] = EMPTY;
-                let k = other.keys.take_key(i, c); // Stored: move; Regen: regenerate
+                // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+                let k = unsafe { other.keys.take_key(i, c) }; // Stored: move; Regen: regenerate
                 self.insert_with(k, v, &mut f);
             }
         }

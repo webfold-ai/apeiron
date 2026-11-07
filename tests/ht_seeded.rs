@@ -54,11 +54,7 @@ fn keyed_coordinates_depend_on_the_secret_and_are_pure() {
         "halves enter separately"
     );
     assert_eq!(FoldKey::new(9), FoldKey::new(9));
-    assert_eq!(
-        format!("{a:?}"),
-        "FoldKey(..)",
-        "the secret is not printed"
-    );
+    assert_eq!(format!("{a:?}"), "FoldKey(..)", "the secret is not printed");
 }
 
 #[test]

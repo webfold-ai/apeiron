@@ -488,21 +488,6 @@ impl<K: Coord, V> Overflow<K, V> {
         Some(self.take_entry(n, e).1)
     }
 
-    /// Whether any entry at `coord` has value equal to `value` — the `PartialEq` scan.
-    pub(super) fn contains_value(&self, coord: u64, value: &V) -> bool
-    where
-        V: PartialEq,
-    {
-        let n = self.find_node(coord);
-        if n == NIL {
-            return false;
-        }
-        self.nodes[n as usize]
-            .entries
-            .iter()
-            .any(|(_, v)| v.as_ref() == Some(value))
-    }
-
     /// Every live entry in node-key order, as `(coordinate, &key, &value)`.
     pub(super) fn iter(&self) -> impl Iterator<Item = (u64, &K, &V)> + '_ {
         let mut order = Vec::new();
@@ -824,34 +809,6 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
         // The insert path keeps the out-of-line full probe: it has not scanned the window, and the
         // inlined read fast path must not be duplicated into every insert loop.
         self.probe_capped_cold(coord, home, &ByKey { coord, k })
-    }
-
-    /// Whether this table holds `value` at `coord`, by coordinate: a live primary slot with
-    /// `coord == c` and an equal value, or an overflow entry at `c` with an equal value.
-    /// Coordinate-only — equal coordinates conflate, exactly as the pre-overflow comparison did.
-    pub(super) fn holds_value_at(&self, coord: u64, value: &V) -> bool
-    where
-        V: PartialEq,
-    {
-        let limit = self.probe_limit();
-        let mut i = self.home(coord);
-        let mut j = 0u32;
-        loop {
-            // SAFETY: i ∈ [0, len) — home()/descend() mask to the array; `sc == coord` names a live
-            // slot whose value is initialized.
-            let sc = unsafe { *self.coords.get_unchecked(i) };
-            if sc == coord && unsafe { self.vals.get_unchecked(i).assume_init_ref() } == value {
-                return true;
-            }
-            if sc == EMPTY || j + 1 >= limit {
-                break;
-            }
-            j += 1;
-            i = self.descend(coord, j);
-        }
-        self.overflow
-            .as_ref()
-            .is_some_and(|o| o.contains_value(coord, value))
     }
 
     /// Worst-case probe length, in steps. Coordinate keys: **1** (address = key, nothing to flood).

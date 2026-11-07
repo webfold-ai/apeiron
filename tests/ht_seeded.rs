@@ -11,7 +11,10 @@ use apeiron::map::hashtrinity::{Coord, FoldKey, Table};
 fn seeded_table_is_exact_on_coordinate_colliding_keys() {
     // 300 u128 keys that all share the unkeyed coordinate 7 (`lo ^ hi == 7`).
     let keys: Vec<u128> = (0..300u128).map(|i| (i << 64) | (i ^ 7)).collect();
-    assert!(keys.iter().all(|k| k.coord() == 7), "premise: unkeyed collision");
+    assert!(
+        keys.iter().all(|k| k.coord() == 7),
+        "premise: unkeyed collision"
+    );
     let mut t: Table<u128, i64> = Table::with_random_seed();
     assert!(t.is_seeded());
     for (i, k) in keys.iter().enumerate() {
@@ -30,13 +33,29 @@ fn seeded_table_is_exact_on_coordinate_colliding_keys() {
 fn keyed_coordinates_depend_on_the_secret_and_are_pure() {
     let (a, b) = (FoldKey::new(1), FoldKey::new(2));
     let s: &str = "a longer byte string than eight";
-    assert_eq!(s.coord_keyed(a), s.coord_keyed(a), "pure in (key, fold key)");
-    assert_ne!(s.coord_keyed(a), s.coord_keyed(b), "a different secret moves the coordinate");
+    assert_eq!(
+        s.coord_keyed(a),
+        s.coord_keyed(a),
+        "pure in (key, fold key)"
+    );
+    assert_ne!(
+        s.coord_keyed(a),
+        s.coord_keyed(b),
+        "a different secret moves the coordinate"
+    );
     // `k0 == k1` would make the two halves symmetric; use a key that is not.
     let n = FoldKey::new(0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210);
-    assert_ne!(5u128.coord_keyed(n), (5u128 << 64).coord_keyed(n), "halves enter separately");
+    assert_ne!(
+        5u128.coord_keyed(n),
+        (5u128 << 64).coord_keyed(n),
+        "halves enter separately"
+    );
     assert_eq!(FoldKey::new(9), FoldKey::new(9));
-    assert_eq!(format!("{:?}", a), "FoldKey(..)", "the secret is not printed");
+    assert_eq!(
+        format!("{:?}", a),
+        "FoldKey(..)",
+        "the secret is not printed"
+    );
 }
 
 #[test]
@@ -55,8 +74,15 @@ fn seeded_borrowed_reads_match_owned_keys() {
 
     let mut p: Table<(String, String), i64> = Table::with_seed(FoldKey::new(7));
     p.put(("alpha-beta-gamma".into(), "delta".into()), 42);
-    assert_eq!(p.get_at(("alpha-beta-gamma", "delta")), Some(&42), "tuple view");
-    assert_eq!(p.get(&("alpha-beta-gamma".into(), "delta".into())), Some(&42));
+    assert_eq!(
+        p.get_at(("alpha-beta-gamma", "delta")),
+        Some(&42),
+        "tuple view"
+    );
+    assert_eq!(
+        p.get(&("alpha-beta-gamma".into(), "delta".into())),
+        Some(&42)
+    );
 }
 
 #[test]

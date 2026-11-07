@@ -50,9 +50,9 @@ impl<K: Coord, V, KS: KeyStore<K>> SideStore<K, V, KS> {
             let mut i = 0;
             while i < self.coords.len() {
                 let c = self.coords[i];
-                // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+                // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
                 let key = unsafe { self.keys.take_key(i, c) };
-                // SAFETY: slot is in bounds and vacant (the probe's EMPTY slot), so nothing is dropped.
+                // SAFETY: the slot is in bounds and not live, so no initialized key is overwritten.
                 unsafe { grown.set(i, key) };
                 i += 1;
             }
@@ -60,7 +60,7 @@ impl<K: Coord, V, KS: KeyStore<K>> SideStore<K, V, KS> {
             self.cap = new_cap;
         }
         let i = self.coords.len();
-        // SAFETY: slot is in bounds and vacant (the probe's EMPTY slot), so nothing is dropped.
+        // SAFETY: the slot is in bounds and not live, so no initialized key is overwritten.
         unsafe { self.keys.set(i, k) };
         self.coords.push(coord);
         self.vals.push(MaybeUninit::new(v));
@@ -72,7 +72,7 @@ impl<K: Coord, V, KS: KeyStore<K>> SideStore<K, V, KS> {
     pub(super) fn find(&self, coord: u64, k: &K) -> Option<usize> {
         let mut i = 0;
         while i < self.coords.len() {
-            // SAFETY: slot is live (the probe matched a live coordinate here).
+            // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
             if self.coords[i] == coord && unsafe { self.keys.matches(i, coord, k) } {
                 return Some(i);
             }
@@ -84,13 +84,13 @@ impl<K: Coord, V, KS: KeyStore<K>> SideStore<K, V, KS> {
     /// Remove entry `i`; its value must already have been moved out by the caller. The removed key is
     /// dropped, and the last entry is swapped into `i` — its key explicitly, since `KS` has no swap.
     pub(super) fn remove_entry(&mut self, i: usize) {
-        // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+        // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
         let gone = unsafe { self.keys.take_key(i, self.coords[i]) };
         let last = self.coords.len() - 1;
         if i != last {
-            // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+            // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
             let moved = unsafe { self.keys.take_key(last, self.coords[last]) };
-            // SAFETY: slot is in bounds and vacant (the probe's EMPTY slot), so nothing is dropped.
+            // SAFETY: the slot is in bounds and not live, so no initialized key is overwritten.
             unsafe { self.keys.set(i, moved) };
             self.coords.swap(i, last);
             self.vals.swap(i, last);
@@ -110,9 +110,9 @@ impl<K: Coord, V, KS: KeyStore<K>> SideStore<K, V, KS> {
         let val = unsafe { self.vals.get_unchecked_mut(i).assume_init_read() };
         let last = self.coords.len() - 1;
         if i != last {
-            // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+            // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
             let moved = unsafe { self.keys.take_key(last, self.coords[last]) };
-            // SAFETY: slot is in bounds and vacant (the probe's EMPTY slot), so nothing is dropped.
+            // SAFETY: the slot is in bounds and not live, so no initialized key is overwritten.
             unsafe { self.keys.set(i, moved) };
         }
         self.coords.swap(i, last);
@@ -144,7 +144,7 @@ impl<K: Coord, V, KS: KeyStore<K>> SideStore<K, V, KS> {
         let mut i = 0;
         while i < coords.len() {
             let c = coords[i];
-            // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+            // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
             drop(unsafe { self.keys.take_key(i, c) });
             i += 1;
         }
@@ -212,7 +212,7 @@ impl<K: Coord, V, KS: KeyStore<K>> Drop for MergeGuard<'_, K, V, KS> {
         match self.store {
             Store::Main => {
                 // The slot is already `TOMB` and its value is gone; drop the key it still holds.
-                // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+                // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
                 drop(unsafe { t.keys.take_key(self.slot, self.coord) });
                 t.len -= 1;
                 t.tombs += 1;

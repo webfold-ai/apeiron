@@ -799,7 +799,7 @@ impl<K: Eq + Coord, KS: KeyStore<K>> Table<K, i64, KS> {
             Capped::Vacant(i) => {
                 unsafe { *self.coords.get_unchecked_mut(i) = coord };
                 unsafe { *self.vals.get_unchecked_mut(i) = MaybeUninit::new(v) };
-                // SAFETY: slot is in bounds and vacant (the probe's EMPTY slot), so nothing is dropped.
+                // SAFETY: the slot is in bounds and not live, so no initialized key is overwritten.
                 unsafe { self.keys.set(i, k) };
                 self.len += 1;
             }
@@ -1000,7 +1000,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
                 // `other`'s Drop skips it (and any remaining slots still drop once if `f` panics).
                 let v = unsafe { other.vals.get_unchecked_mut(i).assume_init_read() };
                 other.coords[i] = EMPTY;
-                // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+                // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
                 let k = unsafe { other.keys.take_key(i, c) }; // Stored: move; Regen: regenerate
                 self.insert_with(k, v, &mut f);
             }

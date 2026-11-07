@@ -230,9 +230,9 @@ impl<'a, K: Coord + Eq, V, KS: KeyStore<K>> OccupiedEntry<'a, K, V, KS> {
         KS: KeyReadout<K>,
     {
         match self.store {
-            // SAFETY: slot is live (the probe matched a live coordinate here).
+            // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
             Store::Side => unsafe { self.t.side.keys.key(self.slot, self.coord) },
-            // SAFETY: slot is live (the probe matched a live coordinate here).
+            // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
             Store::Main => unsafe { self.t.keys.key(self.slot, self.coord) },
             Store::Overflow => {
                 let ov = self.t.overflow.as_ref().expect("overflow entry ⇒ store present");
@@ -339,7 +339,7 @@ impl<'a, K: Coord + Eq, V, KS: KeyStore<K>> OccupiedEntry<'a, K, V, KS> {
                 // the slot's value is now uninitialized and `TOMB` fails the liveness test, so
                 // Drop/Clone/iter skip it — no double free, and the chain past it stays intact.
                 let v = unsafe { self.t.vals.get_unchecked_mut(i).assume_init_read() };
-                // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+                // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
                 let k = unsafe { self.t.keys.take_key(i, c) };
                 unsafe { *self.t.coords.get_unchecked_mut(i) = TOMB };
                 self.t.len -= 1;
@@ -385,7 +385,7 @@ impl<'a, K: Coord + Eq, V, KS: KeyStore<K>> VacantEntry<'a, K, V, KS> {
                 // current arrays; nothing between here and there can panic.
                 unsafe { *self.t.coords.get_unchecked_mut(i) = c };
                 unsafe { *self.t.vals.get_unchecked_mut(i) = MaybeUninit::new(v) };
-                // SAFETY: slot is in bounds and vacant (the probe's EMPTY slot), so nothing is dropped.
+                // SAFETY: the slot is in bounds and not live, so no initialized key is overwritten.
                 unsafe { self.t.keys.set(i, self.key) }; // Stored: write the key; Regen: no-op
                 self.t.len += 1;
                 // SAFETY: just written ⇒ initialized.
@@ -759,7 +759,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
                 // SAFETY: `grow_for_one` ran, so `i` is an EMPTY slot in the current arrays.
                 unsafe { *self.coords.get_unchecked_mut(i) = coord };
                 unsafe { *self.vals.get_unchecked_mut(i) = MaybeUninit::new(new) };
-                // SAFETY: slot is in bounds and vacant (the probe's EMPTY slot), so nothing is dropped.
+                // SAFETY: the slot is in bounds and not live, so no initialized key is overwritten.
                 unsafe { self.keys.set(i, key) };
                 self.len += 1;
                 // SAFETY: just written ⇒ initialized.
@@ -805,7 +805,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
                 unsafe { *self.coords.get_unchecked_mut(i) = TOMB };
                 self.len -= 1;
                 self.tombs += 1;
-                // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+                // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
                 drop(unsafe { self.keys.take_key(i, coord) });
                 Some(old)
             }
@@ -829,7 +829,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
             let i = self.side.find(coord, k)?;
             // SAFETY: `find` returns an occupied side entry ⇒ key and value initialized.
             return Some((
-                // SAFETY: slot is live (the probe matched a live coordinate here).
+                // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
                 unsafe { self.side.keys.key(i, coord) },
                 unsafe { self.side.vals.get_unchecked(i).assume_init_ref() },
             ));
@@ -972,7 +972,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
         let side_it = s_vals
             .iter_mut()
             .enumerate()
-            // SAFETY: slot is live (the probe matched a live coordinate here).
+            // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
             .map(move |(i, v)| {
                 (unsafe { s_keys.key(i, s_coords[i]) }, unsafe {
                     v.assume_init_mut()
@@ -1001,7 +1001,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
             }
             let alive = {
                 // Disjoint field borrows: the key store is read, the value array is written.
-                // SAFETY: slot is live (the probe matched a live coordinate here).
+                // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
                 let k = unsafe { self.keys.key(i, c) };
                 // SAFETY: live coord ⇒ value initialized.
                 let v = unsafe { self.vals.get_unchecked_mut(i).assume_init_mut() };
@@ -1016,7 +1016,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
                 self.coords[i] = TOMB;
                 self.len -= 1;
                 self.tombs += 1;
-                // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+                // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
                 drop(unsafe { self.keys.take_key(i, c) });
                 drop(old);
             }
@@ -1026,7 +1026,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
         while i < self.side.coords.len() {
             let c = self.side.coords[i];
             let alive = {
-                // SAFETY: slot is live (the probe matched a live coordinate here).
+                // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
                 let k = unsafe { self.side.keys.key(i, c) };
                 // SAFETY: side entries are occupied ⇒ value initialized.
                 let v = unsafe { self.side.vals.get_unchecked_mut(i).assume_init_mut() };
@@ -1076,7 +1076,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
                     }
                     if drop_k {
                         // The key store rides the same liveness line; its destructor may panic.
-                        // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+                        // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
                         drop(unsafe { self.keys.take_key(i, c) });
                     }
                 } else {
@@ -1126,7 +1126,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     {
         let mut i = 0;
         while i < self.side.coords.len() {
-            // SAFETY: slot is live (the probe matched a live coordinate here).
+            // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
             if self.side.coords[i] == coord && unsafe { self.side.keys.matches_locate(i, coord, q) } {
                 return Some(i);
             }
@@ -1168,7 +1168,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
         let home = self.home(coord);
         // SAFETY: home ∈ [0, len).
         let sc = unsafe { *self.coords.get_unchecked(home) };
-        // SAFETY: slot is live (the probe matched a live coordinate here).
+        // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
         if sc == coord && unsafe { self.keys.matches_locate(home, coord, q) } {
             return Capped::Hit(home);
         }
@@ -1354,7 +1354,7 @@ where
             // SAFETY: `step` only yields in-bounds live lanes ⇒ this slot's value (and, for
             // `Stored`, its key) is initialized, and the index needs no bounds check.
             let c = unsafe { *t.coords.get_unchecked(i) };
-            // SAFETY: slot is live (the probe matched a live coordinate here).
+            // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
             return Some((unsafe { t.keys.key(i, c) }, unsafe {
                 t.vals.get_unchecked(i).assume_init_ref()
             }));
@@ -1427,7 +1427,7 @@ impl<K: Coord + Eq, V, KS: KeyStore<K>> Iterator for IntoIter<K, V, KS> {
             // SAFETY: a live lane ⇒ value and (for Stored) key initialized. Both are moved out
             // exactly once, then the slot is blanked so this iterator's Drop skips it.
             let v = unsafe { self.vals.get_unchecked_mut(i).assume_init_read() };
-            // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+            // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
             let k = unsafe { self.keys.take_key(i, c) };
             self.coords[i] = EMPTY;
             return Some((k, v));
@@ -1454,7 +1454,7 @@ impl<K: Coord + Eq, V, KS: KeyStore<K>> Drop for IntoIter<K, V, KS> {
             }
         }
         let coords = std::mem::take(&mut self.coords);
-        // SAFETY: slot is live (its coordinate is checked above); the caller stops using it afterwards.
+        // SAFETY: the slot is live, so its key is initialized (see `KeyStore`).
         unsafe { self.keys.drop_live(&coords) };
         // `self.side` / `self.overflow` are Vec iterators; their remaining `(K, V)` pairs drop
         // themselves.
@@ -1539,7 +1539,7 @@ impl<'a, K: Eq + Coord, KS: KeyReadout<K>, Q: Locate<K>> super::overflow::Confir
 {
     #[inline]
     fn confirm(&self, keys: &KS, i: usize) -> bool {
-        // SAFETY: slot is live (the probe matched a live coordinate here).
+        // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
         unsafe { keys.matches_locate(i, self.coord, self.q) }
     }
 }

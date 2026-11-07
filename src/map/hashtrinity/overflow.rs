@@ -57,7 +57,7 @@ pub(super) struct ByKey<'a, K> {
 impl<'a, K: Eq + Coord, KS: KeyStore<K>> Confirm<K, KS> for ByKey<'a, K> {
     #[inline]
     fn confirm(&self, keys: &KS, i: usize) -> bool {
-        // SAFETY: slot is live (the probe matched a live coordinate here).
+        // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
         unsafe { keys.matches(i, self.coord, self.k) }
     }
 }
@@ -799,7 +799,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
         let home = self.home(coord);
         // SAFETY: home ∈ [0, len).
         let sc = unsafe { *self.coords.get_unchecked(home) };
-        // SAFETY: slot is live (the probe matched a live coordinate here).
+        // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
         if sc == coord && unsafe { self.keys.matches(home, coord, k) } {
             return Capped::Hit(home);
         }
@@ -850,7 +850,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
         loop {
             // SAFETY: i ∈ [0, len) — home()/descend() mask to the array.
             let sc = unsafe { *self.coords.get_unchecked(i) };
-            // SAFETY: slot is live (the probe matched a live coordinate here).
+            // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
             if sc == EMPTY || (sc == coord && unsafe { self.keys.matches(i, coord, k) }) || j + 1 >= limit {
                 return j + 1;
             }

@@ -52,7 +52,7 @@ containment = 0.104
 
 # Every file matching one of these globs must match an `[[origin]]` glob.
 [coverage]
-globs = ["fuzz/seeds/*/*", "src/gpu/spirv/*.spv", "src/gpu/spirv/*.comp", "examples/gpu_dump_spirv/*", "fold-abi/*.md"]
+globs = ["fuzz/seeds/*/*", "src/gpu/spirv/*.spv", "src/gpu/spirv/*.comp", "fold-abi/*.md"]
 
 # GGUF fuzz seeds: byte strings built for this repository. No upstream reproducer file is copied.
 [[origin]]
@@ -77,49 +77,83 @@ glob = "src/gpu/spirv/*.comp"
 text = "GLSL source written for this repository."
 
 [[origin]]
-glob = "src/gpu/spirv/*.spv"
+glob = "src/gpu/spirv/admm_map.spv"
 text = "glslc output of the same-named .comp."
 glslc = ["--target-env=vulkan1.1", "--target-spv=spv1.3", "-O", "-fshader-stage=compute"]
 
 [[origin]]
-glob = "examples/gpu_dump_spirv/*.comp"
-text = "GLSL source written for this repository."
-
-[[origin]]
-glob = "examples/gpu_dump_spirv/dump_attn64.spv"
-text = "glslc output of dump_attn.comp with -DHD=64."
-source = "examples/gpu_dump_spirv/dump_attn.comp"
-glslc = ["--target-env=vulkan1.1", "--target-spv=spv1.3", "-O", "-fshader-stage=compute", "-DHD=64"]
-
-[[origin]]
-glob = "examples/gpu_dump_spirv/dump_attn128.spv"
-text = "glslc output of dump_attn.comp with -DHD=128."
-source = "examples/gpu_dump_spirv/dump_attn.comp"
-glslc = ["--target-env=vulkan1.1", "--target-spv=spv1.3", "-O", "-fshader-stage=compute", "-DHD=128"]
-
-[[origin]]
-glob = "examples/gpu_dump_spirv/dump_gemm.spv"
-text = "glslc output of dump_gemm.comp."
-source = "examples/gpu_dump_spirv/dump_gemm.comp"
+glob = "src/gpu/spirv/attn_coopmat.spv"
+text = "glslc output of the same-named .comp."
 glslc = ["--target-env=vulkan1.1", "--target-spv=spv1.3", "-O", "-fshader-stage=compute"]
 
 [[origin]]
-glob = "examples/gpu_dump_spirv/dump_rms.spv"
-text = "glslc output of dump_misc.comp with -DOP=0."
-source = "examples/gpu_dump_spirv/dump_misc.comp"
-glslc = ["--target-env=vulkan1.1", "--target-spv=spv1.3", "-O", "-fshader-stage=compute", "-DOP=0"]
+glob = "src/gpu/spirv/coopmat_gemm.spv"
+text = "glslc output of the same-named .comp."
+glslc = ["--target-env=vulkan1.1", "--target-spv=spv1.3", "-O", "-fshader-stage=compute"]
 
 [[origin]]
-glob = "examples/gpu_dump_spirv/dump_rope.spv"
-text = "glslc output of dump_misc.comp with -DOP=1."
-source = "examples/gpu_dump_spirv/dump_misc.comp"
-glslc = ["--target-env=vulkan1.1", "--target-spv=spv1.3", "-O", "-fshader-stage=compute", "-DOP=1"]
+glob = "src/gpu/spirv/inv_map.spv"
+text = "glslc output of the same-named .comp."
+glslc = ["--target-env=vulkan1.1", "--target-spv=spv1.3", "-O", "-fshader-stage=compute"]
 
 [[origin]]
-glob = "examples/gpu_dump_spirv/dump_silu.spv"
-text = "glslc output of dump_misc.comp with -DOP=2."
-source = "examples/gpu_dump_spirv/dump_misc.comp"
-glslc = ["--target-env=vulkan1.1", "--target-spv=spv1.3", "-O", "-fshader-stage=compute", "-DOP=2"]
+glob = "src/gpu/spirv/limb_finish.spv"
+text = "glslc output of the same-named .comp."
+glslc = ["--target-env=vulkan1.1", "--target-spv=spv1.3", "-O", "-fshader-stage=compute"]
+
+[[origin]]
+glob = "src/gpu/spirv/limb_gemm.spv"
+text = "glslc output of the same-named .comp."
+glslc = ["--target-env=vulkan1.1", "--target-spv=spv1.3", "-O", "-fshader-stage=compute"]
+
+[[origin]]
+glob = "src/gpu/spirv/limb_place.spv"
+text = "glslc output of the same-named .comp."
+glslc = ["--target-env=vulkan1.1", "--target-spv=spv1.3", "-O", "-fshader-stage=compute"]
+
+[[origin]]
+glob = "src/gpu/spirv/limb_plane.spv"
+text = "glslc output of the same-named .comp."
+glslc = ["--target-env=vulkan1.1", "--target-spv=spv1.3", "-O", "-fshader-stage=compute"]
+
+[[origin]]
+glob = "src/gpu/spirv/rank1_map.spv"
+text = "glslc output of the same-named .comp."
+glslc = ["--target-env=vulkan1.1", "--target-spv=spv1.3", "-O", "-fshader-stage=compute"]
+
+[[origin]]
+glob = "src/gpu/spirv/splitk_reduce.spv"
+text = "glslc output of the same-named .comp."
+glslc = ["--target-env=vulkan1.1", "--target-spv=spv1.3", "-O", "-fshader-stage=compute"]
+
+[[origin]]
+glob = "src/gpu/spirv/attn_coopmat_kd.spv"
+text = "glslc output of attn_coopmat.comp with -DKDF=1 (the KD face; `GLSLC_ARGS_KD` in src/gpu/nn/attn/kd.rs)."
+source = "src/gpu/spirv/attn_coopmat.comp"
+glslc = ["--target-env=vulkan1.1", "--target-spv=spv1.3", "-O", "-fshader-stage=compute", "-DKDF=1"]
+
+[[origin]]
+glob = "src/gpu/spirv/attn_coopmat_kd_bwd.spv"
+text = "glslc output of attn_coopmat.comp with -DKDB=1 (the KD backward face; `GLSLC_ARGS_KDB` in src/gpu/nn/attn/kd.rs)."
+source = "src/gpu/spirv/attn_coopmat.comp"
+glslc = ["--target-env=vulkan1.1", "--target-spv=spv1.3", "-O", "-fshader-stage=compute", "-DKDB=1"]
+
+[[origin]]
+glob = "src/gpu/spirv/coopmat_gemm_bf16.spv"
+text = "glslc output of coopmat_gemm.comp with the bf16 face and the guard and mask faces off, at the default tile (`GLSLC_BF16_EXACT_ARGS` in src/gpu/nn/coopmat_gemm.rs)."
+source = "src/gpu/spirv/coopmat_gemm.comp"
+glslc = ["--target-env=vulkan1.1", "--target-spv=spv1.3", "-O", "-fshader-stage=compute", "-DOPF=1", "-DGUARD=0", "-DEPIMASK=0"]
+
+[[origin]]
+glob = "src/gpu/spirv/coopmat_gemm_bf16_guarded.spv"
+text = "glslc output of coopmat_gemm.comp with the bf16 face and both guards on, at the default tile (`GLSLC_BF16_ARGS` in src/gpu/nn/coopmat_gemm.rs)."
+source = "src/gpu/spirv/coopmat_gemm.comp"
+glslc = ["--target-env=vulkan1.1", "--target-spv=spv1.3", "-O", "-fshader-stage=compute", "-DOPF=1"]
+
+[[origin]]
+glob = "src/gpu/spirv/coopmat_gemm_bf16_bn128.spv"
+text = "glslc output of coopmat_gemm.comp with the bf16 face and the guard and mask faces off, at the 128 x 128 tile (`BF16_TILE_WIDE`). The tile flags are not recorded in the source tree, so this entry names no glslc arguments and `--recompile` skips it."
+source = "src/gpu/spirv/coopmat_gemm.comp"
 
 [[origin]]
 glob = "fold-abi/*.md"

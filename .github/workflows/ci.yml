@@ -110,18 +110,33 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      # `tools/gate` (and the tree note it reads) is not published in this tree. Say so, run the gate
+      # when the crate is present, and skip the steps below when it is not.
+      - name: Locate the structure gate
+        id: gate
+        run: |
+          if [ -f tools/gate/Cargo.toml ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Structure gate skipped::tools/gate is not published in this tree, so placement, size and Lean-orphan checks did not run."
+          fi
+
       - name: Install Rust toolchain (nightly-2026-04-14)
+        if: steps.gate.outputs.present == 'true'
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: nightly-2026-04-14
 
       - name: Gate controls
-        run: cargo test --locked --manifest-path tools/gate/Cargo.toml (unpublished)
+        if: steps.gate.outputs.present == 'true'
+        run: cargo test --locked --manifest-path tools/gate/Cargo.toml
 
       - name: Placement, size and Lean orphans over the committed tree
+        if: steps.gate.outputs.present == 'true'
         run: |
           git ls-files > "$RUNNER_TEMP/files"
-          cargo run --release --locked --quiet --manifest-path tools/gate/Cargo.toml (unpublished) -- \
+          cargo run --release --locked --quiet --manifest-path tools/gate/Cargo.toml -- \
             structure --check --root . --files "$RUNNER_TEMP/files"
 
   claims:

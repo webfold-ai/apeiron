@@ -576,7 +576,7 @@ struct FreqLine<V> {
 /// The group width — 16 control bytes scanned in one glance, exactly SwissTable's SSE group. The
 /// `GroupProbe.winnow_exact` licence is `∀ w`, so the width is a free efficiency knob; 16 is the
 /// SSE register, and the byte tag makes the scan one `_mm_cmpeq_epi8` + `_mm_movemask_epi8`.
-pub(crate) const GROUP: usize = 16;
+pub const GROUP: usize = 16;
 
 /// The tag window of `p = f·PHI`: the 7 bits just below the bucket window, `[TAG_SHIFT, 40)` with
 /// the current [`FreqMap::COUNT_HOME_GAP`]/[`FreqMap::COUNT_BBITS`]. Disjoint from
@@ -593,7 +593,7 @@ const TAG_SHIFT: u32 = 64 - FreqMap::<u64, i64>::COUNT_HOME_GAP - FreqMap::<u64,
 /// readout / group-probe at both call sites (this is the point of `CoordinateReadout`: SwissTable
 /// lookup and zstd-style match finding are one operation). `base + GROUP ≤ ctrl.len()`.
 #[inline]
-pub(crate) fn group_tag_mask(ctrl: &[u8], base: usize, tag: u8) -> u16 {
+pub fn group_tag_mask(ctrl: &[u8], base: usize, tag: u8) -> u16 {
     debug_assert!(base + GROUP <= ctrl.len());
     // SAFETY (both paths): base + GROUP ≤ ctrl.len() (caller-guaranteed), so ptr..ptr+16 is in-bounds.
     let ptr = unsafe { ctrl.as_ptr().add(base) };

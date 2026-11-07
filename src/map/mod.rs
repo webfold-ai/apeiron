@@ -12,11 +12,12 @@ pub mod freq;
 // layout. The host lint policy is scoped off it by the module-level `#![allow]` in
 // `src/map/hashtrinity/mod.rs`; `rustfmt` is scoped off it by the `#[rustfmt::skip]` below.
 /// The subsumed incumbent: `hashtrinity` at rev `4cc14471`, ported as this crate's own module.
-/// Private, because `freq` is its public face. The external `hashtrinity` git dependency is
-/// removed, so the doctests in the submodules are marked `ignore`:
-/// they document the upstream crate's API, and this crate's public path for the port is `freq`.
+/// Public, so the `hashtrinity` crate (the user-facing overlay) can re-export it instead of
+/// carrying its own copy; [`freq`] stays the short public face for `Table`, `Coord`, `CoordMap`
+/// and `FreqMap`. The external `hashtrinity` git dependency is removed, so the doctests in the
+/// submodules are marked `ignore`: they document the upstream crate's API.
 #[rustfmt::skip]
-mod hashtrinity;
+pub mod hashtrinity;
 pub mod keystore;
 pub mod merge;
 pub mod pepper;

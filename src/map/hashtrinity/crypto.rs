@@ -17,11 +17,22 @@ use crate::map::hashtrinity::hex::ToHex;
 /// since sibling crates (`hashtrinity-webauthn`'s challenge generation) need it too — one RNG read
 /// site for the whole ecosystem, not a re-duplicated `/dev/urandom` open per crate.
 pub fn rand_bytes(n: usize) -> Vec<u8> {
+    try_rand_bytes(n).expect("kernel CSPRNG (/dev/urandom) unavailable")
+}
+
+/// Like [`rand_bytes`], but a missing or unreadable `/dev/urandom` (a sandbox or container without
+/// `/dev`, a restrictive Landlock policy, file-descriptor exhaustion) is an error the caller can
+/// handle or report, not a panic. Key material must never be silently weakened to get past it:
+/// there is no fallback source, and a short read is an error.
+///
+/// There is deliberately no dependency here: `std::random` is unstable, this module is
+/// `forbid(unsafe_code)` so it cannot call `getrandom(2)` itself, and the kernel CSPRNG is
+/// reachable through the one file read below.
+pub fn try_rand_bytes(n: usize) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
-    let mut f = std::fs::File::open("/dev/urandom").expect("open /dev/urandom");
     let mut b = vec![0u8; n];
-    f.read_exact(&mut b).expect("read /dev/urandom");
-    b
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    Ok(b)
 }
 
 mod ed25519 {
@@ -537,8 +548,25 @@ mod ed25519 {
         sig[32..].copy_from_slice(&s);
         sig
     }
+    /// S < L, compared as 256-bit little-endian integers (RFC 8032 section 5.1.7, step 1).
+    fn sc_is_canonical(s: &[u8; 32]) -> bool {
+        let limbs = [
+            u64::from_le_bytes(s[0..8].try_into().unwrap()),
+            u64::from_le_bytes(s[8..16].try_into().unwrap()),
+            u64::from_le_bytes(s[16..24].try_into().unwrap()),
+            u64::from_le_bytes(s[24..32].try_into().unwrap()),
+        ];
+        !ge_u256(&limbs, &L)
+    }
+
     /// Verify a 64-byte signature over `msg` for public key `pk` (RFC 8032). This is iroh's peer-signature check.
+    /// Rejects S >= L: otherwise S + L verifies too, and one signature has two valid encodings.
     pub fn ed25519_verify(pk: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
+        let mut s_bytes = [0u8; 32];
+        s_bytes.copy_from_slice(&sig[32..]);
+        if !sc_is_canonical(&s_bytes) {
+            return false;
+        }
         let a = match ge_frombytes(pk) {
             Some(a) => a,
             None => return false,

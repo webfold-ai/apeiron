@@ -800,12 +800,7 @@ pub mod term {
     }
 
     pub(crate) fn is_word(b: u8) -> bool {
-        // The ASCII alphanumeric ranges, spelled out: `u8::is_ascii_alphanumeric` is not in the
-        // pinned model, and this is exactly that predicate.
-        (b >= b'0' && b <= b'9')
-            || (b >= b'a' && b <= b'z')
-            || (b >= b'A' && b <= b'Z')
-            || b == b'_'
+        b.is_ascii_alphanumeric() || b == b'_'
     }
 
     // ── parser: surface syntax → `Re` (the universal Term) ───────────────────────
@@ -978,11 +973,21 @@ pub mod term {
         /// parse one alternative into a `Concat` of `K`-atoms (`S_routeF` of the trinity boundaries).
         /// `^ $` become `Look(Start/End)` atoms (pattern-global anchors, extracted at lowering); `\b`
         /// a `Look(WordB)` atom; runs of single-byte `{1,1}` classes fuse into one `Run` (the K-fusion
-        /// the membership prefilter needs).
-        fn alt(&mut self) -> Result<Re, String> {
+        /// the membership prefilter needs). `in_group` is `true` when parsing a `(...)` body, so a
+        /// `)` here ends the group rather than falling through to `class_atom`'s literal catch-all —
+        /// at the top level (`in_group = false`) a bare `)` stays a literal, unchanged from before,
+        /// so a pattern that never uses `(` at all is byte-for-byte the same as pre-group-support.
+        ///
+        /// A mid-sequence group — `Re::Alt` pushed here as one atom among literals/classes — is not
+        /// a fourth `Seg` case (the trinity stays three): `lower_concat_multi` Cartesian-expands it
+        /// into multiple full flat sequences at lowering time instead, one per branch combination.
+        fn alt(&mut self, in_group: bool) -> Result<Re, String> {
             let mut segs: Vec<Re> = Vec::new();
             while let Some(c) = self.peek() {
                 if c == b'|' {
+                    break;
+                }
+                if in_group && c == b')' {
                     break;
                 }
                 if c == b'^' {
@@ -998,6 +1003,36 @@ pub mod term {
                 if c == b'\\' && self.s.get(self.i + 1) == Some(&b'b') {
                     self.i += 2;
                     segs.push(Re::Atom(K::Look(Look::WordB)));
+                    continue;
+                }
+                if c == b'(' {
+                    self.i += 1;
+                    // optional non-capturing marker `(?:...)` — tregex never captures, so `(...)`
+                    // and `(?:...)` are the same construct; both just group an alternation.
+                    if self.peek() == Some(b'?') && self.s.get(self.i + 1) == Some(&b':') {
+                        self.i += 2;
+                    }
+                    let mut branches = Vec::new();
+                    loop {
+                        branches.push(self.alt(true)?);
+                        if self.peek() == Some(b'|') {
+                            self.i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if self.peek() != Some(b')') {
+                        return Err("unterminated group".to_string());
+                    }
+                    self.i += 1;
+                    // Quantifying the GROUP itself (`(a|b)+`, `(a|b){2,3}`) is a real, separate
+                    // feature (repeat N times, not "pick one branch once") this doesn't implement —
+                    // fail to compile rather than silently treat the quantifier as a no-op or as
+                    // applying to whatever comes next.
+                    if matches!(self.peek(), Some(b'*' | b'+' | b'?' | b'{')) {
+                        return Err("quantified groups are not supported".to_string());
+                    }
+                    segs.push(Re::Alt(branches));
                     continue;
                 }
                 let mask = self.class_atom()?;
@@ -1033,7 +1068,7 @@ pub mod term {
         };
         let mut alts = Vec::new();
         loop {
-            alts.push(p.alt()?);
+            alts.push(p.alt(false)?);
             if p.peek() == Some(b'|') {
                 p.i += 1;
             } else {
@@ -1057,38 +1092,83 @@ pub mod term {
         let alts = match re {
             Re::Alt(branches) => branches
                 .iter()
-                .map(|b| lower_concat(b, &mut as0, &mut ae0))
+                .flat_map(|b| lower_concat_multi(b, &mut as0, &mut ae0))
                 .collect(),
-            other => vec![lower_concat(other, &mut as0, &mut ae0)],
+            other => lower_concat_multi(other, &mut as0, &mut ae0),
         };
         (alts, as0, ae0)
     }
 
-    fn lower_concat(re: &Re, as0: &mut bool, ae0: &mut bool) -> Vec<Seg> {
+    /// Lower ONE alternative (concat) to all its expanded flat segment-sequences — plural, because
+    /// a mid-sequence group (`Re::Alt` pushed as one atom by `P::alt`) Cartesian-expands into
+    /// multiple full sequences, one per branch combination: `Seg` stays the three-case trinity
+    /// (no Group case), so `foo(a|b)bar` becomes the two flat sequences for `fooabar`/`foobbar`
+    /// here, at lowering time, rather than at match time.
+    ///
+    /// A concat with NO embedded group still produces exactly one sequence (the `sequences` fold
+    /// starts at `vec![Vec::new()]` and every literal/class/`\b` atom extends every
+    /// sequence-in-progress in place, so a plain literal/class pattern is unaffected — same output
+    /// as the old single-sequence `lower_concat` for that case).
+    fn lower_concat_multi(re: &Re, as0: &mut bool, ae0: &mut bool) -> Vec<Vec<Seg>> {
         let body: &[Re] = match re {
             Re::Concat(v) => v,
             single => std::slice::from_ref(single),
         };
-        let mut out = Vec::with_capacity(body.len());
+        let mut sequences: Vec<Vec<Seg>> = vec![Vec::new()];
         for atom in body {
             match atom {
                 Re::Atom(K::Look(Look::Start)) => *as0 = true,
                 Re::Atom(K::Look(Look::End)) => *ae0 = true,
-                Re::Atom(K::Look(Look::WordB)) => out.push(Seg::WordB),
-                Re::Atom(K::Run(v)) => out.push(Seg::Lit(v.clone())),
-                Re::Atom(K::Class(m, min, max)) => out.push(Seg::Class {
+                Re::Atom(K::Look(Look::WordB)) => {
+                    for seq in &mut sequences {
+                        seq.push(Seg::WordB);
+                    }
+                }
+                Re::Atom(K::Run(v)) => {
+                    for seq in &mut sequences {
+                        seq.push(Seg::Lit(v.clone()));
+                    }
+                }
+                Re::Atom(K::Class(m, min, max)) => {
+                    for seq in &mut sequences {
+                        seq.push(Seg::Class {
                     mask: m.clone(),
                     min: *min,
                     max: *max,
-                }),
-                Re::Concat(_) | Re::Alt(_) => {
-                    // nested groups aren't in tregex's supported subset yet; flatten conservatively
-                    let inner = lower_concat(atom, as0, ae0);
-                    out.extend(inner);
+                        });
+                    }
+                }
+                Re::Alt(branches) => {
+                    let mut next = Vec::with_capacity(sequences.len() * branches.len().max(1));
+                    for branch in branches {
+                        let branch_seqs = lower_concat_multi(branch, as0, ae0);
+                        for prefix in &sequences {
+                            for suffix in &branch_seqs {
+                                let mut combined = prefix.clone();
+                                combined.extend(suffix.iter().cloned());
+                                next.push(combined);
                 }
             }
         }
-        out
+                    sequences = next;
+                }
+                Re::Concat(_) => {
+                    // A bare nested Concat (not produced by the current parser, which only ever
+                    // pushes `Re::Alt` for a group) — handled the same structural way for safety.
+                    let inner = lower_concat_multi(atom, as0, ae0);
+                    let mut next = Vec::with_capacity(sequences.len() * inner.len().max(1));
+                    for prefix in &sequences {
+                        for suffix in &inner {
+                            let mut combined = prefix.clone();
+                            combined.extend(suffix.iter().cloned());
+                            next.push(combined);
+                        }
+                    }
+                    sequences = next;
+                }
+            }
+        }
+        sequences
     }
 
     /// the engine's parse entry: surface syntax → the lowered membership program, via the Term.
@@ -1175,116 +1255,53 @@ fn lead_idx(segs: &[Seg]) -> Option<usize> {
 
 // ── matcher ─────────────────────────────────────────────────────────────────
 /// match a linear segment program at `pos`; return the end offset of the (greedy) match.
-/// Whether `v` matches `hay` starting at `p`; the byte loop keeps the slice comparison out of
-/// `match_segs`, where the translator cannot join the two loop contexts.
-fn lit_at(hay: &[u8], p: usize, v: &[u8]) -> bool {
-    if p + v.len() > hay.len() {
-        return false;
+fn match_segs(segs: &[Seg], hay: &[u8], pos: usize) -> Option<usize> {
+    fn go(segs: &[Seg], si: usize, hay: &[u8], pos: usize) -> Option<usize> {
+        if si == segs.len() {
+            return Some(pos);
     }
-    let mut j = 0usize;
-    let mut eq = true;
-    while j < v.len() && eq {
-        if hay[p + j] != v[j] {
-            eq = false;
-        }
-        j += 1;
-    }
-    eq
-}
-
-/// One segment's decision at a position, computed without touching the matcher's state so the
-/// driver loop holds no borrow of `segs` across iterations.
-enum SegStep {
-    Next(usize),
-    Class(usize, usize),
-    Fail,
-}
-
-fn step_at(seg: &Seg, hay: &[u8], p: usize) -> SegStep {
-    match seg {
+        match &segs[si] {
         Seg::Lit(v) => {
-            if lit_at(hay, p, v) {
-                SegStep::Next(p + v.len())
+                if pos + v.len() <= hay.len() && &hay[pos..pos + v.len()] == v.as_slice() {
+                    go(segs, si + 1, hay, pos + v.len())
             } else {
-                SegStep::Fail
+                    None
             }
         }
         Seg::WordB => {
-            let before = p > 0 && is_word(hay[p - 1]);
-            let after = p < hay.len() && is_word(hay[p]);
+                let before = pos > 0 && is_word(hay[pos - 1]);
+                let after = pos < hay.len() && is_word(hay[pos]);
             if before != after {
-                SegStep::Next(p)
+                    go(segs, si + 1, hay, pos)
             } else {
-                SegStep::Fail
+                    None
             }
         }
         Seg::Class { mask, min, max } => {
             let mut avail = 0usize;
-            while p + avail < hay.len() && mask[hay[p + avail] as usize] {
+                while pos + avail < hay.len() && mask[hay[pos + avail] as usize] {
                 avail += 1;
                 if avail == *max {
                     break;
                 }
             }
-            if avail >= *min {
-                SegStep::Class(avail, *min)
-            } else {
-                SegStep::Fail
+                if avail < *min {
+                    return None;
+                }
+                let mut take = avail;
+                loop {
+                    if let Some(end) = go(segs, si + 1, hay, pos + take) {
+                        return Some(end);
+                    }
+                    if take == *min {
+                        return None;
+                    }
+                    take -= 1;
             }
         }
     }
 }
-
-pub(crate) fn match_segs(segs: &[Seg], hay: &[u8], pos: usize) -> Option<usize> {
-    // The recursive matcher's backtracking, as an explicit stack: one entry per `Class`
-    // segment still offering a shorter take, `(segment, start, take, min)`.
-    let mut stack: Vec<(usize, usize, usize, usize)> = Vec::new();
-    let mut si = 0usize;
-    let mut p = pos;
-    let mut found: Option<usize> = None;
-    let mut done = false;
-    while !done {
-        if si == segs.len() {
-            found = Some(p);
-            done = true;
-        } else {
-            let st = step_at(&segs[si], hay, p);
-            match st {
-                SegStep::Next(np) => {
-                    p = np;
-                    si += 1;
-                }
-                SegStep::Class(avail, min) => {
-                    stack.push((si, p, avail, min));
-                    p += avail;
-                    si += 1;
-                }
-                SegStep::Fail => {
-                    let mut back = true;
-                    while back {
-                        let popped = stack.pop();
-                        match popped {
-                            Some(entry) => {
-                                let (csi, cpos, take, cmin) = entry;
-                                if take > cmin {
-                                    let nt = take - 1;
-                                    stack.push((csi, cpos, nt, cmin));
-                                    p = cpos + nt;
-                                    si = csi + 1;
-                                    back = false;
-                                }
-                            }
-                            None => {
-                                done = true;
-                                back = false;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    found
+    go(segs, 0, hay, pos)
 }
 
 impl Regex {
@@ -1650,5 +1667,124 @@ impl Regex {
                     .collect()
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod regex_group_tests {
+    //! `Regex::new`/`is_match` had no test coverage at all before this module (the `parity.rs`
+    //! file this module's own doc comment references does not exist in this repo) — these tests
+    //! cover both the pre-existing no-group behavior (regression safety: a plain literal/class
+    //! pattern must parse and match exactly as it did before `(`/`)` gained real meaning) and the
+    //! new mid-sequence/nested group support this commit adds.
+    use super::Regex;
+
+    #[test]
+    fn plain_literal_and_class_still_work_unaffected_by_group_support() {
+        let re = Regex::new("ab.c*d").unwrap();
+        assert!(re.is_match(b"xxabXcccdyy"));
+        assert!(re.is_match(b"abXd"));
+        assert!(!re.is_match(b"abXce"));
+    }
+
+    #[test]
+    fn top_level_alternation_still_works_unaffected() {
+        let re = Regex::new("cat|dog").unwrap();
+        assert!(re.is_match(b"I have a cat"));
+        assert!(re.is_match(b"I have a dog"));
+        assert!(!re.is_match(b"I have a bird"));
+    }
+
+    #[test]
+    fn whole_pattern_wrapped_in_one_group_still_works() {
+        let re = Regex::new("(cat|dog)").unwrap();
+        assert!(re.is_match(b"cat"));
+        assert!(re.is_match(b"dog"));
+        assert!(!re.is_match(b"bird"));
+    }
+
+    /// THE bug this commit fixes: a real Stripe-secret-key-shaped pattern
+    /// (`prefix(alt1|alt2)_suffix`), the exact shape the parser silently mishandled before (no
+    /// `(` handling in `alt()` at all — `(`/`)` fell through to the literal catch-all, so
+    /// `sk_(test|live)_...` parsed as two bogus top-level alternatives each requiring a LITERAL
+    /// paren character, matching nothing real).
+    #[test]
+    fn mid_sequence_alternation_group_matches_either_branch() {
+        let re = Regex::new("sk_(test|live)_[0-9A-Za-z]{24,}").unwrap();
+        // Built at run time: a contiguous `sk_live_<24 chars>` literal looks like a real key to
+        // secret scanners, and these are fixtures.
+        let body = "abcdefghijklmnopqrstuvwx";
+        assert!(re.is_match(format!("sk_{}_{body}", "live").as_bytes()));
+        assert!(re.is_match(format!("sk_{}_{body}", "test").as_bytes()));
+        assert!(!re.is_match(format!("sk_{}_{body}", "prod").as_bytes()));
+        // Too short for the {24,} class must still not match.
+        assert!(!re.is_match(b"sk_live_short"));
+    }
+
+    #[test]
+    fn mid_sequence_group_with_literal_before_and_after() {
+        let re = Regex::new("foo(a|b|c)bar").unwrap();
+        assert!(re.is_match(b"fooabar"));
+        assert!(re.is_match(b"foobbar"));
+        assert!(re.is_match(b"foocbar"));
+        assert!(!re.is_match(b"foodbar"));
+    }
+
+    #[test]
+    fn non_capturing_group_syntax_is_accepted_identically() {
+        let re = Regex::new("foo(?:a|b)bar").unwrap();
+        assert!(re.is_match(b"fooabar"));
+        assert!(re.is_match(b"foobbar"));
+        assert!(!re.is_match(b"foocbar"));
+    }
+
+    #[test]
+    fn two_groups_in_one_pattern_cartesian_expand() {
+        let re = Regex::new("(a|b)_(x|y)").unwrap();
+        assert!(re.is_match(b"a_x"));
+        assert!(re.is_match(b"a_y"));
+        assert!(re.is_match(b"b_x"));
+        assert!(re.is_match(b"b_y"));
+        assert!(!re.is_match(b"a_z"));
+        assert!(!re.is_match(b"c_x"));
+    }
+
+    #[test]
+    fn nested_groups_are_supported_recursively() {
+        let re = Regex::new("go(od|ne(r|st))").unwrap();
+        assert!(re.is_match(b"good")); // go + od
+        assert!(re.is_match(b"goner")); // go + ne + r
+        assert!(re.is_match(b"gonest")); // go + ne + st
+        assert!(!re.is_match(b"gone")); // "ne" alone (no r/st) must not match
+    }
+
+    #[test]
+    fn a_group_composes_with_a_following_quantified_class() {
+        // The exact real-world shape from Sondera's YARA corpus (see hashtrinity-tregex-mid-
+        // pattern-alternation-bug.md): a group immediately followed by more literal + a
+        // quantified class, not just a group followed by nothing.
+        let re = Regex::new(r"\b(echo|printf)\s+(yes|no)\b").unwrap();
+        assert!(re.is_match(b"echo yes"));
+        assert!(re.is_match(b"printf no"));
+        assert!(!re.is_match(b"echoyes"));
+    }
+
+    #[test]
+    fn case_insensitive_prefix_composes_with_a_mid_sequence_group() {
+        // (?i) is applied by callers (e.g. sangsec's hit()) by lowercasing the WHOLE pattern and
+        // target before compiling/matching — confirm that still works once a group is involved.
+        let re = Regex::new("sk_(test|live)_[0-9a-z]{4,}").unwrap();
+        assert!(re.is_match(b"sk_live_abcd"));
+    }
+
+    #[test]
+    fn an_unterminated_group_fails_to_compile_rather_than_matching_wrong() {
+        assert!(Regex::new("foo(a|b").is_err());
+    }
+
+    #[test]
+    fn a_quantified_group_fails_to_compile_rather_than_being_silently_ignored() {
+        assert!(Regex::new("(ab)+").is_err());
+        assert!(Regex::new("(a|b){2,3}").is_err());
     }
 }

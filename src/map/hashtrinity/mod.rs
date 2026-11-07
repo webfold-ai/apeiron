@@ -2,7 +2,10 @@
 //! hashtrinity — a `K → V` table where the key is its own address.
 //!
 //! Not a wrapper over `std::HashMap`. One flat power-of-two array, one insert, and four merge
-//! functions that pick what kind of table you get. No random seed, so the layout is deterministic.
+//! functions that pick what kind of table you get. The default table has no random seed, so its layout
+//! is deterministic. Its fold is public, so chosen keys can be aimed at the same slots; the probe cap
+//! and the overflow tree bound each lookup, but not to `O(1)`. For keys an attacker chooses, use the
+//! opt-in seeded table ([`Table::with_random_seed`]).
 //!
 //! # One structure, four merges
 //!
@@ -22,7 +25,8 @@
 //!
 //! [`Table`] keeps the key (exact). Two keyless variants trade that for speed and footprint:
 //! [`CoordMap`] for coordinate keys (the address regenerates the key), and [`FreqMap`] for opaque
-//! keys it routes by fold (`2⁻⁶⁴` false-positive on non-members) — dedup / count / index.
+//! keys it routes by fold (a false merge on a `2⁻⁶⁴` fold collision, for random keys only) — dedup /
+//! count / index.
 //!
 //! # Why it's fast
 //!
@@ -30,12 +34,15 @@
 //! — no hash, no collision, one probe. Larger or byte keys fold to a 64-bit coordinate via `k·PHI`
 //! (Fibonacci hashing) and take the top `bits` as the home slot; a collision re-addresses by the next
 //! window of `k·PHI`. Multiply-by-odd is a bijection on 2⁶⁴, so distinct keys always separate within
-//! `⌈64/bits⌉` steps — no two keys can alias forever. Coordinate keys are HashDOS-immune by
-//! construction (`home(c) = c`: the only key that can occupy slot `s` is `s`). On the FOLD path the
-//! immunity is measured, not proved: separation bounds aliasing, not probe length, and
-//! `AggregationBound.descent_can_be_wholly_blocked` refutes the worst-case reading — `PHI` is public,
-//! so `PHI⁻¹` aims one crafted key at each slot a victim would try. `tests/hashdos.rs` is the red
-//! team and carries the numbers. No SipHash tax.
+//! `⌈64/bits⌉` steps — no two keys can alias forever. Integer keys below the array length have no
+//! hash at all (`home(c) = c`: the only such key that can occupy slot `s` is `s`), so they cannot be
+//! piled up, but only while no fold-path key shares the table. On the FOLD path the default table is
+//! not flood-resistant: separation bounds aliasing, not probe length
+//! (`AggregationBound.descent_can_be_wholly_blocked`), and `PHI` is public, so `PHI⁻¹` aims crafted
+//! keys at the slots a victim would try. The probe cap ([`PROBE_CAP`]) limits each primary probe, and
+//! keys it cannot place go to the overflow tree, so an aimed flood costs `O(log n)` per lookup there.
+//! `tests/hashdos.rs` measures it. The seeded table keys the fold with a secret and is the answer for
+//! untrusted keys. No SipHash tax on the default.
 //!
 //! # Which face, and when — see `FACES.md`
 //!
@@ -45,14 +52,15 @@
 //!
 //! | map | face | when | confirm |
 //! |-----|------|------|---------|
-//! | [`FreqMap`] | **NB** | join / count / dedup / cache / index — the analytical work | trusts the fold (`2^-64` false-positive) — the group probe |
+//! | [`FreqMap`] | **NB** | join / count / dedup / cache / index — the analytical work | trusts the fold (`2^-64` false merge for random keys) — the group probe |
 //! | [`CoordMap`] | **B** | dense *coordinate* keys you must resolve EXACTLY, worst-probe-1 | the address round-trips (regenerates the key) |
 //! | [`Table`] `Stored` | **B/U** | opaque keys you must resolve exactly OR read back | stores + compares the key |
 //!
 //! Default to **`FreqMap`** for the analytical faces (GROUP BY, JOIN, DISTINCT, counters): it is the
 //! proven group-probe engine (`GroupProbe.lean` — uniform fold, 16-wide tag glance miss filter, bounded
-//! terminal sweep), and `2^-64` is "never" on those workloads. Reach for `CoordMap`/`Table` only when a
-//! `2^-64` false positive is unacceptable or you must recover the key.
+//! terminal sweep), and the `2^-64` false-merge rate is negligible for random keys on those workloads.
+//! Reach for `CoordMap`/`Table` when a false merge is unacceptable, when keys are attacker-chosen (a
+//! seeded `Table`), or when you must recover the key.
 //!
 //! **Operation shape** (on any of them):
 //!

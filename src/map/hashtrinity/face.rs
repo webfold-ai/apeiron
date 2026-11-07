@@ -67,11 +67,11 @@ use std::mem::MaybeUninit;
 ///   `Locate`. By induction the composite equals `<(A, B) as Coord>::coord` of the absorbed key.
 ///
 /// So this is the existing tuple fold, not a second scheme, and nothing downstream of the `u64`
-/// changes: the radix descent, the `⌈64/bits⌉` separation bound, the HashDOS immunity, and the
-/// `2⁻⁶⁴` coordinate-identity risk are all untouched. `tests/locate.rs` pins the equation.   CITATION-EXEMPT: deleted by `d84bda3`, 25 crates → 12
+/// changes: the radix descent, the `⌈64/bits⌉` separation bound, the
+/// flood bound of the default fold are all untouched. `tests/locate.rs` pins the equation.   CITATION-EXEMPT: deleted by `d84bda3`, 25 crates → 12
 ///
-/// [`same`](Locate::same) is the exact key compare, used only by the `_exact` faces — the ordinary
-/// borrowed read trusts the coordinate exactly as [`Table::get`] does, and costs exactly the same.
+/// [`same`](Locate::same) is the exact key compare. Every borrowed read and write on a [`Table`]
+/// confirms it, so two keys that share a coordinate stay distinct.
 pub trait Locate<K: Coord + Eq> {
     /// This view's coordinate — equal to `K::coord` of the key it locates.
     fn coord(&self) -> u64;
@@ -1185,7 +1185,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
 /// face is retained under its historical name.
 impl<K: Eq + Coord, V> Table<K, V, Stored<K>> {
     /// [`get_exact`](Table::get_exact) from a borrowed key — also compares the stored key, so a
-    /// `2⁻⁶⁴` coordinate collision reads as absent instead of returning someone else's value.
+    /// key that shares a coordinate with another reads as absent instead of returning that key's value.
     #[inline]
     pub fn get_exact_at<Q: Locate<K>>(&self, q: Q) -> Option<&V> {
         self.get_at(q)

@@ -9,8 +9,8 @@ use super::*;
 /// (initialized for every entry `i < coords.len()`; a merge moves it out only while a
 /// [`MergeGuard`] holds the table, and a panicking merge swap-removes the entry), and `keys` the
 /// identity exactly as the main store carries it: the full key for `Stored`, nothing for `Regen`
-/// (which regenerates the key from `coords[i]`, and is admitted only under an injective coordinate —
-/// [`CoordInv`]). The store is packed and scanned linearly; it holds only the keys that literally ask
+/// (which regenerates the key from `coords[i]`; a keyless store refuses reserved-coordinate keys, see
+/// [`push`](Self::push)). The store is packed and scanned linearly; it holds only the keys that literally ask
 /// for a sentinel, so it is empty (one zero-length `Vec` and a zero-sized key store) on every
 /// ordinary table. Capacity is O(side entries), never O(table slots).
 pub(super) struct SideStore<K: Coord, V, KS: KeyStore<K>> {
@@ -35,6 +35,14 @@ impl<K: Coord, V, KS: KeyStore<K>> SideStore<K, V, KS> {
     /// Append `(coord, k, v)`, growing the key store's fixed-capacity allocation by doubling. The
     /// values and coordinates live in plain `Vec`s and grow themselves.
     pub(super) fn push(&mut self, coord: u64, k: K, v: V) {
+        // A keyless store cannot hold a reserved-coordinate key: `Regen` regenerates the key from
+        // its coordinate, and the reserved words are the very values that were refused as keys. A
+        // refusal here, before anything is stored, leaves the table unchanged.
+        assert!(
+            !KS::REGEN,
+            "a CoordMap cannot store a key whose coordinate is u64::MAX or u64::MAX - 1 (reserved \
+             slot markers); use a Table, which keeps the key"
+        );
         let need = self.coords.len() + 1;
         if need > self.cap {
             let new_cap = (self.cap * 2).max(4).max(need);
@@ -42,15 +50,18 @@ impl<K: Coord, V, KS: KeyStore<K>> SideStore<K, V, KS> {
             let mut i = 0;
             while i < self.coords.len() {
                 let c = self.coords[i];
-                let key = self.keys.take_key(i, c);
-                grown.set(i, key);
+                // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
+                let key = unsafe { self.keys.take_key(i, c) };
+                // SAFETY: the slot is in bounds and not live, so no initialized key is overwritten.
+                unsafe { grown.set(i, key) };
                 i += 1;
             }
             self.keys = grown;
             self.cap = new_cap;
         }
         let i = self.coords.len();
-        self.keys.set(i, k);
+        // SAFETY: the slot is in bounds and not live, so no initialized key is overwritten.
+        unsafe { self.keys.set(i, k) };
         self.coords.push(coord);
         self.vals.push(MaybeUninit::new(v));
     }
@@ -61,7 +72,8 @@ impl<K: Coord, V, KS: KeyStore<K>> SideStore<K, V, KS> {
     pub(super) fn find(&self, coord: u64, k: &K) -> Option<usize> {
         let mut i = 0;
         while i < self.coords.len() {
-            if self.coords[i] == coord && self.keys.matches(i, coord, k) {
+            // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
+            if self.coords[i] == coord && unsafe { self.keys.matches(i, coord, k) } {
                 return Some(i);
             }
             i += 1;
@@ -72,11 +84,14 @@ impl<K: Coord, V, KS: KeyStore<K>> SideStore<K, V, KS> {
     /// Remove entry `i`; its value must already have been moved out by the caller. The removed key is
     /// dropped, and the last entry is swapped into `i` — its key explicitly, since `KS` has no swap.
     pub(super) fn remove_entry(&mut self, i: usize) {
-        let gone = self.keys.take_key(i, self.coords[i]);
+        // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
+        let gone = unsafe { self.keys.take_key(i, self.coords[i]) };
         let last = self.coords.len() - 1;
         if i != last {
-            let moved = self.keys.take_key(last, self.coords[last]);
-            self.keys.set(i, moved);
+            // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
+            let moved = unsafe { self.keys.take_key(last, self.coords[last]) };
+            // SAFETY: the slot is in bounds and not live, so no initialized key is overwritten.
+            unsafe { self.keys.set(i, moved) };
             self.coords.swap(i, last);
             self.vals.swap(i, last);
         }
@@ -91,12 +106,14 @@ impl<K: Coord, V, KS: KeyStore<K>> SideStore<K, V, KS> {
     pub(super) fn take_entry(&mut self, i: usize) -> (u64, K, V) {
         let c = self.coords[i];
         // SAFETY: entry `i` is occupied ⇒ its key and value are initialized.
-        let key = self.keys.take_key(i, c);
+        let key = unsafe { self.keys.take_key(i, c) };
         let val = unsafe { self.vals.get_unchecked_mut(i).assume_init_read() };
         let last = self.coords.len() - 1;
         if i != last {
-            let moved = self.keys.take_key(last, self.coords[last]);
-            self.keys.set(i, moved);
+            // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
+            let moved = unsafe { self.keys.take_key(last, self.coords[last]) };
+            // SAFETY: the slot is in bounds and not live, so no initialized key is overwritten.
+            unsafe { self.keys.set(i, moved) };
         }
         self.coords.swap(i, last);
         self.vals.swap(i, last);
@@ -127,7 +144,8 @@ impl<K: Coord, V, KS: KeyStore<K>> SideStore<K, V, KS> {
         let mut i = 0;
         while i < coords.len() {
             let c = coords[i];
-            drop(self.keys.take_key(i, c));
+            // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
+            drop(unsafe { self.keys.take_key(i, c) });
             i += 1;
         }
     }
@@ -194,7 +212,8 @@ impl<K: Coord, V, KS: KeyStore<K>> Drop for MergeGuard<'_, K, V, KS> {
         match self.store {
             Store::Main => {
                 // The slot is already `TOMB` and its value is gone; drop the key it still holds.
-                drop(t.keys.take_key(self.slot, self.coord));
+                // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
+                drop(unsafe { t.keys.take_key(self.slot, self.coord) });
                 t.len -= 1;
                 t.tombs += 1;
             }

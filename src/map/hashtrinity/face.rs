@@ -44,6 +44,8 @@ use crate::map::hashtrinity::{
     bits_for, is_live, is_sentinel, side::MergeGuard, Capped, Coord, KeyReadout, KeyStore, Overflow,
     SideStore, Store, Stored, Table, EMPTY, PHI, TOMB,
 };
+use super::algebra::keyed_pair;
+use crate::map::hashtrinity::FoldKey;
 use std::mem::MaybeUninit;
 
 // ── Locate / Absorb: a borrowed key that addresses the same slot as the owned one. ─────────────
@@ -65,14 +67,17 @@ use std::mem::MaybeUninit;
 ///   `Locate`. By induction the composite equals `<(A, B) as Coord>::coord` of the absorbed key.
 ///
 /// So this is the existing tuple fold, not a second scheme, and nothing downstream of the `u64`
-/// changes: the radix descent, the `⌈64/bits⌉` separation bound, the HashDOS immunity, and the
-/// `2⁻⁶⁴` coordinate-identity risk are all untouched. `tests/locate.rs` pins the equation.   CITATION-EXEMPT: deleted by `d84bda3`, 25 crates → 12
+/// changes: the radix descent, the `⌈64/bits⌉` separation bound, the
+/// flood bound of the default fold are all untouched. `tests/locate.rs` pins the equation.   CITATION-EXEMPT: deleted by `d84bda3`, 25 crates → 12
 ///
-/// [`same`](Locate::same) is the exact key compare, used only by the `_exact` faces — the ordinary
-/// borrowed read trusts the coordinate exactly as [`Table::get`] does, and costs exactly the same.
+/// [`same`](Locate::same) is the exact key compare. Every borrowed read and write on a [`Table`]
+/// confirms it, so two keys that share a coordinate stay distinct.
 pub trait Locate<K: Coord + Eq> {
     /// This view's coordinate — equal to `K::coord` of the key it locates.
     fn coord(&self) -> u64;
+    /// This view's keyed coordinate under `key` — equal to [`Coord::coord_keyed`] of the key it locates,
+    /// so a borrowed probe of a seeded table lands where the owned key does.
+    fn coord_keyed(&self, key: FoldKey) -> u64;
     /// Whether this view names exactly `k` (the exact compare; `_exact` faces only).
     fn same(&self, k: &K) -> bool;
 }
@@ -88,6 +93,10 @@ impl<K: Coord + Eq> Locate<K> for &K {
     #[inline]
     fn coord(&self) -> u64 {
         (**self).coord()
+    }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        (**self).coord_keyed(key)
     }
     #[inline]
     fn same(&self, k: &K) -> bool {
@@ -106,6 +115,10 @@ impl Locate<String> for &str {
     fn coord(&self) -> u64 {
         // `<str as Coord>::coord` and `<String as Coord>::coord` are the same `fold_bytes` call.
         <str as Coord>::coord(self)
+    }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        <str as Coord>::coord_keyed(self, key)
     }
     #[inline]
     fn same(&self, k: &String) -> bool {
@@ -128,6 +141,10 @@ impl<A: Coord + Eq, B: Coord + Eq, PA: Locate<A>, PB: Locate<B>> Locate<(A, B)> 
         self.0.coord().wrapping_mul(PHI) ^ self.1.coord()
     }
     #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        keyed_pair(self.0.coord_keyed(key), self.1.coord_keyed(key), key)
+    }
+    #[inline]
     fn same(&self, k: &(A, B)) -> bool {
         self.0.same(&k.0) && self.1.same(&k.1)
     }
@@ -145,6 +162,11 @@ impl<A: Coord + Eq, B: Coord + Eq, C: Coord + Eq, PA: Locate<A>, PB: Locate<B>, 
     #[inline]
     fn coord(&self) -> u64 {
         (self.0.coord().wrapping_mul(PHI) ^ self.1.coord()).wrapping_mul(PHI) ^ self.2.coord()
+    }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        let ab = keyed_pair(self.0.coord_keyed(key), self.1.coord_keyed(key), key);
+        keyed_pair(ab, self.2.coord_keyed(key), key)
     }
     #[inline]
     fn same(&self, k: &(A, B, C)) -> bool {
@@ -208,8 +230,10 @@ impl<'a, K: Coord + Eq, V, KS: KeyStore<K>> OccupiedEntry<'a, K, V, KS> {
         KS: KeyReadout<K>,
     {
         match self.store {
-            Store::Side => self.t.side.keys.key(self.slot, self.coord),
-            Store::Main => self.t.keys.key(self.slot, self.coord),
+            // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
+            Store::Side => unsafe { self.t.side.keys.key(self.slot, self.coord) },
+            // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
+            Store::Main => unsafe { self.t.keys.key(self.slot, self.coord) },
             Store::Overflow => {
                 let ov = self.t.overflow.as_ref().expect("overflow entry ⇒ store present");
                 self.t.keys.key_of(&ov.nodes[self.node as usize].entries[self.entry as usize].0)
@@ -315,7 +339,8 @@ impl<'a, K: Coord + Eq, V, KS: KeyStore<K>> OccupiedEntry<'a, K, V, KS> {
                 // the slot's value is now uninitialized and `TOMB` fails the liveness test, so
                 // Drop/Clone/iter skip it — no double free, and the chain past it stays intact.
                 let v = unsafe { self.t.vals.get_unchecked_mut(i).assume_init_read() };
-                let k = self.t.keys.take_key(i, c);
+                // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
+                let k = unsafe { self.t.keys.take_key(i, c) };
                 unsafe { *self.t.coords.get_unchecked_mut(i) = TOMB };
                 self.t.len -= 1;
                 self.t.tombs += 1;
@@ -360,7 +385,8 @@ impl<'a, K: Coord + Eq, V, KS: KeyStore<K>> VacantEntry<'a, K, V, KS> {
                 // current arrays; nothing between here and there can panic.
                 unsafe { *self.t.coords.get_unchecked_mut(i) = c };
                 unsafe { *self.t.vals.get_unchecked_mut(i) = MaybeUninit::new(v) };
-                self.t.keys.set(i, self.key); // Stored: write the key; Regen: no-op
+                // SAFETY: the slot is in bounds and not live, so no initialized key is overwritten.
+                unsafe { self.t.keys.set(i, self.key) }; // Stored: write the key; Regen: no-op
                 self.t.len += 1;
                 // SAFETY: just written ⇒ initialized.
                 unsafe { self.t.vals.get_unchecked_mut(i).assume_init_mut() }
@@ -428,7 +454,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     /// the keyed probe, so two distinct keys with equal coordinates take two slots.
     #[inline]
     pub fn entry(&mut self, k: K) -> Entry<'_, K, V, KS> {
-        let coord = Self::coord_of(&k);
+        let coord = self.coord_of(&k);
         if is_sentinel(coord) {
             if let Some(slot) = self.side.find(coord, &k) {
                 return Entry::Occupied(OccupiedEntry {
@@ -499,7 +525,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     where
         KS: KeyReadout<K>,
     {
-        let coord = q.coord();
+        let coord = self.view_coord(&q);
         if is_sentinel(coord) {
             if let Some(slot) = self.side_find_locate(coord, &q) {
                 return Entry::Occupied(OccupiedEntry {
@@ -565,7 +591,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     /// The value for `k`, mutably. One probe.
     #[inline]
     pub fn get_mut(&mut self, k: &K) -> Option<&mut V> {
-        let coord = Self::coord_of(k);
+        let coord = self.coord_of(k);
         if is_sentinel(coord) {
             let i = self.side.find(coord, k)?;
             // SAFETY: `find` returns an occupied side entry ⇒ value initialized.
@@ -622,7 +648,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     /// Whether `k` is present. One probe, no value touched.
     #[inline]
     pub fn contains_key(&self, k: &K) -> bool {
-        let coord = Self::coord_of(k);
+        let coord = self.coord_of(k);
         if is_sentinel(coord) {
             return self.side.find(coord, k).is_some();
         }
@@ -682,7 +708,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     where
         KS: KeyReadout<K>,
     {
-        let coord = q.coord();
+        let coord = self.view_coord(&q);
         if is_sentinel(coord) {
             if let Some(i) = self.side_find_locate(coord, &q) {
                 // SAFETY: every side entry's value is initialized; it is moved out once, and the
@@ -733,7 +759,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
                 // SAFETY: `grow_for_one` ran, so `i` is an EMPTY slot in the current arrays.
                 unsafe { *self.coords.get_unchecked_mut(i) = coord };
                 unsafe { *self.vals.get_unchecked_mut(i) = MaybeUninit::new(new) };
-                self.keys.set(i, key);
+                // SAFETY: the slot is in bounds and not live, so no initialized key is overwritten.
+                unsafe { self.keys.set(i, key) };
                 self.len += 1;
                 // SAFETY: just written ⇒ initialized.
                 unsafe { self.vals.get_unchecked(i).assume_init_ref() }
@@ -752,7 +779,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     where
         KS: KeyReadout<K>,
     {
-        let coord = q.coord();
+        let coord = self.view_coord(&q);
         match self.locate_at(&q)? {
             Located::Side(i) => {
                 // SAFETY: a located side entry is occupied ⇒ key and value initialized; `take_entry`
@@ -778,7 +805,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
                 unsafe { *self.coords.get_unchecked_mut(i) = TOMB };
                 self.len -= 1;
                 self.tombs += 1;
-                drop(self.keys.take_key(i, coord));
+                // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
+                drop(unsafe { self.keys.take_key(i, coord) });
                 Some(old)
             }
         }
@@ -796,19 +824,20 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     where
         KS: KeyReadout<K>,
     {
-        let coord = Self::coord_of(k);
+        let coord = self.coord_of(k);
         if is_sentinel(coord) {
             let i = self.side.find(coord, k)?;
             // SAFETY: `find` returns an occupied side entry ⇒ key and value initialized.
             return Some((
-                self.side.keys.key(i, coord),
+                // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
+                unsafe { self.side.keys.key(i, coord) },
                 unsafe { self.side.vals.get_unchecked(i).assume_init_ref() },
             ));
         }
         match self.probe_capped_keyed(coord, k) {
             Capped::Hit(i) => {
                 // SAFETY: found ⇒ value initialized.
-                Some((self.keys.key(i, coord), unsafe {
+                Some((unsafe { self.keys.key(i, coord) }, unsafe {
                     self.vals.get_unchecked(i).assume_init_ref()
                 }))
             }
@@ -832,7 +861,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     /// grows the table (no key is being added).
     #[inline]
     fn entry_ref(&mut self, k: &K) -> Option<OccupiedEntry<'_, K, V, KS>> {
-        let coord = Self::coord_of(k);
+        let coord = self.coord_of(k);
         if is_sentinel(coord) {
             let slot = self.side.find(coord, k)?;
             return Some(OccupiedEntry {
@@ -932,7 +961,9 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
         let main = vals.iter_mut().enumerate().filter_map(move |(i, v)| {
             if is_live(coords[i]) {
                 // SAFETY: live coord ⇒ value initialized.
-                Some((keys.key(i, coords[i]), unsafe { v.assume_init_mut() }))
+                Some((unsafe { keys.key(i, coords[i]) }, unsafe {
+                    v.assume_init_mut()
+                }))
             } else {
                 None
             }
@@ -941,7 +972,12 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
         let side_it = s_vals
             .iter_mut()
             .enumerate()
-            .map(move |(i, v)| (s_keys.key(i, s_coords[i]), unsafe { v.assume_init_mut() }));
+            // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
+            .map(move |(i, v)| {
+                (unsafe { s_keys.key(i, s_coords[i]) }, unsafe {
+                    v.assume_init_mut()
+                })
+            });
         let ov_it = overflow
             .as_mut()
             .into_iter()
@@ -965,7 +1001,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
             }
             let alive = {
                 // Disjoint field borrows: the key store is read, the value array is written.
-                let k = self.keys.key(i, c);
+                // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
+                let k = unsafe { self.keys.key(i, c) };
                 // SAFETY: live coord ⇒ value initialized.
                 let v = unsafe { self.vals.get_unchecked_mut(i).assume_init_mut() };
                 keep(k, v)
@@ -979,7 +1016,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
                 self.coords[i] = TOMB;
                 self.len -= 1;
                 self.tombs += 1;
-                drop(self.keys.take_key(i, c));
+                // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
+                drop(unsafe { self.keys.take_key(i, c) });
                 drop(old);
             }
         }
@@ -988,7 +1026,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
         while i < self.side.coords.len() {
             let c = self.side.coords[i];
             let alive = {
-                let k = self.side.keys.key(i, c);
+                // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
+                let k = unsafe { self.side.keys.key(i, c) };
                 // SAFETY: side entries are occupied ⇒ value initialized.
                 let v = unsafe { self.side.vals.get_unchecked_mut(i).assume_init_mut() };
                 keep(k, v)
@@ -1037,7 +1076,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
                     }
                     if drop_k {
                         // The key store rides the same liveness line; its destructor may panic.
-                        drop(self.keys.take_key(i, c));
+                        // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
+                        drop(unsafe { self.keys.take_key(i, c) });
                     }
                 } else {
                     self.tombs -= 1; // the slot was a `TOMB`, now `EMPTY`
@@ -1061,7 +1101,20 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
 
     /// Empty the table into an iterator of its `(key, value)` pairs, keeping the table usable.
     pub fn drain(&mut self) -> IntoIter<K, V, KS> {
-        std::mem::replace(self, Self::with_bits(3)).into_iter()
+        // The emptied table keeps its fold: a seeded table stays seeded under the same secret.
+        let mut fresh = Self::with_bits(3);
+        fresh.seed = self.seed;
+        std::mem::replace(self, fresh).into_iter()
+    }
+
+    /// A borrowed view's coordinate under this table's fold: [`Locate::coord`], or its keyed form when
+    /// the table is seeded. The [`Locate`] twin of [`coord_of`](Self::coord_of).
+    #[inline]
+    fn view_coord<Q: Locate<K>>(&self, q: &Q) -> u64 {
+        match self.seed {
+            None => q.coord(),
+            Some(s) => q.coord_keyed(s),
+        }
     }
 
     /// The side-store twin of [`probe_capped_locate`](Self::probe_capped_locate): the entry whose
@@ -1073,7 +1126,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     {
         let mut i = 0;
         while i < self.side.coords.len() {
-            if self.side.coords[i] == coord && self.side.keys.matches_locate(i, coord, q) {
+            // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
+            if self.side.coords[i] == coord && unsafe { self.side.keys.matches_locate(i, coord, q) } {
                 return Some(i);
             }
             i += 1;
@@ -1088,7 +1142,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     where
         KS: KeyReadout<K>,
     {
-        let coord = q.coord();
+        let coord = self.view_coord(q);
         if is_sentinel(coord) {
             return self.side_find_locate(coord, q).map(Located::Side);
         }
@@ -1114,7 +1168,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
         let home = self.home(coord);
         // SAFETY: home ∈ [0, len).
         let sc = unsafe { *self.coords.get_unchecked(home) };
-        if sc == coord && self.keys.matches_locate(home, coord, q) {
+        // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
+        if sc == coord && unsafe { self.keys.matches_locate(home, coord, q) } {
             return Capped::Hit(home);
         }
         if sc == EMPTY {
@@ -1130,7 +1185,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
 /// face is retained under its historical name.
 impl<K: Eq + Coord, V> Table<K, V, Stored<K>> {
     /// [`get_exact`](Table::get_exact) from a borrowed key — also compares the stored key, so a
-    /// `2⁻⁶⁴` coordinate collision reads as absent instead of returning someone else's value.
+    /// key that shares a coordinate with another reads as absent instead of returning that key's value.
     #[inline]
     pub fn get_exact_at<Q: Locate<K>>(&self, q: Q) -> Option<&V> {
         self.get_at(q)
@@ -1299,7 +1354,8 @@ where
             // SAFETY: `step` only yields in-bounds live lanes ⇒ this slot's value (and, for
             // `Stored`, its key) is initialized, and the index needs no bounds check.
             let c = unsafe { *t.coords.get_unchecked(i) };
-            return Some((t.keys.key(i, c), unsafe {
+            // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
+            return Some((unsafe { t.keys.key(i, c) }, unsafe {
                 t.vals.get_unchecked(i).assume_init_ref()
             }));
         }
@@ -1309,7 +1365,7 @@ where
             self.seen += 1;
             let c = t.side.coords[i];
             // SAFETY: every side entry's key and value are initialized.
-            return Some((t.side.keys.key(i, c), unsafe {
+            return Some((unsafe { t.side.keys.key(i, c) }, unsafe {
                 t.side.vals.get_unchecked(i).assume_init_ref()
             }));
         }
@@ -1371,7 +1427,8 @@ impl<K: Coord + Eq, V, KS: KeyStore<K>> Iterator for IntoIter<K, V, KS> {
             // SAFETY: a live lane ⇒ value and (for Stored) key initialized. Both are moved out
             // exactly once, then the slot is blanked so this iterator's Drop skips it.
             let v = unsafe { self.vals.get_unchecked_mut(i).assume_init_read() };
-            let k = self.keys.take_key(i, c);
+            // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
+            let k = unsafe { self.keys.take_key(i, c) };
             self.coords[i] = EMPTY;
             return Some((k, v));
         }
@@ -1397,7 +1454,8 @@ impl<K: Coord + Eq, V, KS: KeyStore<K>> Drop for IntoIter<K, V, KS> {
             }
         }
         let coords = std::mem::take(&mut self.coords);
-        self.keys.drop_live(&coords);
+        // SAFETY: the slot is live, so its key is initialized (see `KeyStore`).
+        unsafe { self.keys.drop_live(&coords) };
         // `self.side` / `self.overflow` are Vec iterators; their remaining `(K, V)` pairs drop
         // themselves.
     }
@@ -1481,6 +1539,7 @@ impl<'a, K: Eq + Coord, KS: KeyReadout<K>, Q: Locate<K>> super::overflow::Confir
 {
     #[inline]
     fn confirm(&self, keys: &KS, i: usize) -> bool {
-        keys.matches_locate(i, self.coord, self.q)
+        // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
+        unsafe { keys.matches_locate(i, self.coord, self.q) }
     }
 }

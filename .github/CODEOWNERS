@@ -1,16 +1,18 @@
-# Code owners (CONTRIBUTING.md, "Enforcement"). Each security surface has its own entry, so a
-# subsystem maintainer can be named on one path without rights elsewhere. Later lines win.
-*                   @paperboygold
-/src/format/        @paperboygold
-/src/engine/        @paperboygold
-/src/gpu/           @paperboygold
-/src/map/           @paperboygold
-/src/crypto/        @paperboygold
-/proof/             @paperboygold
-/.github/           @paperboygold
-/.mailmap           @paperboygold
-/AGENTS.md          @paperboygold
-/CONTRIBUTING.md    @paperboygold
-/SECURITY.md        @paperboygold
-/LICENSE            @paperboygold
-/NOTICE             @paperboygold
+# Code owners of the webfold-ai/apeiron fork (CONTRIBUTING.md, "Enforcement"). The upstream
+# sanguinehost/apeiron is run by its author, Lucas Rose-Winters (@paperboygold), who does not
+# contribute to this fork. Each security surface has its own entry, so a subsystem maintainer can be
+# named on one path without rights elsewhere. Later lines win.
+*                   @yokoszn
+/src/format/        @yokoszn
+/src/engine/        @yokoszn
+/src/gpu/           @yokoszn
+/src/map/           @yokoszn
+/src/crypto/        @yokoszn
+/proof/             @yokoszn
+/.github/           @yokoszn
+/.mailmap           @yokoszn
+/AGENTS.md          @yokoszn
+/CONTRIBUTING.md    @yokoszn
+/SECURITY.md        @yokoszn
+/LICENSE            @yokoszn
+/NOTICE             @yokoszn

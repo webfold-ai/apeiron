@@ -53,6 +53,70 @@ pub trait Coord {
     const INJECTIVE: bool = false;
     /// This key's 64-bit address.
     fn coord(&self) -> u64;
+    /// This key's address under a secret [`FoldKey`]: what a seeded [`Table`] uses, so an attacker who
+    /// knows the public fold (and [`PHI`](crate::map::hashtrinity::PHI)) cannot aim keys at chosen
+    /// slots.
+    ///
+    /// The default keys the finished coordinate, which is right for an integer (injective, so no
+    /// collision to hide). Types whose `coord` folds bytes or several components key the fold
+    /// *itself*: a collision of the unkeyed 64-bit value would survive any bijection applied after it.
+    /// It must be a pure function of `(key, fold key)`.
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        keyed_mix(self.coord(), key)
+    }
+}
+
+/// The secret that turns a [`Table`]'s fold into a keyed one ([`Table::with_random_seed`]). It is the
+/// *only* defence of a seeded table against chosen keys, so for untrusted keys it must be
+/// unpredictable to the attacker: use [`FoldKey::random`]. The keyed fold is a multiply-fold, not a
+/// cryptographic PRF: it defeats the public-constant aiming of the unseeded fold, not an attacker who
+/// can observe the seed or time individual operations.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct FoldKey {
+    k0: u64,
+    k1: u64, // forced odd: it is a multiplier
+}
+
+impl FoldKey {
+    /// A key from an explicit 128-bit seed (reproducible; for tests and replay). Do not use a
+    /// guessable seed against attacker-chosen keys. 127 bits of the seed are used (the multiplier is
+    /// forced odd).
+    pub const fn new(seed: u128) -> Self {
+        FoldKey {
+            k0: seed as u64,
+            k1: (seed >> 64) as u64 | 1,
+        }
+    }
+
+    /// A fresh unpredictable key from the standard library's per-process random state
+    /// (`RandomState`): no dependency, no `unsafe`.
+    pub fn random() -> Self {
+        use std::hash::BuildHasher;
+        let rs = std::collections::hash_map::RandomState::new();
+        let hi = u128::from(rs.hash_one(0x4861_7368_5472_696Eu64));
+        let lo = u128::from(rs.hash_one(0x6974_7920_466F_6C64u64));
+        Self::new((hi << 64) | lo)
+    }
+}
+
+impl std::fmt::Debug for FoldKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FoldKey(..)") // the secret is never printed
+    }
+}
+
+/// Two keyed multiply rounds over a finished coordinate: secret xor and secret odd multiplier each.
+#[inline]
+fn keyed_mix(c: u64, k: FoldKey) -> u64 {
+    let a = folded_mul(c ^ k.k0, k.k1);
+    folded_mul(a ^ k.k0.rotate_left(17), k.k1.rotate_left(29) | 1)
+}
+
+/// Combine two already-keyed component coordinates (tuples).
+#[inline]
+pub(crate) fn keyed_pair(a: u64, b: u64, k: FoldKey) -> u64 {
+    folded_mul(a ^ k.k0, b ^ k.k1)
 }
 
 macro_rules! int_coord {
@@ -96,23 +160,43 @@ pub trait KeyStore<K: Coord>: Sized {
     /// Allocate a store for `n` slots.
     fn alloc(n: usize) -> Self;
     /// Record slot `i`'s key (Stored: keep it; Regen: a no-op — the address carries it).
-    fn set(&mut self, i: usize, k: K);
+    /// # Safety
+    /// `i` is in bounds and slot `i` is not live (a value there would be overwritten undropped).
+    unsafe fn set(&mut self, i: usize, k: K);
     /// Whether slot `i` holds key `q` (an exact compare; trivially true on the Regen path).
-    fn matches(&self, i: usize, coord: u64, q: &K) -> bool;
+    /// # Safety
+    /// Slot `i` is in bounds and live.
+    unsafe fn matches(&self, i: usize, coord: u64, q: &K) -> bool;
+    /// Run `f` on a reference to slot `i`'s key (borrowed if stored, regenerated if not). The
+    /// key-borrowing face the exact comparisons use without taking ownership of the key.
+    ///
+    /// # Safety
+    /// Slot `i` must be live.
+    unsafe fn with_key<R>(&self, i: usize, coord: u64, f: impl FnOnce(&K) -> R) -> R;
     /// Move slot `i`'s key into slot `j` of `dst` (used while growing).
-    fn migrate(&mut self, i: usize, dst: &mut Self, j: usize);
+    /// # Safety
+    /// Slot `i` of `self` is live and the caller stops treating it as live afterwards; `j` is in
+    /// bounds of `dst` and not live there.
+    unsafe fn migrate(&mut self, i: usize, dst: &mut Self, j: usize);
     /// Move slot `i`'s key out (Stored: take it; Regen: regenerate it).
-    fn take_key(&mut self, i: usize, coord: u64) -> K;
+    /// # Safety
+    /// Slot `i` is live; the caller blanks its coordinate, so the key is not read or dropped again.
+    unsafe fn take_key(&mut self, i: usize, coord: u64) -> K;
     /// Clone the LIVE keys (`is_live(coords[i])` — excludes `EMPTY` and a removed slot's `TOMB`)
     /// into a fresh store. Liveness is the caller's coordinate line — the store carries no
     /// discriminant of its own (see [`Stored`]).
     #[must_use]
-    fn clone_live(&self, coords: &[u64]) -> Self
+    /// # Safety
+    /// `coords.len()` does not exceed the store's slot count, and `coords[i]` is live exactly where
+    /// slot `i`'s key is initialized.
+    unsafe fn clone_live(&self, coords: &[u64]) -> Self
     where
         K: Clone;
     /// Drop the LIVE keys. Called by `Table`'s `Drop`; a no-op when `K` has no destructor or
     /// nothing is stored.
-    fn drop_live(&mut self, coords: &[u64]);
+    /// # Safety
+    /// As [`clone_live`](Self::clone_live); the keys are dropped, so they are not read again.
+    unsafe fn drop_live(&mut self, coords: &[u64]);
 }
 
 /// Key readback — the borrowed/owned key projection, split off [`KeyStore`] so the storage trait
@@ -130,7 +214,9 @@ pub trait KeyReadout<K: Coord>: KeyStore<K> {
         Self: 'a,
         K: 'a;
     /// The key at slot `i` — borrowed if stored, regenerated from `coord` if not.
-    fn key(&self, i: usize, coord: u64) -> Self::Key<'_>;
+    /// # Safety
+    /// Slot `i` is in bounds and live.
+    unsafe fn key(&self, i: usize, coord: u64) -> Self::Key<'_>;
     /// The readout of an already-materialized key `k` — the [`Overflow`](crate::map::hashtrinity::Overflow)
     /// tree stores keys inline rather than in the index-addressed store, so its iteration projects
     /// a key it holds directly. `&K` when stored; regenerated from the key's
@@ -141,7 +227,9 @@ pub trait KeyReadout<K: Coord>: KeyStore<K> {
         K: 'a;
     /// Whether the key at slot `i` is exactly the key a borrowed [`Locate`] view names. The borrowed
     /// faces' full-key confirmation — the twin of [`KeyStore::matches`], which takes an owned `&K`.
-    fn matches_locate<Q>(&self, i: usize, coord: u64, q: &Q) -> bool
+    /// # Safety
+    /// Slot `i` is in bounds and live.
+    unsafe fn matches_locate<Q>(&self, i: usize, coord: u64, q: &Q) -> bool
     where
         K: Eq,
         Q: Locate<K>;
@@ -174,12 +262,12 @@ impl<K: Coord + Eq> KeyStore<K> for Stored<K> {
         Stored(alloc_uninit_boxed(n))
     }
     #[inline]
-    fn set(&mut self, i: usize, k: K) {
+    unsafe fn set(&mut self, i: usize, k: K) {
         // only ever called on a previously-EMPTY slot — nothing to drop
         unsafe { *self.0.get_unchecked_mut(i) = MaybeUninit::new(k) };
     }
     #[inline]
-    fn matches(&self, i: usize, _coord: u64, q: &K) -> bool {
+    unsafe fn matches(&self, i: usize, _coord: u64, q: &K) -> bool {
         // When `coord` is injective, `coords[i] == q.coord()` (the caller's precondition) already
         // implies `self.0[i] == q`, so the stored-key load is redundant and is skipped. The branch
         // is on a const, so it folds away per `K` — no cost on the opaque-key path.
@@ -190,7 +278,12 @@ impl<K: Coord + Eq> KeyStore<K> for Stored<K> {
         unsafe { self.0.get_unchecked(i).assume_init_ref() == q }
     }
     #[inline]
-    fn migrate(&mut self, i: usize, dst: &mut Self, j: usize) {
+    unsafe fn with_key<R>(&self, i: usize, _coord: u64, f: impl FnOnce(&K) -> R) -> R {
+        // SAFETY: slot `i` live ⇒ in bounds and initialized (the caller's contract).
+        f(unsafe { self.0.get_unchecked(i).assume_init_ref() })
+    }
+    #[inline]
+    unsafe fn migrate(&mut self, i: usize, dst: &mut Self, j: usize) {
         // SAFETY: src occupied ⇒ initialized; the caller blanks src's coord, so src's Drop skips it.
         unsafe {
             *dst.0.get_unchecked_mut(j) =
@@ -198,11 +291,11 @@ impl<K: Coord + Eq> KeyStore<K> for Stored<K> {
         };
     }
     #[inline]
-    fn take_key(&mut self, i: usize, _coord: u64) -> K {
+    unsafe fn take_key(&mut self, i: usize, _coord: u64) -> K {
         // SAFETY: occupied ⇒ initialized; the caller blanks the coord, so Drop skips it.
         unsafe { self.0.get_unchecked_mut(i).assume_init_read() }
     }
-    fn clone_live(&self, coords: &[u64]) -> Self
+    unsafe fn clone_live(&self, coords: &[u64]) -> Self
     where
         K: Clone,
     {
@@ -221,7 +314,7 @@ impl<K: Coord + Eq> KeyStore<K> for Stored<K> {
         }
         out
     }
-    fn drop_live(&mut self, coords: &[u64]) {
+    unsafe fn drop_live(&mut self, coords: &[u64]) {
         if std::mem::needs_drop::<K>() {
             let mut i = 0usize;
             while i < coords.len() {
@@ -243,7 +336,7 @@ impl<K: Coord + Eq> KeyReadout<K> for Stored<K> {
     where
         K: 'a;
     #[inline]
-    fn key(&self, i: usize, _coord: u64) -> &K {
+    unsafe fn key(&self, i: usize, _coord: u64) -> &K {
         // SAFETY: only called on an occupied slot — the invariant says initialized.
         unsafe { self.0.get_unchecked(i).assume_init_ref() }
     }
@@ -256,7 +349,7 @@ impl<K: Coord + Eq> KeyReadout<K> for Stored<K> {
         k
     }
     #[inline]
-    fn matches_locate<Q: Locate<K>>(&self, i: usize, coord: u64, q: &Q) -> bool {
+    unsafe fn matches_locate<Q: Locate<K>>(&self, i: usize, coord: u64, q: &Q) -> bool {
         q.same(self.key(i, coord))
     }
 }
@@ -273,9 +366,9 @@ impl<K: CoordInv + Eq> KeyStore<K> for Regen<K> {
         Regen(std::marker::PhantomData)
     }
     #[inline]
-    fn set(&mut self, _i: usize, _k: K) {} // the address is the key — nothing to store
+    unsafe fn set(&mut self, _i: usize, _k: K) {} // the address is the key — nothing to store
     #[inline]
-    fn matches(&self, _i: usize, _coord: u64, _q: &K) -> bool {
+    unsafe fn matches(&self, _i: usize, _coord: u64, _q: &K) -> bool {
         // `CoordInv` round-trips (`from_coord(k.coord()) == k`), so whenever this runs with
         // `coords[i] == coord` and `q.coord() == coord` — every caller's precondition — the key at
         // slot `i` IS `q`, and the compare is redundant. This is the same redundancy [`Stored`] skips
@@ -285,20 +378,24 @@ impl<K: CoordInv + Eq> KeyStore<K> for Regen<K> {
         true
     }
     #[inline]
-    fn migrate(&mut self, _i: usize, _dst: &mut Self, _j: usize) {} // regenerated in the new table
+    unsafe fn with_key<R>(&self, _i: usize, coord: u64, f: impl FnOnce(&K) -> R) -> R {
+        f(&K::from_coord(coord))
+    }
     #[inline]
-    fn take_key(&mut self, _i: usize, coord: u64) -> K {
+    unsafe fn migrate(&mut self, _i: usize, _dst: &mut Self, _j: usize) {} // regenerated in the new table
+    #[inline]
+    unsafe fn take_key(&mut self, _i: usize, coord: u64) -> K {
         K::from_coord(coord)
     }
     #[inline]
-    fn clone_live(&self, _coords: &[u64]) -> Self
+    unsafe fn clone_live(&self, _coords: &[u64]) -> Self
     where
         K: Clone,
     {
         Regen(std::marker::PhantomData) // nothing stored, nothing to clone
     }
     #[inline]
-    fn drop_live(&mut self, _coords: &[u64]) {} // nothing stored, nothing to drop
+    unsafe fn drop_live(&mut self, _coords: &[u64]) {} // nothing stored, nothing to drop
 }
 
 impl<K: CoordInv + Eq> KeyReadout<K> for Regen<K> {
@@ -307,7 +404,7 @@ impl<K: CoordInv + Eq> KeyReadout<K> for Regen<K> {
     where
         K: 'a;
     #[inline]
-    fn key(&self, _i: usize, coord: u64) -> K {
+    unsafe fn key(&self, _i: usize, coord: u64) -> K {
         K::from_coord(coord)
     }
     #[inline]
@@ -320,7 +417,7 @@ impl<K: CoordInv + Eq> KeyReadout<K> for Regen<K> {
         K::from_coord(k.coord())
     }
     #[inline]
-    fn matches_locate<Q: Locate<K>>(&self, _i: usize, coord: u64, q: &Q) -> bool {
+    unsafe fn matches_locate<Q: Locate<K>>(&self, _i: usize, coord: u64, q: &Q) -> bool {
         q.same(&self.key(_i, coord))
     }
 }
@@ -329,11 +426,23 @@ impl Coord for u128 {
     fn coord(&self) -> u64 {
         (*self as u64) ^ ((*self >> 64) as u64)
     }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        // Both halves enter the keyed multiply separately, so `5` and `5 << 64` stay apart under a key.
+        keyed_mix(
+            folded_mul((*self as u64) ^ key.k0, ((*self >> 64) as u64) ^ key.k1),
+            key,
+        )
+    }
 }
 impl Coord for i128 {
     #[inline]
     fn coord(&self) -> u64 {
         (*self as u128).coord()
+    }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        (*self as u128).coord_keyed(key)
     }
 }
 impl Coord for char {
@@ -379,20 +488,58 @@ fn folded_mul(a: u64, b: u64) -> u64 {
 /// `folded_mul` — twice the input per multiply, and each `folded_mul` is a single `mulx` with none
 /// of that scaffolding. A ≤16-byte key is ONE folded multiply; the benchmark's 17–24-byte key is
 /// two; both far fewer instructions than the striped chain. Each `folded_mul` is the proven
-/// counted-`2^64`-fiber boundary (`xorHalves_balanced`); keys ≤ 15 bytes pack injectively and
-/// separate EXACTLY (`pack_injective` — the `2^-64` tradeoff is a long-key statement only).
+/// counted-`2^64`-fiber boundary (`xorHalves_balanced`). **Only keys of at most 7 bytes are
+/// injective** (length and bytes packed into one word, then a bijective mix; across lengths too).
+/// From 8 bytes up the input space exceeds 2^64, so collisions exist by counting; `2^-64` is the
+/// per-pair rate for *random* keys, not a guarantee against chosen ones: a 9–16 byte collision is a
+/// closed-form factorisation of the 128-bit product (`(2m)·n == m·(2n)`), and a birthday search
+/// needs about 2^32 evaluations by the birthday bound (not measured here). [`Table`] stays exact
+/// regardless (it compares the key); [`FreqMap`] trusts the fold.
 /// Measured: all six FreqMap-vs-hashbrown quadrants win, the in-cache-miss residual (once +28%,
 /// last +9%) now −3%. Everything proven downstream of the u64 (routing, descent, hashdos) untouched.
+/// The unkeyed byte fold: [`fold_bytes_with`] with the golden constants.
 #[inline]
 fn fold_bytes(b: &[u8]) -> u64 {
+    fold_bytes_with(b, PHI, PHI_HI)
+}
+
+/// [`fold_bytes`] with its two constants supplied: `p` seeds the fold (xor) and `q` is the odd
+/// multiplier. The unkeyed fold passes `(PHI, q)`, so its values are unchanged; a keyed fold
+/// passes the secret ([`FoldKey`]), so the key is mixed inside the fold, not after it.
+#[inline]
+fn fold_bytes_with(b: &[u8], p: u64, q: u64) -> u64 {
     let len = b.len();
-    let seed = PHI ^ (len as u64).wrapping_mul(PHI_HI); // length differentiates, folded in below
-    if len >= 8 {
-        return if len <= 16 {
+    if len < 8 {
+        // Short keys (< 8 bytes) pack INJECTIVELY across lengths: the bytes, zero-padded into the low
+        // 7 bytes of one word, and the length in the top byte, then a bijective mix (xor a constant,
+        // xor-shift). Distinct (length, bytes) ⇒ distinct word ⇒ distinct coordinate. A length-only
+        // seed made the map injective per length alone: a 4-byte and a 5-byte key could share a
+        // coordinate in closed form (audit CLM-02).
+        //
+        // Per length the packing is injective: ≥4 bytes take the first 4 and the last `len` − 4 bytes
+        // (positions 4..len, realigned to bits 32..); 1..=3 bytes take bytes 0, len/2, len−1 (for
+        // len 1 and 2 that repeats a byte, which is still injective within the length).
+        let packed = if len >= 4 {
+            let lo = u32::from_le_bytes(b[..4].try_into().unwrap()) as u64;
+            let hi = u32::from_le_bytes(b[len - 4..].try_into().unwrap()) as u64;
+            // `hi` holds bytes len-4..len; shifting right by 8·(8−len) keeps exactly positions 4..len.
+            lo | ((hi >> (8 * (8 - len))) << 32)
+        } else if len > 0 {
+            (b[0] as u64) | ((b[len / 2] as u64) << 8) | ((b[len - 1] as u64) << 16)
+        } else {
+            0
+        };
+        let x = (packed | ((len as u64) << 56)) ^ p;
+        return x ^ (x >> 32);
+    }
+    // 8 bytes and up: `len` is 8..; the seed differentiates lengths, folded in below.
+    let seed = p ^ (len as u64).wrapping_mul(q);
+    {
+        if len <= 16 {
             // two overlapping words, ONE folded multiply (16 bytes → 64 bits, was 2 muls striped).
             let a = u64::from_le_bytes(b[..8].try_into().unwrap());
             let c = u64::from_le_bytes(b[len - 8..].try_into().unwrap()); // overlap, no copy
-            folded_mul(a ^ seed, c ^ PHI_HI)
+            folded_mul(a ^ seed, c ^ q)
         } else if len <= 24 {
             // three words, TWO folded multiplies run INDEPENDENTLY (`FoldDepth.synthFold`): `s0`
             // reads the head, `s1` reads the tail, neither reads the other's output — serial multiply
@@ -406,8 +553,8 @@ fn fold_bytes(b: &[u8]) -> u64 {
             let a = u64::from_le_bytes(b[..8].try_into().unwrap());
             let mid = u64::from_le_bytes(b[8..16].try_into().unwrap());
             let c = u64::from_le_bytes(b[len - 8..].try_into().unwrap());
-            let s0 = folded_mul(a ^ seed, mid ^ PHI_HI);
-            let s1 = folded_mul(c ^ seed, mid ^ PHI_HI);
+            let s0 = folded_mul(a ^ seed, mid ^ q);
+            let s1 = folded_mul(c ^ seed, mid ^ q);
             s0.rotate_left(5) ^ s1
         } else {
             // > 24 bytes: nonlinear 16-byte-block accumulator (half the per-word chain's depth,
@@ -417,26 +564,14 @@ fn fold_bytes(b: &[u8]) -> u64 {
             while s.len() > 16 {
                 let x = u64::from_le_bytes(s[..8].try_into().unwrap());
                 let y = u64::from_le_bytes(s[8..16].try_into().unwrap());
-                acc = folded_mul(acc ^ x, y ^ PHI_HI);
+                acc = folded_mul(acc ^ x, y ^ q);
                 s = &s[16..];
             }
             let x = u64::from_le_bytes(b[len - 16..len - 8].try_into().unwrap()); // overlap tail
             let y = u64::from_le_bytes(b[len - 8..].try_into().unwrap());
-            folded_mul(acc ^ x, y ^ PHI_HI)
-        };
+            folded_mul(acc ^ x, y ^ q)
+        }
     }
-    // short keys (< 8 bytes): pack overlapping reads, light mix; the probe supplies the multiply.
-    let raw = if len >= 4 {
-        let lo = u32::from_le_bytes(b[..4].try_into().unwrap()) as u64;
-        let hi = u32::from_le_bytes(b[len - 4..].try_into().unwrap()) as u64;
-        (lo << 32) | hi
-    } else if len > 0 {
-        (b[0] as u64) | ((b[len / 2] as u64) << 16) | ((b[len - 1] as u64) << 32)
-    } else {
-        0
-    };
-    let x = raw ^ seed;
-    x ^ (x >> 32)
 }
 
 impl Coord for str {
@@ -444,17 +579,29 @@ impl Coord for str {
     fn coord(&self) -> u64 {
         fold_bytes(self.as_bytes())
     }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        keyed_mix(fold_bytes_with(self.as_bytes(), key.k0, key.k1), key)
+    }
 }
 impl Coord for String {
     #[inline]
     fn coord(&self) -> u64 {
         fold_bytes(self.as_bytes())
     }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        self.as_str().coord_keyed(key)
+    }
 }
 impl Coord for [u8] {
     #[inline]
     fn coord(&self) -> u64 {
         fold_bytes(self)
+    }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        keyed_mix(fold_bytes_with(self, key.k0, key.k1), key)
     }
 }
 impl<T: Coord + ?Sized> Coord for &T {
@@ -463,17 +610,30 @@ impl<T: Coord + ?Sized> Coord for &T {
     fn coord(&self) -> u64 {
         (**self).coord()
     }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        (**self).coord_keyed(key)
+    }
 }
 impl<A: Coord, B: Coord> Coord for (A, B) {
     #[inline]
     fn coord(&self) -> u64 {
         self.0.coord().wrapping_mul(PHI) ^ self.1.coord()
     }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        keyed_pair(self.0.coord_keyed(key), self.1.coord_keyed(key), key)
+    }
 }
 impl<A: Coord, B: Coord, C: Coord> Coord for (A, B, C) {
     #[inline]
     fn coord(&self) -> u64 {
         (self.0.coord().wrapping_mul(PHI) ^ self.1.coord()).wrapping_mul(PHI) ^ self.2.coord()
+    }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        let ab = keyed_pair(self.0.coord_keyed(key), self.1.coord_keyed(key), key);
+        keyed_pair(ab, self.2.coord_keyed(key), key)
     }
 }
 
@@ -613,7 +773,7 @@ impl<K: Eq + Coord, KS: KeyStore<K>> Table<K, i64, KS> {
     /// Add `v` to `k`'s running total (starting from 0).
     #[inline]
     pub fn add(&mut self, k: K, v: i64) {
-        let coord = Self::coord_of(&k);
+        let coord = self.coord_of(&k);
         self.add_with_coord(coord, k, v);
     }
 
@@ -639,7 +799,8 @@ impl<K: Eq + Coord, KS: KeyStore<K>> Table<K, i64, KS> {
             Capped::Vacant(i) => {
                 unsafe { *self.coords.get_unchecked_mut(i) = coord };
                 unsafe { *self.vals.get_unchecked_mut(i) = MaybeUninit::new(v) };
-                self.keys.set(i, k);
+                // SAFETY: the slot is in bounds and not live, so no initialized key is overwritten.
+                unsafe { self.keys.set(i, k) };
                 self.len += 1;
             }
             Capped::Blocked => {
@@ -672,7 +833,7 @@ impl<K: Eq + Coord, KS: KeyStore<K>> Table<K, i64, KS> {
         }
         let mut coords = [0u64; P];
         for (i, c) in coords.iter_mut().enumerate() {
-            *c = Self::coord_of(&keys[i]);
+            *c = self.coord_of(&keys[i]);
             self.prefetch_coord(*c);
         }
         for i in 0..n {
@@ -680,7 +841,7 @@ impl<K: Eq + Coord, KS: KeyStore<K>> Table<K, i64, KS> {
             self.add_with_coord(c, keys[i], 1);
             let j = i + P;
             if j < n {
-                let cj = Self::coord_of(&keys[j]);
+                let cj = self.coord_of(&keys[j]);
                 coords[j & (P - 1)] = cj; // j ≡ i (mod P): the ring slot we just consumed
                 self.prefetch_coord(cj);
             }
@@ -839,7 +1000,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
                 // `other`'s Drop skips it (and any remaining slots still drop once if `f` panics).
                 let v = unsafe { other.vals.get_unchecked_mut(i).assume_init_read() };
                 other.coords[i] = EMPTY;
-                let k = other.keys.take_key(i, c); // Stored: move; Regen: regenerate
+                // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
+                let k = unsafe { other.keys.take_key(i, c) }; // Stored: move; Regen: regenerate
                 self.insert_with(k, v, &mut f);
             }
         }

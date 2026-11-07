@@ -2,7 +2,10 @@
 //! hashtrinity — a `K → V` table where the key is its own address.
 //!
 //! Not a wrapper over `std::HashMap`. One flat power-of-two array, one insert, and four merge
-//! functions that pick what kind of table you get. No random seed, so the layout is deterministic.
+//! functions that pick what kind of table you get. The default table has no random seed, so its layout
+//! is deterministic. Its fold is public, so chosen keys can be aimed at the same slots; the probe cap
+//! and the overflow tree bound each lookup, but not to `O(1)`. For keys an attacker chooses, use the
+//! opt-in seeded table ([`Table::with_random_seed`]).
 //!
 //! # One structure, four merges
 //!
@@ -22,7 +25,8 @@
 //!
 //! [`Table`] keeps the key (exact). Two keyless variants trade that for speed and footprint:
 //! [`CoordMap`] for coordinate keys (the address regenerates the key), and [`FreqMap`] for opaque
-//! keys it routes by fold (`2⁻⁶⁴` false-positive on non-members) — dedup / count / index.
+//! keys it routes by fold (a false merge on a `2⁻⁶⁴` fold collision, for random keys only) — dedup /
+//! count / index.
 //!
 //! # Why it's fast
 //!
@@ -30,12 +34,15 @@
 //! — no hash, no collision, one probe. Larger or byte keys fold to a 64-bit coordinate via `k·PHI`
 //! (Fibonacci hashing) and take the top `bits` as the home slot; a collision re-addresses by the next
 //! window of `k·PHI`. Multiply-by-odd is a bijection on 2⁶⁴, so distinct keys always separate within
-//! `⌈64/bits⌉` steps — no two keys can alias forever. Coordinate keys are HashDOS-immune by
-//! construction (`home(c) = c`: the only key that can occupy slot `s` is `s`). On the FOLD path the
-//! immunity is measured, not proved: separation bounds aliasing, not probe length, and
-//! `AggregationBound.descent_can_be_wholly_blocked` refutes the worst-case reading — `PHI` is public,
-//! so `PHI⁻¹` aims one crafted key at each slot a victim would try. `tests/hashdos.rs` is the red
-//! team and carries the numbers. No SipHash tax.
+//! `⌈64/bits⌉` steps — no two keys can alias forever. Integer keys below the array length have no
+//! hash at all (`home(c) = c`: the only such key that can occupy slot `s` is `s`), so they cannot be
+//! piled up, but only while no fold-path key shares the table. On the FOLD path the default table is
+//! not flood-resistant: separation bounds aliasing, not probe length
+//! (`AggregationBound.descent_can_be_wholly_blocked`), and `PHI` is public, so `PHI⁻¹` aims crafted
+//! keys at the slots a victim would try. The probe cap ([`PROBE_CAP`]) limits each primary probe, and
+//! keys it cannot place go to the overflow tree, so an aimed flood costs `O(log n)` per lookup there.
+//! `tests/hashdos.rs` measures it. The seeded table keys the fold with a secret and is the answer for
+//! untrusted keys. No SipHash tax on the default.
 //!
 //! # Which face, and when — see `FACES.md`
 //!
@@ -45,14 +52,15 @@
 //!
 //! | map | face | when | confirm |
 //! |-----|------|------|---------|
-//! | [`FreqMap`] | **NB** | join / count / dedup / cache / index — the analytical work | trusts the fold (`2^-64` false-positive) — the group probe |
+//! | [`FreqMap`] | **NB** | join / count / dedup / cache / index — the analytical work | trusts the fold (`2^-64` false merge for random keys) — the group probe |
 //! | [`CoordMap`] | **B** | dense *coordinate* keys you must resolve EXACTLY, worst-probe-1 | the address round-trips (regenerates the key) |
 //! | [`Table`] `Stored` | **B/U** | opaque keys you must resolve exactly OR read back | stores + compares the key |
 //!
 //! Default to **`FreqMap`** for the analytical faces (GROUP BY, JOIN, DISTINCT, counters): it is the
 //! proven group-probe engine (`GroupProbe.lean` — uniform fold, 16-wide tag glance miss filter, bounded
-//! terminal sweep), and `2^-64` is "never" on those workloads. Reach for `CoordMap`/`Table` only when a
-//! `2^-64` false positive is unacceptable or you must recover the key.
+//! terminal sweep), and the `2^-64` false-merge rate is negligible for random keys on those workloads.
+//! Reach for `CoordMap`/`Table` when a false merge is unacceptable, when keys are attacker-chosen (a
+//! seeded `Table`), or when you must recover the key.
 //!
 //! **Operation shape** (on any of them):
 //!
@@ -326,6 +334,8 @@ where
     bits: u32,
     len: usize,   // live PRIMARY main-slot entries (excludes tombstones and the overflow)
     tombs: usize, // deleted-but-not-yet-reclaimed slots; cleared on resize
+    // `Some` ⇒ every coordinate is the keyed fold ([`Coord::coord_keyed`]); set by `with_seed`.
+    seed: Option<FoldKey>,
     _k: std::marker::PhantomData<K>,
 }
 
@@ -345,7 +355,8 @@ impl<K: Coord, V, KS: KeyStore<K>> Drop for Table<K, V, KS> {
         }
         // the key store rides the same invariant; internally gated on needs_drop::<K>
         let coords = std::mem::take(&mut self.coords);
-        self.keys.drop_live(&coords);
+        // SAFETY: the slot is live, so its key is initialized (see `KeyStore`).
+        unsafe { self.keys.drop_live(&coords) };
         // Side entries: `coords` holds reserved markers (never `is_live`), so every entry's key and
         // value is dropped by the side store itself.
         self.side.clear();
@@ -383,12 +394,14 @@ impl<K: Coord + Clone, V: Clone, KS: KeyStore<K>> Clone for Table<K, V, KS> {
         let side = SideStore {
             coords: self.side.coords.clone(),
             vals: side_vals,
-            keys: self.side.keys.clone_live(&side_live_mask),
+            // SAFETY: the slot is live, so its key is initialized (see `KeyStore`).
+            keys: unsafe { self.side.keys.clone_live(&side_live_mask) },
             cap: self.side.coords.len(),
             _k: std::marker::PhantomData,
         };
         Table {
-            keys: self.keys.clone_live(&self.coords),
+            // SAFETY: the slot is live, so its key is initialized (see `KeyStore`).
+            keys: unsafe { self.keys.clone_live(&self.coords) },
             coords,
             vals,
             side,
@@ -396,6 +409,7 @@ impl<K: Coord + Clone, V: Clone, KS: KeyStore<K>> Clone for Table<K, V, KS> {
             bits: self.bits,
             len: self.len,
             tombs: self.tombs,
+            seed: self.seed,
             _k: std::marker::PhantomData,
         }
     }
@@ -414,6 +428,10 @@ impl<K: Coord, V, KS: KeyStore<K>> std::fmt::Debug for Table<K, V, KS> {
 
 /// A table for coordinate keys ([`CoordInv`], integers): the key regenerates from the address, so no
 /// key array. Builds a big map faster than hashbrown (no key writes) and uses less memory.
+///
+/// The two reserved coordinates `u64::MAX` (`EMPTY`) and `u64::MAX - 1` (`TOMB`) cannot be stored
+/// without a key, so inserting either panics before the table changes; reads report them absent.
+/// For `i64` keys these are `-1` and `-2`. Use a [`Table`], which keeps the key, for those values.
 pub type CoordMap<K, V> = Table<K, V, Regen<K>>;
 
 impl<K: Eq + Coord, V, KS: KeyStore<K>> Default for Table<K, V, KS> {
@@ -457,6 +475,46 @@ impl<K: Eq + Coord, V> Table<K, V, Stored<K>> {
     }
 }
 
+/// Seeded constructors, for keys an attacker chooses. The default table is **unseeded**: its fold is
+/// a public function of the key (`PHI` is public), so keys can be computed that all land on the slots
+/// a victim key probes. A seeded table keys every coordinate with a secret [`FoldKey`]
+/// ([`Coord::coord_keyed`]), so those keys cannot be aimed in advance. It stores the key and is exact.
+/// It exists only for the [`Stored`] species: a [`CoordMap`] regenerates the key from its address and
+/// so cannot hide it. The cost is one keyed fold per operation. The keyed fold is a multiply-fold,
+/// not a cryptographic PRF.
+impl<K: Eq + Coord, V> Table<K, V, Stored<K>> {
+    /// An empty seeded table with an explicit [`FoldKey`] (reproducible; for tests and replay). Against
+    /// an attacker the key must be unpredictable: see [`with_random_seed`](Self::with_random_seed).
+    pub fn with_seed(seed: FoldKey) -> Self {
+        let mut t = Self::with_bits(3);
+        t.seed = Some(seed);
+        t
+    }
+
+    /// A seeded table presized to hold `cap` keys.
+    pub fn with_seed_and_capacity(seed: FoldKey, cap: usize) -> Self {
+        let mut t = Self::with_bits(bits_for(cap));
+        t.seed = Some(seed);
+        t
+    }
+
+    /// An empty table with a fresh random [`FoldKey`] from `std`'s per-process random state: the
+    /// opt-in flood-resistant constructor for untrusted keys.
+    pub fn with_random_seed() -> Self {
+        Self::with_seed(FoldKey::random())
+    }
+
+    /// [`with_random_seed`](Self::with_random_seed), presized to hold `cap` keys.
+    pub fn with_random_seed_and_capacity(cap: usize) -> Self {
+        Self::with_seed_and_capacity(FoldKey::random(), cap)
+    }
+
+    /// Whether this table folds its keys under a secret ([`with_seed`](Self::with_seed)).
+    pub fn is_seeded(&self) -> bool {
+        self.seed.is_some()
+    }
+}
+
 /// Constructors for a [`CoordMap`] — coordinate keys, no key array (regenerated from the address).
 impl<K: CoordInv + Eq, V> Table<K, V, Regen<K>> {
     /// A coordinate map sized for `cap` keys — the same one sizing as [`Table::with_capacity`].
@@ -477,16 +535,20 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
             bits,
             len: 0,
             tombs: 0,
+            seed: None,
             _k: std::marker::PhantomData,
         }
     }
 
-    /// A key's coordinate — the identity on every coordinate. The two values reserved as occupancy
-    /// markers (`EMPTY`, `TOMB`) are held out of band (see [`SideStore`]), so no non-reserved
-    /// coordinate is remapped and `coord_of(U64::MAX)` is not folded onto another key's coordinate.
+    /// A key's coordinate: the key's own [`Coord::coord`], or its keyed coordinate when the table is
+    /// seeded ([`with_seed`](Table::with_seed)). The two values reserved as occupancy markers
+    /// (`EMPTY`, `TOMB`) are held out of band (see [`SideStore`]), so no coordinate is remapped here.
     #[inline]
-    fn coord_of(k: &K) -> u64 {
-        k.coord()
+    fn coord_of(&self, k: &K) -> u64 {
+        match self.seed {
+            None => k.coord(),
+            Some(s) => k.coord_keyed(s),
+        }
     }
 
     /// The home slot. A key that fits the array indexes directly (no hash); a larger key takes the
@@ -570,7 +632,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     /// with equal coordinates are two entries; a reserved coordinate is resolved in the [`SideStore`].
     #[inline]
     fn get_coord(&self, k: &K) -> Option<&V> {
-        let coord = Self::coord_of(k);
+        let coord = self.coord_of(k);
         if is_sentinel(coord) {
             let i = self.side.find(coord, k)?;
             // SAFETY: `find` only returns an entry whose `live` marker is set.
@@ -579,7 +641,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
         let home = self.home(coord);
         // SAFETY: home ∈ [0, len). The home hit reads one coord, confirms the key, then one value.
         let sc = unsafe { *self.coords.get_unchecked(home) };
-        if sc == coord && self.keys.matches(home, coord, k) {
+        // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
+        if sc == coord && unsafe { self.keys.matches(home, coord, k) } {
             return Some(unsafe { self.vals.get_unchecked(home).assume_init_ref() });
         }
         // The direct-addressed face (`home == coord`, i.e. a coordinate below the array length) is
@@ -628,7 +691,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
         }
         let mut coords = [0u64; P];
         for (i, c) in coords.iter_mut().enumerate() {
-            *c = Self::coord_of(&keys[i]);
+            *c = self.coord_of(&keys[i]);
             self.prefetch_coord(*c);
         }
         for i in 0..n {
@@ -637,7 +700,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
             visit(&keys[i], v);
             let j = i + P;
             if j < n {
-                let cj = Self::coord_of(&keys[j]);
+                let cj = self.coord_of(&keys[j]);
                 coords[j & (P - 1)] = cj; // j ≡ i (mod P): the slot we just consumed
                 self.prefetch_coord(cj);
             }
@@ -677,7 +740,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     /// reserved-coordinate key is removed from the [`SideStore`].
     #[inline]
     pub fn remove(&mut self, k: &K) -> Option<V> {
-        let coord = Self::coord_of(k);
+        let coord = self.coord_of(k);
         if is_sentinel(coord) {
             let i = self.side.find(coord, k)?;
             // SAFETY: `find` only returns an entry whose `live` marker is set.
@@ -695,7 +758,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
                 unsafe { *self.coords.get_unchecked_mut(i) = TOMB };
                 self.len -= 1;
                 self.tombs += 1;
-                drop(self.keys.take_key(i, coord));
+                // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
+                drop(unsafe { self.keys.take_key(i, coord) });
                 Some(old)
             }
             Capped::Vacant(_) => None,
@@ -724,7 +788,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     /// the side store instead of the slot arrays.
     #[inline]
     fn insert_core(&mut self, k: K, new: V, last_write: bool) -> Option<InsertHit<V>> {
-        let coord = Self::coord_of(&k);
+        let coord = self.coord_of(&k);
         if is_sentinel(coord) {
             if let Some(i) = self.side.find(coord, &k) {
                 drop(k);
@@ -778,7 +842,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
                 // SAFETY: probe returns an in-bounds EMPTY slot; coords, vals, keys share the index.
                 unsafe { *self.coords.get_unchecked_mut(i) = coord };
                 unsafe { *self.vals.get_unchecked_mut(i) = MaybeUninit::new(new) };
-                self.keys.set(i, k); // Stored: write the key; Regen: no-op
+                // SAFETY: the slot is in bounds and not live, so no initialized key is overwritten.
+                unsafe { self.keys.set(i, k) }; // Stored: write the key; Regen: no-op
                 self.len += 1;
                 None
             }
@@ -873,7 +938,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
                 // SAFETY: probe returns an in-bounds EMPTY slot.
                 unsafe { *self.coords.get_unchecked_mut(i) = coord };
                 unsafe { *self.vals.get_unchecked_mut(i) = MaybeUninit::new(v) };
-                self.keys.set(i, k); // Stored: write the key; Regen: no-op
+                // SAFETY: the slot is in bounds and not live, so no initialized key is overwritten.
+                unsafe { self.keys.set(i, k) }; // Stored: write the key; Regen: no-op
                 self.len += 1;
             }
             Capped::Blocked => {
@@ -927,13 +993,16 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     #[cold]
     fn resize(&mut self, new_bits: u32) {
         let mut bigger = Self::with_bits(new_bits);
+        // The stored coordinates are keyed: the rebuilt table must key them the same way.
+        bigger.seed = self.seed;
         let mut i = 0;
         while i < self.coords.len() {
             let c = self.coords[i];
             if is_live(c) {
                 // Move the key out first so the keyed probe can confirm it: two distinct keys with
                 // equal coordinates must land on two slots of the rebuilt table, not one.
-                let key = self.keys.take_key(i, c);
+                // SAFETY: the slot is live, so its key is initialized; it is not read again after this.
+                let key = unsafe { self.keys.take_key(i, c) };
                 // SAFETY: live coord ⇒ value initialized. Move the value out and blank the source
                 // coord so the old table's Drop skips it.
                 let v = unsafe { self.vals.get_unchecked_mut(i).assume_init_read() };
@@ -1013,8 +1082,9 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
 
     /// The coordinate seed matched to this table's slot count (see the [`seed`] module). `seed.home(c)`
     /// is this table's own home slot and `seed.residual(c)` is the rest of `c·PHI` the slot doesn't
-    /// carry — what a compact readout would store instead of the full coordinate. Diagnostic — not
-    /// part of the stable surface.
+    /// carry — what a compact readout would store instead of the full coordinate. It describes the
+    /// unkeyed coordinate, so it does not apply to a seeded table. Diagnostic — not part of the
+    /// stable surface.
     #[doc(hidden)]
     #[inline]
     pub fn coord_seed(&self) -> CoordSeed {
@@ -1034,7 +1104,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
         let home = self.home(coord);
         // SAFETY: home ∈ [0, len).
         let sc = unsafe { *self.coords.get_unchecked(home) };
-        if sc == coord && self.keys.matches(home, coord, k) {
+        // SAFETY: the slot is live: its coordinate matched a live one, so its key is initialized.
+        if sc == coord && unsafe { self.keys.matches(home, coord, k) } {
             return Some(unsafe { self.vals.get_unchecked(home).assume_init_ref() });
         }
         if sc == EMPTY {
@@ -1051,8 +1122,10 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     }
 }
 
-/// Equal iff the same entries: main slots by coordinate, side entries by coordinate and value (the
-/// coordinate identity the main comparison has always used).
+/// Equal iff the same entries: every live entry of `self` (main, side or overflow) is present in
+/// `other` under the same KEY with an equal value, and the counts agree. Keys are compared, not
+/// coordinates: two distinct keys may share a coordinate (`u128` `5` and `5 << 64`), and they are
+/// different entries. O(n) key lookups, each O(1) expected.
 impl<K: Eq + Coord, V: PartialEq, KS: KeyStore<K>> PartialEq for Table<K, V, KS> {
     fn eq(&self, other: &Self) -> bool {
         if self.len() != other.len() {
@@ -1062,44 +1135,33 @@ impl<K: Eq + Coord, V: PartialEq, KS: KeyStore<K>> PartialEq for Table<K, V, KS>
             if !is_live(*c) {
                 continue;
             }
-            // SAFETY: live coord ⇒ this value initialized; the match in `other` (primary or
-            // overflow) confirms an initialized value there.
-            if !other.holds_value_at(*c, unsafe { self.vals.get_unchecked(i).assume_init_ref() }) {
+            // SAFETY: live coord ⇒ slot i's key and value are initialized.
+            let same = unsafe {
+                self.keys.with_key(i, *c, |k| {
+                    other.get(k) == Some(self.vals.get_unchecked(i).assume_init_ref())
+                })
+            };
+            if !same {
                 return false;
             }
         }
-        // Overflow entries participate the same way; `len()` already fixed the count.
-        if let Some(o) = &self.overflow {
-            for (c, _k, v) in o.iter() {
-                if !other.holds_value_at(c, v) {
-                    return false;
-                }
-            }
-        }
-        // Side entries participate by `(coordinate, value)`, not through `len()` alone: two tables
-        // differing only in a reserved-coordinate entry must compare unequal. O(s²) with `s` the
-        // side-entry count (0 on ordinary tables).
-        if self.side.coords.len() != other.side.coords.len() {
-            return false;
-        }
-        let mut matched = vec![false; other.side.coords.len()];
         for i in 0..self.side.coords.len() {
             let c = self.side.coords[i];
-            // SAFETY: side entries are occupied ⇒ values initialized.
-            let v = unsafe { self.side.vals.get_unchecked(i).assume_init_ref() };
-            let mut hit = false;
-            for j in 0..other.side.coords.len() {
-                if !matched[j]
-                    && other.side.coords[j] == c
-                    && unsafe { other.side.vals.get_unchecked(j).assume_init_ref() } == v
-                {
-                    matched[j] = true;
-                    hit = true;
-                    break;
-                }
-            }
-            if !hit {
+            // SAFETY: side entries are occupied ⇒ keys and values are initialized.
+            let same = unsafe {
+                self.side.keys.with_key(i, c, |k| {
+                    other.get(k) == Some(self.side.vals.get_unchecked(i).assume_init_ref())
+                })
+            };
+            if !same {
                 return false;
+            }
+        }
+        if let Some(o) = &self.overflow {
+            for (_c, k, v) in o.iter() {
+                if other.get(k) != Some(v) {
+                    return false;
+                }
             }
         }
         true

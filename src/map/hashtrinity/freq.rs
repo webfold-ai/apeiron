@@ -284,7 +284,8 @@ impl<K: Coord + Eq + Copy + Sync> FreqMap<K, i64> {
     /// Below the crossover (small `n` / single core —
     /// `GatherCrossover`) it falls back to one serial aggregation. Cost is linear in `n` GIVEN a
     /// per-probe bound (`AggregationBound.build_linear_of_bounded_probes`, where that bound is a
-    /// hypothesis, refuted worst-case); `2^-64` fold-collision fp (the join/count use case).
+    /// hypothesis, refuted worst-case); fold-collision false merge `2^-64` for random keys (the
+    /// join/count use case).
     ///
     /// Panics on admission refusal ([`try_count_par`](Self::try_count_par) returns `None`
     /// instead): a `u32` histogram entry, a `usize` offset or an `i64` count overflowing.
@@ -344,7 +345,8 @@ impl<K: CoordInv + Eq + Copy + Sync> Table<K, i64, Regen<K>> {
     /// Below the crossover (small `n` / single core —
     /// `GatherCrossover`) it falls back to one serial aggregation. Cost is linear in `n` GIVEN a
     /// per-probe bound (`AggregationBound.build_linear_of_bounded_probes`, where that bound is a
-    /// hypothesis, refuted worst-case); `2^-64` fold-collision fp (the join/count use case).
+    /// hypothesis, refuted worst-case); fold-collision false merge `2^-64` for random keys (the
+    /// join/count use case).
     /// Phases 1–2 are the shared `FreqMap` count helpers; panics on admission refusal.
     #[must_use]
     pub fn count_par(keys: &[K]) -> Vec<Self> {
@@ -1241,10 +1243,15 @@ impl<V: Clone> Clone for FreqLine<V> {
 ///   surface; the descent's own worst case is the measured one, not a proved one).
 ///
 /// **The one tradeoff.** The fold is lossy, so two distinct keys with the same 64-bit fold collide,
-/// and a non-member query whose fold equals a member's is a false positive — both `2^-64` (zero over
-/// millions of probes). This is the map for dedup, joins, caches, counters, indexes on high-entropy
-/// keys, where `2^-64` is "never". A map that must reject arbitrary non-members exactly, or return
-/// the key, wants [`Table`]. `FreqMap` carries frequencies, not keys.
+/// and a non-member query whose fold equals a member's is a false positive. For *random* keys that
+/// is `2^-64` per pair. It is **not** a guarantee against keys an attacker chooses, and it does not
+/// hold for key types whose [`Coord`] is not injective: `u128`/`i128` and tuples collide in closed form
+/// (`5` and `5 << 64`), and 9–16 byte strings collide by factoring the 128-bit product. Only keys of
+/// at most 7 bytes are injective. `FreqMap` trusts the fold and has no seeded mode; the fold is
+/// public, so it is not flood-resistant. Use it for dedup, joins, caches, counters and indexes on
+/// high-entropy keys you trust. A map that must reject non-members exactly, return the key, or take
+/// untrusted keys wants [`Table`] (seeded: [`Table::with_random_seed`]). `FreqMap` carries
+/// frequencies, not keys.
 #[derive(Clone, Debug, Default)]
 pub struct FreqMap<K, V> {
     inner: FreqLine<V>,
@@ -1284,7 +1291,8 @@ impl<K: Coord, V> FreqMap<K, V> {
     /// occupancy over the group width, `w`-fold amplified against load
     /// (`GroupProbe.full_groups_bounded_by_occupancy`, the load inversion) — so a smaller footprint
     /// is strictly better: fewer cold lines on every out-of-cache access. The load knob is
-    /// `LoadFactorFrontier`'s, not a security flag — the probe is always immune.
+    /// `LoadFactorFrontier`'s, not a security flag. The fold is public, so this map is not
+    /// flood-resistant against chosen keys whatever the load (see the type docs).
     /// At `cap = 1e5`, 2^18 slots
     /// (4 MB, past a 2 MB L2) took 0.855 L2 misses per hit read, 2^17 takes 0.221.
     pub fn with_capacity(cap: usize) -> Self {
@@ -1301,7 +1309,8 @@ impl<K: Coord, V> FreqMap<K, V> {
         Self::with_capacity(cap)
     }
 
-    /// Look up a key by its frequency. `2^-64` false-positive on non-members (see the type docs).
+    /// Look up a key by its frequency. A false positive on a non-member whose fold equals a member's is
+    /// `2^-64` for random keys, not guaranteed for chosen ones (see the type docs).
     #[inline]
     pub fn get(&self, k: &K) -> Option<&V> {
         self.inner.get(Self::freq(k))
@@ -1512,9 +1521,10 @@ impl<K: Coord> FreqMap<K, i64> {
 #[cfg(test)]
 mod freqline_flood {
     //! Phase-4 gate: the ·PHI-collapse reads home/tag/descent from the fold's own bits, so an
-    //! adversary who controls the fold's top window controls the home group directly. Flood immunity
+    //! adversary who controls the fold's top window controls the home group directly. The probe bound
     //! must then rest ENTIRELY on the descent separating distinct folds within the radix depth (not on
-    //! any home-spread). These build the sharpest floods and assert the probe stays bounded.
+    //! any home-spread). These build the sharpest floods and assert the probe stays bounded for them.
+    //! That is a measurement of these key sets, not a flood-resistance proof.
     use super::{FreqMap, PHI};
 
     fn assert_bounded(keys: &[u64], label: &str) {

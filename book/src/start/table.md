@@ -1,9 +1,11 @@
 # A Table
 
-`apeiron::freq::Table<K, V>` is a flat hash table with no random seed. A key's address is a
-function of the key, so the layout is deterministic. The probe length is capped at
-`PROBE_CAP = 16`; a key that cannot be placed within the cap goes to an AVL overflow tree, so a
-crafted key set cannot drive lookups into unbounded probing (`tests/hashdos.rs`).
+`apeiron::freq::Table<K, V>` is a flat hash table. Its default form has no random seed: a key's
+address is a function of the key, so the layout is deterministic. The probe length is capped at
+`PROBE_CAP = 16`; a key that cannot be placed within the cap goes to an AVL overflow tree. A crafted
+key set therefore cannot drive a lookup into unbounded probing, but its keys are still public-fold
+aimed, so each lookup on them costs `O(log n)` in the overflow instead of `O(1)` (`tests/hashdos.rs`).
+For keys an attacker chooses, `Table::with_random_seed()` keys every address with a secret.
 
 `insert_with(key, new, merge)` is the only mutator. When the key is absent, `new` is stored. When
 it is present, `merge(old, new)` replaces the stored value. The merge function decides what kind
@@ -48,9 +50,9 @@ assert_eq!(grid.get(&1_000_004), None);
 |---|---|---|
 | opaque keys, exact lookup, read the keys back | `Table<K, V>` | stored and compared |
 | dense coordinate keys, exact lookup | `CoordMap<K, V>` | regenerated from the address |
-| counting, grouping, deduplication | `FreqMap<K, V>` | folded to 64 bits, `2^-64` false positive on non-members |
+| counting, grouping, deduplication | `FreqMap<K, V>` | folded to 64 bits, `2^-64` false merge for random keys |
 
 The first two resolve every key exactly. `FreqMap` trades that for speed and footprint and
-suits analytical work, where a `2^-64` false positive is negligible. The
+suits analytical work over keys you trust, where a `2^-64` false merge is negligible for random keys. The
 [theory chapter](../theory/table.md) states the address rule and the bound; the
 [verification chapter](../verification/evidence.md) states what is proved about this body and what is open.

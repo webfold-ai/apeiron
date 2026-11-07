@@ -7,9 +7,84 @@
 //! The compression round is the only parameter — SHA-512 (next) is the same fold, wider.
 //!
 //! **Zero dependencies outside `hashtrinity`** (whose `hex` masquerade replaces the `hex` crate).
+//!
+//! ## Timing: this module is NOT constant-time as a whole
+//!
+//! Only the primitives listed as constant-time below avoid branches and memory indices that
+//! depend on secret data. Everything else may leak secrets through timing or cache access
+//! patterns to an attacker who can measure it (a network peer timing handshakes, or a process on
+//! the same machine). Do not use the variable-time primitives with long-term secrets on hosts or
+//! paths where such an attacker exists.
+//!
+//! Constant-time in the secret (no secret-dependent branch, loop count or table index):
+//! - X25519 ([`x25519`]): fixed 255-step ladder with a masked `cswap`.
+//! - Ed25519 signing and key derivation ([`ed25519_sign`], [`ed25519_pubkey`], and the
+//!   benchmark baseline `ed25519_sign_daa`): masked comb lookup, double-and-always-add, branch-free scalar
+//!   reduction mod L.
+//! - P-256 key derivation, ECDSA signing and ECDH ([`p256_pubkey`], [`ecdsa_p256_sign`],
+//!   [`ecdh_p256`]): Montgomery-form field and mod-n arithmetic with masked final subtractions,
+//!   complete (Renes–Costello–Batina) point formulas, fixed 4-bit windows with a masked table scan,
+//!   and inversion by a fixed public exponent.
+//!
+//! Measured (release build, one pinned core, median of interleaved rounds): the time ratio between
+//! a weight-248 and a weight-8 P-256 scalar went from 10.9 to between 0.98 and 1.03, the same
+//! spread as two runs on one scalar; X25519 and Ed25519 signing were already at ratio ~1.0 and
+//! stay there. Residual leaks in these paths, by design or not removed:
+//! - `p256_pubkey` panics, and `ecdh_p256` returns `None`, for a secret ≡ 0 mod n (the result
+//!   is the point at infinity); the outcome is visible anyway.
+//! - The RFC 6979 nonce loop compares each HMAC-DRBG candidate with n using a branching compare
+//!   and retries on rejection (probability about 2^-32 per signature); rejected candidates are
+//!   discarded.
+//! - Constant time relies on 64×64→128-bit multiplication being constant-time on the target
+//!   (true for x86-64 and AArch64; not guaranteed on targets where it is a library call) and on the
+//!   compiler keeping the masked selects branch-free (`core::hint::black_box` is a best-effort
+//!   barrier; the generated assembly was not audited).
+//! - Verification and the curve-membership checks take public inputs and branch on them.
+//!
+//! Variable-time (secret-dependent branches or table lookups remain):
+//! - AES (`aes_gcm`, `aes_cbc`, `aes_ctr`): secret-indexed S-box table lookups (audit CRY-07).
+//! - GHASH in `aes_gcm`: bitwise multiply branching on the hash subkey H and the accumulator
+//!   (CRY-08).
+//! - RSA private-key operations (`rsa` PKCS#1 v1.5 and PSS signing): square-and-multiply on the
+//!   private exponent with bit-serial reduction, no CRT, no blinding (CRY-05). Key generation is
+//!   not constant-time either.
+//! - [`secp256k1`] signing, public-key derivation and recovery: double-and-add scalar multiply and
+//!   bit-serial modular reduction, as P-256 had before.
+//! - [`p384`] signing: the same variable-time double-and-add and bit-serial reduction.
+//! - [`mlkem`] decapsulation: the re-encryption check is an early-exit slice compare followed by a
+//!   branch, and coefficient reduction uses `%` on secret-derived values.
+//! - [`argon2`]: argon2id's data-dependent memory indexing (after the first half of the first
+//!   pass) is part of the algorithm's design.
 #![forbid(unsafe_code)]
 
 use crate::map::hashtrinity::hex::ToHex;
+
+/// Test-only operation counter for the constant-time regression tests: `ct_probe!()` marks one
+/// execution of a step whose count must not depend on secret data (a ladder swap, a conditional
+/// subtraction, a group addition). Tests run an operation on two secrets and compare the counts.
+/// Compiled out of non-test builds.
+#[cfg(test)]
+pub(crate) mod ct_probe {
+    use std::cell::Cell;
+    thread_local! {
+        static HITS: Cell<u64> = const { Cell::new(0) };
+    }
+    pub(crate) fn hit() {
+        HITS.with(|h| h.set(h.get() + 1));
+    }
+    /// Run `f` and return how many probe points it passed.
+    pub(crate) fn count<R>(f: impl FnOnce() -> R) -> u64 {
+        HITS.with(|h| h.set(0));
+        std::hint::black_box(f());
+        HITS.with(Cell::get)
+    }
+}
+macro_rules! ct_probe {
+    () => {
+        #[cfg(test)]
+        crate::map::hashtrinity::crypto::ct_probe::hit();
+    };
+}
 
 /// Cryptographically-secure random bytes, read directly from the kernel CSPRNG — the one place
 /// this crate touches the OS for randomness (salts, nonces, key generation), shared rather than
@@ -305,14 +380,17 @@ mod ed25519 {
         }
     }
 
-    /// SCALAR MUL — the FOLD: n·P = repeated ⊕ (double-and-add over the 256-bit scalar).
+    /// SCALAR MUL — the FOLD: n·P = repeated ⊕ (double-and-always-add over the 256-bit scalar).
+    /// Constant-time in the scalar (CRY-02): the addition is computed for every bit and kept or
+    /// dropped with a masked move (the Edwards addition is complete, so no exceptional cases).
     fn ge_scalarmul(scalar: &[u8; 32], p: &Ge) -> Ge {
         let mut r = ge_identity();
         for i in (0..256).rev() {
             r = ge_add(&r, &r);
-            if (scalar[i / 8] >> (i % 8)) & 1 == 1 {
-                r = ge_add(&r, p);
-            }
+            ct_probe!();
+            let sum = ge_add(&r, p);
+            let bit = ((scalar[i / 8] >> (i % 8)) & 1) as u64;
+            ge_cmov(&mut r, &sum, core::hint::black_box(bit).wrapping_neg());
         }
         r
     }
@@ -434,20 +512,21 @@ mod ed25519 {
         }
         true
     }
-    fn sub_u256(a: &mut [u64; 4], b: &[u64; 4]) {
-        let mut borrow = 0i128;
+    /// `a - b` mod 2^256 and the borrow out (0 or 1), with no data-dependent branch.
+    fn sub_u256(a: &[u64; 4], b: &[u64; 4]) -> ([u64; 4], u64) {
+        let mut r = [0u64; 4];
+        let mut borrow = 0u64;
         for i in 0..4 {
-            let v = a[i] as i128 - b[i] as i128 - borrow;
-            if v < 0 {
-                a[i] = (v + (1i128 << 64)) as u64;
-                borrow = 1;
-            } else {
-                a[i] = v as u64;
-                borrow = 0;
-            }
+            let v = (a[i] as u128).wrapping_sub(b[i] as u128 + borrow as u128);
+            r[i] = v as u64;
+            borrow = ((v >> 64) as u64) & 1;
         }
+        (r, borrow)
     }
     /// Reduce a little-endian byte string (≤64 bytes) mod L → 32 LE bytes.
+    ///
+    /// Constant-time in the value (CRY-02): one shift and one masked conditional subtraction per
+    /// input bit; the number of steps depends only on the (public) length.
     fn sc_reduce(bytes: &[u8]) -> [u8; 32] {
         let mut rem = [0u64; 4];
         for i in (0..bytes.len() * 8).rev() {
@@ -458,8 +537,12 @@ mod ed25519 {
                 *limb = (*limb << 1) | c;
                 c = nc;
             }
-            if ge_u256(&rem, &L) {
-                sub_u256(&mut rem, &L);
+            // rem < 2L < 2^254 here, so the shift above never overflows the four limbs.
+            ct_probe!();
+            let (diff, borrow) = sub_u256(&rem, &L);
+            let keep = core::hint::black_box(borrow).wrapping_neg(); // all-ones iff rem < L
+            for j in 0..4 {
+                rem[j] = (rem[j] & keep) | (diff[j] & !keep);
             }
         }
         let mut o = [0u8; 32];
@@ -487,7 +570,10 @@ mod ed25519 {
                 cr = t >> 64;
             }
             let mut k = i + 4;
-            while cr != 0 && k < 8 {
+            // Always propagate to the top limb (adding a zero carry is harmless), so the number
+            // of steps does not depend on the secret operand.
+            while k < 8 {
+                ct_probe!();
                 let t = p[k] as u128 + cr;
                 p[k] = t as u64;
                 cr = t >> 64;
@@ -505,9 +591,7 @@ mod ed25519 {
             cr = v >> 8;
         }
         for k in 32..64 {
-            if cr == 0 {
-                break;
-            }
+            ct_probe!();
             let v = buf[k] as u16 + cr;
             buf[k] = v as u8;
             cr = v >> 8;
@@ -559,20 +643,40 @@ mod ed25519 {
         !ge_u256(&limbs, &L)
     }
 
+    /// True iff `p` has order dividing the cofactor 8, i.e. [8]P is the identity (X = 0, Y = Z).
+    fn ge_is_small_order(p: &Ge) -> bool {
+        let mut q = *p;
+        for _ in 0..3 {
+            q = ge_add(&q, &q);
+        }
+        fe_eq(&q.x, &fe0()) && fe_eq(&q.y, &q.z)
+    }
+
+    /// Decode a point that must be canonically encoded (y < p, and no sign bit on x = 0, RFC 8032
+    /// section 5.1.3) and not of small order.
+    fn ge_frombytes_strict(s: &[u8; 32]) -> Option<Ge> {
+        let p = ge_frombytes(s)?;
+        (ge_tobytes(&p) == *s && !ge_is_small_order(&p)).then_some(p)
+    }
+
     /// Verify a 64-byte signature over `msg` for public key `pk` (RFC 8032). This is iroh's peer-signature check.
     /// Rejects S >= L: otherwise S + L verifies too, and one signature has two valid encodings.
+    /// Rejects non-canonical and small-order encodings of A and R: with a small-order A, [k]A is one of
+    /// eight small-order points, so (R = that point, S = 0) would verify for every message.
     pub fn ed25519_verify(pk: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
         let mut s_bytes = [0u8; 32];
         s_bytes.copy_from_slice(&sig[32..]);
         if !sc_is_canonical(&s_bytes) {
             return false;
         }
-        let a = match ge_frombytes(pk) {
-            Some(a) => a,
-            None => return false,
+        let Some(a) = ge_frombytes_strict(pk) else {
+            return false;
         };
         let mut rp = [0u8; 32];
         rp.copy_from_slice(&sig[..32]);
+        if ge_frombytes_strict(&rp).is_none() {
+            return false;
+        }
         let mut s = [0u8; 32];
         s.copy_from_slice(&sig[32..]);
         let mut km = Vec::from(&rp[..]);
@@ -582,6 +686,40 @@ mod ed25519 {
         // check [S]B == R + [k]A   ⟺   [S]B + [k](-A) == R
         let check = ge_add(&ge_scalarmul_base(&s), &ge_scalarmul(&k, &ge_neg(&a)));
         ge_tobytes(&check) == rp
+    }
+
+    #[cfg(test)]
+    mod small_order_r {
+        use super::*;
+
+        /// CRY-19, the R side. A key holder can choose R = identity and S = k·a (mod L), with
+        /// k = H(R || A || M); then [S]B = [k]A = R + [k]A and the cofactorless check passes. Such a
+        /// signature is not one RFC 8032 signing produces and verifiers that follow the common
+        /// "reject small-order R" rule refuse it; this one must too.
+        #[test]
+        fn identity_r_signature_from_the_key_holder_is_rejected() {
+            let sk = [7u8; 32];
+            let a = clamp(&sha512(&sk));
+            let pk = ed25519_pubkey(&sk);
+            let mut r = [0u8; 32];
+            r[0] = 1; // identity
+            for msg in [&b"msg1"[..], b"msg2"] {
+                let mut km = r.to_vec();
+                km.extend_from_slice(&pk);
+                km.extend_from_slice(msg);
+                let k = sc_reduce(&sha512(&km));
+                let s = sc_muladd(&k, &a, &[0u8; 32]);
+                let mut sig = [0u8; 64];
+                sig[..32].copy_from_slice(&r);
+                sig[32..].copy_from_slice(&s);
+                assert!(
+                    !ed25519_verify(&pk, msg, &sig),
+                    "identity-R signature accepted"
+                );
+                // control: the ordinary signature still verifies
+                assert!(ed25519_verify(&pk, msg, &ed25519_sign(&sk, msg)));
+            }
+        }
     }
 
     /// Baseline for the benchmark: signing with plain double-and-add (`r·B` the O(n) fold, no comb).
@@ -605,8 +743,29 @@ mod ed25519 {
         sig
     }
 
+    /// Constant-time conditional swap (RFC 7748 section 5 `cswap`): swaps `a`↔`b` iff `swap` == 1,
+    /// with a mask instead of a branch, so neither the control flow nor the memory accesses depend
+    /// on the secret scalar bit (CLM-06).
+    #[inline]
+    fn fe_cswap(a: &mut Fe, b: &mut Fe, swap: u64) {
+        let mask = core::hint::black_box(swap).wrapping_neg();
+        for i in 0..5 {
+            let t = mask & (a[i] ^ b[i]);
+            a[i] ^= t;
+            b[i] ^= t;
+        }
+    }
+    #[inline]
+    fn ladder_cswap(x2: &mut Fe, x3: &mut Fe, z2: &mut Fe, z3: &mut Fe, swap: u64) {
+        ct_probe!();
+        fe_cswap(x2, x3, swap);
+        fe_cswap(z2, z3, swap);
+    }
+
     /// X25519 (RFC 7748) — the Montgomery ladder on Curve25519, the TLS 1.3 key exchange. Reuses the
     /// same field GF(2²⁵⁵−19). x-only differential add-and-double; scalar clamped per the RFC.
+    /// Constant-time in the scalar: a fixed 255-step ladder, masked swaps, branch-free field
+    /// arithmetic, and inversion by a fixed public exponent (see "Timing" in the module docs).
     pub fn x25519(scalar: &[u8; 32], u: &[u8; 32]) -> [u8; 32] {
         let mut k = *scalar;
         k[0] &= 248;
@@ -614,14 +773,11 @@ mod ed25519 {
         k[31] |= 64;
         let x1 = fe_frombytes(u);
         let (mut x2, mut z2, mut x3, mut z3) = (fe1(), fe0(), x1, fe1());
-        let mut swap = 0u8;
+        let mut swap = 0u64;
         for t in (0..255).rev() {
-            let kt = (k[t / 8] >> (t % 8)) & 1;
+            let kt = ((k[t / 8] >> (t % 8)) & 1) as u64;
             swap ^= kt;
-            if swap == 1 {
-                core::mem::swap(&mut x2, &mut x3);
-                core::mem::swap(&mut z2, &mut z3);
-            }
+            ladder_cswap(&mut x2, &mut x3, &mut z2, &mut z3, swap);
             swap = kt;
             let a = fe_add(&x2, &z2);
             let aa = fe_sq(&a);
@@ -637,10 +793,7 @@ mod ed25519 {
             x2 = fe_mul(&aa, &bb);
             z2 = fe_mul(&e, &fe_add(&aa, &fe_mul(&fe_small(121665), &e)));
         }
-        if swap == 1 {
-            core::mem::swap(&mut x2, &mut x3);
-            core::mem::swap(&mut z2, &mut z3);
-        }
+        ladder_cswap(&mut x2, &mut x3, &mut z2, &mut z3, swap);
         fe_tobytes(&fe_mul(&x2, &fe_inv(&z2)))
     }
 
@@ -742,6 +895,18 @@ mod ed25519 {
             assert_eq!(shared_ab, expected_shared);
         }
 
+        /// CLM-06: the ladder performs one conditional swap per scalar bit plus the final one,
+        /// whatever the bits are. The swap must be a masked swap, not `if swap == 1`, so the count
+        /// of swap steps executed is the same (256) for a weight-1 and a weight-251 scalar.
+        #[test]
+        fn ladder_swap_steps_do_not_depend_on_scalar_bits() {
+            use crate::map::hashtrinity::crypto::ct_probe;
+            let low = ct_probe::count(|| x25519(&[0u8; 32], &BASEPOINT));
+            let high = ct_probe::count(|| x25519(&[0xffu8; 32], &BASEPOINT));
+            let mixed = ct_probe::count(|| x25519(&[0x55u8; 32], &BASEPOINT));
+            assert_eq!((low, high, mixed), (256, 256, 256));
+        }
+
         /// Fresh random keypairs each run (not just the two fixed vectors above) — the
         /// commutativity property must hold for arbitrary scalars, not just these two.
         #[test]
@@ -756,6 +921,86 @@ mod ed25519 {
                 let pub_a = x25519(&scalar_a, &BASEPOINT);
                 let pub_b = x25519(&scalar_b, &BASEPOINT);
                 assert_eq!(x25519(&scalar_a, &pub_b), x25519(&scalar_b, &pub_a));
+            }
+        }
+    }
+
+    /// CRY-02: the signing scalar arithmetic and the variable-base multiply run the same steps
+    /// whatever the secret values are, and compute the same results as before.
+    #[cfg(test)]
+    mod ct_tests {
+        use super::*;
+        use crate::map::hashtrinity::crypto::ct_probe;
+
+        fn unhex32(s: &str) -> [u8; 32] {
+            let mut o = [0u8; 32];
+            for i in 0..32 {
+                o[i] = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+            }
+            o
+        }
+
+        #[test]
+        fn sc_reduce_steps_do_not_depend_on_the_value() {
+            let zero = ct_probe::count(|| sc_reduce(&[0u8; 64]));
+            let ones = ct_probe::count(|| sc_reduce(&[0xffu8; 64]));
+            let mixed = ct_probe::count(|| sc_reduce(&[0x5au8; 64]));
+            assert_eq!((zero, ones, mixed), (512, 512, 512));
+        }
+
+        #[test]
+        fn sc_muladd_steps_do_not_depend_on_the_secret_scalar() {
+            let k = [0x11u8; 32];
+            let r = [0x22u8; 32];
+            let mut a_small = [0u8; 32];
+            a_small[0] = 8;
+            let mut a_big = [0xffu8; 32];
+            a_big[31] = 0x7f;
+            let small = ct_probe::count(|| sc_muladd(&k, &a_small, &r));
+            let big = ct_probe::count(|| sc_muladd(&k, &a_big, &r));
+            assert_eq!(small, big);
+        }
+
+        #[test]
+        fn ge_scalarmul_steps_do_not_depend_on_scalar_bits() {
+            let b = base();
+            let low = ct_probe::count(|| ge_scalarmul(&[0u8; 32], &b));
+            let high = ct_probe::count(|| ge_scalarmul(&[0xffu8; 32], &b));
+            assert_eq!((low, high), (256, 256));
+        }
+
+        #[test]
+        fn sc_reduce_known_answers() {
+            let mut l = [0u8; 64];
+            for i in 0..4 {
+                l[i * 8..i * 8 + 8].copy_from_slice(&L[i].to_le_bytes());
+            }
+            assert_eq!(sc_reduce(&l), [0u8; 32], "L mod L");
+            let mut lm1 = l;
+            lm1[0] -= 1;
+            assert_eq!(sc_reduce(&lm1)[..], lm1[..32], "L-1 mod L");
+            assert_eq!(
+                sc_reduce(&[0xffu8; 64]),
+                unhex32("000f9c44e31106a447938568a71b0ed065bef517d273ecce3d9a307c1b419903"),
+                "(2^512-1) mod L"
+            );
+            assert_eq!(
+                sc_reduce(&[0xffu8; 32]),
+                unhex32("1c95988d7431ecd670cf7d73f45befc6feffffffffffffffffffffffffffff0f"),
+                "(2^256-1) mod L"
+            );
+            // (L-1)*(L-1) + (L-1) = L*(L-1), which is 0 mod L
+            let mut lm1_32 = [0u8; 32];
+            lm1_32.copy_from_slice(&lm1[..32]);
+            assert_eq!(sc_muladd(&lm1_32, &lm1_32, &lm1_32), [0u8; 32]);
+        }
+
+        /// The comb (`ed25519_sign`) and the double-and-add baseline (`ed25519_sign_daa`) are the
+        /// same RFC 8032 function.
+        #[test]
+        fn sign_daa_matches_sign() {
+            for seed in [[0u8; 32], [0xffu8; 32], [0x42u8; 32]] {
+                assert_eq!(ed25519_sign_daa(&seed, b"m"), ed25519_sign(&seed, b"m"));
             }
         }
     }
@@ -969,31 +1214,17 @@ mod ecdsa {
         }
         r
     }
+    fn to_be32(u: &U) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        for i in 0..4 {
+            b[24 - i * 8..32 - i * 8].copy_from_slice(&u[i].to_be_bytes());
+        }
+        b
+    }
+    // `is_zero` and `ge4` branch: they are used ONLY on public values (signature range checks,
+    // public-key coordinates) and for the RFC 6979 candidate rejection (see `rfc6979_k`).
     fn is_zero(a: &U) -> bool {
         a == &[0, 0, 0, 0]
-    }
-    fn ge5(a: &[u64; 5], m: &[u64; 5]) -> bool {
-        let mut i = 5;
-        while i > 0 {
-            i -= 1;
-            if a[i] != m[i] {
-                return a[i] > m[i];
-            }
-        }
-        true
-    }
-    fn sub5(a: &mut [u64; 5], m: &[u64; 5]) {
-        let mut br = 0i128;
-        for i in 0..5 {
-            let v = a[i] as i128 - m[i] as i128 - br;
-            if v < 0 {
-                a[i] = (v + (1i128 << 64)) as u64;
-                br = 1;
-            } else {
-                a[i] = v as u64;
-                br = 0;
-            }
-        }
     }
     fn ge4(a: &U, m: &U) -> bool {
         let mut i = 4;
@@ -1006,229 +1237,324 @@ mod ecdsa {
         true
     }
 
-    /// 256×256 → 512-bit product.
-    fn mul512(a: &U, b: &U) -> [u64; 8] {
-        let mut p = [0u64; 8];
+    // ── Constant-time multi-precision arithmetic (CRY-01) ─────────────────────────────────────────────
+    // Every function below runs the same instruction sequence for all inputs of its type: carries
+    // and borrows are computed arithmetically, and "conditional" steps are masked selects.
+
+    /// All-ones if `bit` == 1, zero if `bit` == 0. `black_box` keeps the optimiser from turning the
+    /// masked selects back into branches.
+    #[inline]
+    fn mask(bit: u64) -> u64 {
+        core::hint::black_box(bit).wrapping_neg()
+    }
+    /// All-ones iff `a` == `b`.
+    #[inline]
+    fn eq_mask(a: u64, b: u64) -> u64 {
+        let x = a ^ b;
+        mask(((x | x.wrapping_neg()) >> 63) ^ 1)
+    }
+    /// `b` if `m` is all-ones, `a` if `m` is zero.
+    #[inline]
+    fn select(a: &U, b: &U, m: u64) -> U {
+        let mut r = *a;
         for i in 0..4 {
-            let mut cr = 0u128;
-            for j in 0..4 {
-                let t = a[i] as u128 * b[j] as u128 + p[i + j] as u128 + cr;
-                p[i + j] = t as u64;
-                cr = t >> 64;
-            }
-            let mut k = i + 4;
-            while cr != 0 && k < 8 {
-                let t = p[k] as u128 + cr;
-                p[k] = t as u64;
-                cr = t >> 64;
-                k += 1;
-            }
+            r[i] ^= m & (a[i] ^ b[i]);
         }
-        p
+        r
     }
-    /// Reduce a 512-bit value mod `m` (binary long division — correct, modulus-generic).
-    fn mod_gen(x: &[u64; 8], m: &U) -> U {
-        let m5 = [m[0], m[1], m[2], m[3], 0];
-        let mut rem = [0u64; 5];
-        let mut i = 512;
-        while i > 0 {
-            i -= 1;
-            let bit = (x[i / 64] >> (i % 64)) & 1;
-            let mut c = bit;
-            for l in rem.iter_mut() {
-                let nc = *l >> 63;
-                *l = (*l << 1) | c;
-                c = nc;
-            }
-            if ge5(&rem, &m5) {
-                sub5(&mut rem, &m5);
-            }
-        }
-        [rem[0], rem[1], rem[2], rem[3]]
-    }
-    fn mulmod(a: &U, b: &U, m: &U) -> U {
-        mod_gen(&mul512(a, b), m)
-    }
-    fn addmod(a: &U, b: &U, m: &U) -> U {
-        let mut s = [0u64; 5];
-        let mut c = 0u128;
+    fn add4(a: &U, b: &U) -> (U, u64) {
+        let mut r = [0u64; 4];
+        let mut c = 0u64;
         for i in 0..4 {
-            let t = a[i] as u128 + b[i] as u128 + c;
-            s[i] = t as u64;
-            c = t >> 64;
+            let t = a[i] as u128 + b[i] as u128 + c as u128;
+            r[i] = t as u64;
+            c = (t >> 64) as u64;
         }
-        s[4] = c as u64;
-        let m5 = [m[0], m[1], m[2], m[3], 0];
-        if ge5(&s, &m5) {
-            sub5(&mut s, &m5);
-        }
-        [s[0], s[1], s[2], s[3]]
+        (r, c)
     }
-    fn submod(a: &U, b: &U, m: &U) -> U {
-        if ge4(a, b) {
-            let mut r = *a;
-            let mut br = 0i128;
+    fn sub4(a: &U, b: &U) -> (U, u64) {
+        let mut r = [0u64; 4];
+        let mut br = 0u64;
+        for i in 0..4 {
+            let t = (a[i] as u128).wrapping_sub(b[i] as u128 + br as u128);
+            r[i] = t as u64;
+            br = ((t >> 64) as u64) & 1;
+        }
+        (r, br)
+    }
+    /// `acc + x·y + c` as (low, high); cannot overflow 128 bits.
+    #[inline]
+    fn mac(acc: u64, x: u64, y: u64, c: u64) -> (u64, u64) {
+        let t = acc as u128 + (x as u128) * (y as u128) + c as u128;
+        (t as u64, (t >> 64) as u64)
+    }
+
+    /// An odd 256-bit modulus `m` > 2^255 with its Montgomery constants (R = 2^256).
+    struct Modulus {
+        m: U,
+        /// −m⁻¹ mod 2^64.
+        m0inv: u64,
+        /// R² mod m.
+        r2: U,
+    }
+    /// The field modulus p (−p⁻¹ ≡ 1 mod 2^64 since p ≡ −1).
+    const FP: Modulus = Modulus {
+        m: P,
+        m0inv: 1,
+        r2: [
+            0x0000000000000003,
+            0xfffffffbffffffff,
+            0xfffffffffffffffe,
+            0x00000004fffffffd,
+        ],
+    };
+    /// The group order n (signature arithmetic).
+    const FN: Modulus = Modulus {
+        m: N,
+        m0inv: 0xccd1c8aaee00bc4f,
+        r2: [
+            0x83244c95be79eea2,
+            0x4699799c49bd6fa6,
+            0x2845b2392b6bec59,
+            0x66e12d94f3d95620,
+        ],
+    };
+    impl Modulus {
+        /// `a + b mod m` for `a, b < m`.
+        fn add(&self, a: &U, b: &U) -> U {
+            ct_probe!();
+            let (s, c) = add4(a, b);
+            let (d, br) = sub4(&s, &self.m);
+            select(&s, &d, mask(c | (br ^ 1)))
+        }
+        /// `a − b mod m` for `a, b < m`.
+        fn sub(&self, a: &U, b: &U) -> U {
+            ct_probe!();
+            let (d, br) = sub4(a, b);
+            let mut corr = self.m;
+            for l in &mut corr {
+                *l &= mask(br);
+            }
+            add4(&d, &corr).0
+        }
+        /// `a mod m` for any `a < 2^256` (one conditional subtraction suffices since m > 2^255).
+        fn reduce_once(&self, a: &U) -> U {
+            ct_probe!();
+            let (d, br) = sub4(a, &self.m);
+            select(&d, a, mask(br))
+        }
+        /// Montgomery product `a·b·R⁻¹ mod m` (CIOS) for `a, b < m`; the final subtraction is masked.
+        fn mul(&self, a: &U, b: &U) -> U {
+            let m = &self.m;
+            let mut t = [0u64; 6];
             for i in 0..4 {
-                let v = r[i] as i128 - b[i] as i128 - br;
-                if v < 0 {
-                    r[i] = (v + (1i128 << 64)) as u64;
-                    br = 1;
-                } else {
-                    r[i] = v as u64;
-                    br = 0;
+                let mut c = 0u64;
+                for j in 0..4 {
+                    (t[j], c) = mac(t[j], a[j], b[i], c);
+                }
+                let s = t[4] as u128 + c as u128;
+                t[4] = s as u64;
+                t[5] = (s >> 64) as u64;
+                let q = t[0].wrapping_mul(self.m0inv);
+                let (_, mut c) = mac(t[0], q, m[0], 0);
+                for j in 1..4 {
+                    (t[j - 1], c) = mac(t[j], q, m[j], c);
+                }
+                let s = t[4] as u128 + c as u128;
+                t[3] = s as u64;
+                t[4] = t[5] + (s >> 64) as u64;
+            }
+            // t < 2m: subtract m once if t ≥ m (t[4] is the 2^256 bit).
+            ct_probe!();
+            let r = [t[0], t[1], t[2], t[3]];
+            let (d, br) = sub4(&r, m);
+            select(&r, &d, mask(t[4] | (br ^ 1)))
+        }
+        fn to_mont(&self, a: &U) -> U {
+            self.mul(a, &self.r2)
+        }
+        fn to_normal(&self, a: &U) -> U {
+            self.mul(a, &[1, 0, 0, 0])
+        }
+        /// Inverse in Montgomery form: `(aR)⁻¹·R² = a⁻¹R`, as `aR^(m−2)` (Fermat). The exponent is
+        /// the public modulus, so branching on its bits does not depend on `a`. Maps 0 to 0.
+        fn inv(&self, a: &U) -> U {
+            let mut e = self.m;
+            e[0] -= 2; // m[0] > 2 for both moduli: no borrow
+            let mut r = self.to_mont(&[1, 0, 0, 0]);
+            for i in (0..256).rev() {
+                r = self.mul(&r, &r);
+                if (e[i / 64] >> (i % 64)) & 1 == 1 {
+                    r = self.mul(&r, a);
                 }
             }
             r
-        } else {
-            addmod(a, &submod(m, b, m), m)
         }
     }
-    fn sub_small(a: &U, k: u64) -> U {
-        let mut r = *a;
-        let mut br = k as i128;
-        for i in 0..4 {
-            let v = r[i] as i128 - br;
-            if v < 0 {
-                r[i] = (v + (1i128 << 64)) as u64;
-                br = 1;
-            } else {
-                r[i] = v as u64;
-                br = 0;
-            }
-        }
-        r
-    }
-    fn powmod(a: &U, e: &U, m: &U) -> U {
-        let mut r = [1u64, 0, 0, 0];
-        let mut base = *a;
-        for i in 0..256 {
-            if (e[i / 64] >> (i % 64)) & 1 == 1 {
-                r = mulmod(&r, &base, m);
-            }
-            base = mulmod(&base, &base, m);
-        }
-        r
-    }
-    fn invmod(a: &U, m: &U) -> U {
-        powmod(a, &sub_small(m, 2), m)
-    } // a^(m-2)
 
-    // Jacobian point (X:Y:Z); affine (X/Z², Y/Z³). a = -3.
+    // ── The group: projective (X:Y:Z), x = X/Z, y = Y/Z, coordinates in Montgomery form. ───────────────
+    /// R mod p, i.e. 1 in Montgomery form.
+    const ONE_M: U = [
+        0x0000000000000001,
+        0xffffffff00000000,
+        0xffffffffffffffff,
+        0x00000000fffffffe,
+    ];
+    /// b·R mod p.
+    const B_M: U = [
+        0xd89cdf6229c4bddf,
+        0xacf005cd78843090,
+        0xe5a220abf7212ed6,
+        0xdc30061d04874834,
+    ];
+    fn fmul(a: &U, b: &U) -> U {
+        FP.mul(a, b)
+    }
+    fn fadd(a: &U, b: &U) -> U {
+        FP.add(a, b)
+    }
+    fn fsub(a: &U, b: &U) -> U {
+        FP.sub(a, b)
+    }
+
     #[derive(Clone, Copy)]
-    struct Jac {
+    struct Pt {
         x: U,
         y: U,
         z: U,
     }
-    fn jinf() -> Jac {
-        Jac {
-            x: [1, 0, 0, 0],
-            y: [1, 0, 0, 0],
-            z: [0, 0, 0, 0],
+    fn identity() -> Pt {
+        Pt {
+            x: [0; 4],
+            y: ONE_M,
+            z: [0; 4],
         }
     }
-    fn fmul(a: &U, b: &U) -> U {
-        mulmod(a, b, &P)
+    fn from_affine(x: &U, y: &U) -> Pt {
+        Pt {
+            x: FP.to_mont(x),
+            y: FP.to_mont(y),
+            z: ONE_M,
+        }
     }
-    fn fsq(a: &U) -> U {
-        mulmod(a, a, &P)
+    fn generator() -> Pt {
+        from_affine(&GX, &GY)
     }
-    fn fadd(a: &U, b: &U) -> U {
-        addmod(a, b, &P)
-    }
-    fn fsub(a: &U, b: &U) -> U {
-        submod(a, b, &P)
+    fn pt_select(a: &Pt, b: &Pt, m: u64) -> Pt {
+        Pt {
+            x: select(&a.x, &b.x, m),
+            y: select(&a.y, &b.y, m),
+            z: select(&a.z, &b.z, m),
+        }
     }
 
-    fn jdouble(p: &Jac) -> Jac {
-        if is_zero(&p.z) {
-            return *p;
-        }
-        let delta = fsq(&p.z);
-        let gamma = fsq(&p.y);
-        let beta = fmul(&p.x, &gamma);
-        let t = fmul(&fsub(&p.x, &delta), &fadd(&p.x, &delta));
-        let alpha = fadd(&fadd(&t, &t), &t); // 3(X-δ)(X+δ)
-        let x3 = fsub(&fsq(&alpha), &{
-            let b2 = fadd(&beta, &beta);
-            let b4 = fadd(&b2, &b2);
-            fadd(&b4, &b4)
-        }); // 8·beta
-        let z3 = fsub(&fsub(&fsq(&fadd(&p.y, &p.z)), &gamma), &delta);
-        let g2 = fsq(&gamma);
-        let g8 = {
-            let a = fadd(&g2, &g2);
-            let b = fadd(&a, &a);
-            fadd(&b, &b)
-        };
-        let b4 = {
-            let a = fadd(&beta, &beta);
-            fadd(&a, &a)
-        };
-        let y3 = fsub(&fmul(&alpha, &fsub(&b4, &x3)), &g8);
-        Jac {
-            x: x3,
-            y: y3,
-            z: z3,
+    /// Complete addition for a = −3 (Renes–Costello–Batina 2016, Algorithm 4): correct for every
+    /// pair of inputs, including P + P, P + (−P) and the identity, so it has no branches.
+    fn padd(p: &Pt, q: &Pt) -> Pt {
+        ct_probe!();
+        let xx = fmul(&p.x, &q.x);
+        let yy = fmul(&p.y, &q.y);
+        let zz = fmul(&p.z, &q.z);
+        let xy = fsub(&fmul(&fadd(&p.x, &p.y), &fadd(&q.x, &q.y)), &fadd(&xx, &yy));
+        let yz = fsub(&fmul(&fadd(&p.y, &p.z), &fadd(&q.y, &q.z)), &fadd(&yy, &zz));
+        let xz = fsub(&fmul(&fadd(&p.x, &p.z), &fadd(&q.x, &q.z)), &fadd(&xx, &zz));
+        let bzz = fsub(&xz, &fmul(&B_M, &zz));
+        let bzz3 = fadd(&fadd(&bzz, &bzz), &bzz);
+        let yy_m = fsub(&yy, &bzz3);
+        let yy_p = fadd(&yy, &bzz3);
+        let zz3 = fadd(&fadd(&zz, &zz), &zz);
+        let bxz = fsub(&fmul(&B_M, &xz), &fadd(&zz3, &xx));
+        let bxz3 = fadd(&fadd(&bxz, &bxz), &bxz);
+        let xx3_m_zz3 = fsub(&fadd(&fadd(&xx, &xx), &xx), &zz3);
+        Pt {
+            x: fsub(&fmul(&yy_p, &xy), &fmul(&yz, &bxz3)),
+            y: fadd(&fmul(&yy_p, &yy_m), &fmul(&xx3_m_zz3, &bxz3)),
+            z: fadd(&fmul(&yy_m, &yz), &fmul(&xy, &xx3_m_zz3)),
         }
     }
-    fn jadd(p: &Jac, q: &Jac) -> Jac {
-        if is_zero(&p.z) {
-            return *q;
-        }
-        if is_zero(&q.z) {
-            return *p;
-        }
-        let z1z1 = fsq(&p.z);
-        let z2z2 = fsq(&q.z);
-        let u1 = fmul(&p.x, &z2z2);
-        let u2 = fmul(&q.x, &z1z1);
-        let s1 = fmul(&fmul(&p.y, &q.z), &z2z2);
-        let s2 = fmul(&fmul(&q.y, &p.z), &z1z1);
-        if u1 == u2 {
-            if s1 == s2 {
-                return jdouble(p);
-            } else {
-                return jinf();
-            }
-        }
-        let h = fsub(&u2, &u1);
-        let i = fsq(&fadd(&h, &h));
-        let j = fmul(&h, &i);
-        let rr = fadd(&fsub(&s2, &s1), &fsub(&s2, &s1));
-        let v = fmul(&u1, &i);
-        let x3 = fsub(&fsub(&fsq(&rr), &j), &fadd(&v, &v));
-        let y3 = fsub(&fmul(&rr, &fsub(&v, &x3)), &fmul(&fadd(&s1, &s1), &j));
-        let z3 = fmul(&fsub(&fsub(&fsq(&fadd(&p.z, &q.z)), &z1z1), &z2z2), &h);
-        Jac {
-            x: x3,
-            y: y3,
-            z: z3,
+    /// Complete doubling for a = −3 (Renes–Costello–Batina 2016, Algorithm 6).
+    fn pdbl(p: &Pt) -> Pt {
+        ct_probe!();
+        let xx = fmul(&p.x, &p.x);
+        let yy = fmul(&p.y, &p.y);
+        let zz = fmul(&p.z, &p.z);
+        let xy = fmul(&p.x, &p.y);
+        let xy2 = fadd(&xy, &xy);
+        let xz = fmul(&p.x, &p.z);
+        let xz2 = fadd(&xz, &xz);
+        let bzz = fsub(&fmul(&B_M, &zz), &xz2);
+        let bzz3 = fadd(&fadd(&bzz, &bzz), &bzz);
+        let yy_m = fsub(&yy, &bzz3);
+        let yy_p = fadd(&yy, &bzz3);
+        let y_frag = fmul(&yy_p, &yy_m);
+        let x_frag = fmul(&yy_m, &xy2);
+        let zz3 = fadd(&fadd(&zz, &zz), &zz);
+        let bxz2 = fsub(&fmul(&B_M, &xz2), &fadd(&zz3, &xx));
+        let bxz6 = fadd(&fadd(&bxz2, &bxz2), &bxz2);
+        let xx3_m_zz3 = fsub(&fadd(&fadd(&xx, &xx), &xx), &zz3);
+        let yz = fmul(&p.y, &p.z);
+        let yz2 = fadd(&yz, &yz);
+        let z = fmul(&yz2, &yy);
+        let z2 = fadd(&z, &z);
+        Pt {
+            x: fsub(&x_frag, &fmul(&bxz6, &yz2)),
+            y: fadd(&y_frag, &fmul(&xx3_m_zz3, &bxz6)),
+            z: fadd(&z2, &z2),
         }
     }
-    fn jscalar(k: &U, p: &Jac) -> Jac {
-        let mut r = jinf();
-        let mut i = 256;
-        while i > 0 {
-            i -= 1;
-            r = jdouble(&r);
-            if (k[i / 64] >> (i % 64)) & 1 == 1 {
-                r = jadd(&r, p);
+    /// `k·P` for a secret 256-bit `k`: fixed 4-bit windows, most significant first. Every window
+    /// does 4 doublings and 1 addition, and the table entry is selected by scanning all 16 entries
+    /// with a mask (no secret-dependent branch or memory index). `k ≥ n` is fine: the result is
+    /// `(k mod n)·P`.
+    fn scalar_mul(k: &U, p: &Pt) -> Pt {
+        let mut table = [identity(); 16];
+        table[1] = *p;
+        for i in 2..16 {
+            table[i] = padd(&table[i - 1], p);
+        }
+        let mut r = identity();
+        for w in (0..64).rev() {
+            for _ in 0..4 {
+                r = pdbl(&r);
             }
+            let nib = (k[w / 16] >> ((w % 16) * 4)) & 0xf;
+            let mut sel = identity();
+            for (i, t) in table.iter().enumerate() {
+                sel = pt_select(&sel, t, eq_mask(i as u64, nib));
+            }
+            r = padd(&r, &sel);
         }
         r
     }
-    /// The affine x-coordinate of a Jacobian point (None at infinity).
-    fn affine_x(p: &Jac) -> Option<U> {
+    /// Affine `(x, y)` in normal form, None at infinity. The work is the same for every point; the
+    /// only branch is the final None/Some, which the caller's result reveals anyway.
+    fn to_affine(p: &Pt) -> Option<(U, U)> {
+        let zi = FP.inv(&p.z);
+        let x = FP.to_normal(&fmul(&p.x, &zi));
+        let y = FP.to_normal(&fmul(&p.y, &zi));
         if is_zero(&p.z) {
-            return None;
+            None
+        } else {
+            Some((x, y))
         }
-        let zi = invmod(&p.z, &P);
-        Some(fmul(&p.x, &fsq(&zi)))
+    }
+
+    /// SEC 1 public-key validation (CRY-09): both coordinates canonical (< p) and
+    /// `y² = x³ − 3x + b`. The point at infinity has no affine encoding, and `(0, 0)` is not on the
+    /// curve (b ≠ 0), so it is rejected too. P-256 has cofactor 1: an on-curve point is in the group.
+    fn on_curve(x: &U, y: &U) -> bool {
+        if ge4(x, &P) || ge4(y, &P) {
+            return false;
+        }
+        let (xm, ym) = (FP.to_mont(x), FP.to_mont(y));
+        let x3 = fmul(&fmul(&xm, &xm), &xm);
+        let three_x = fadd(&fadd(&xm, &xm), &xm);
+        fmul(&ym, &ym) == fadd(&fsub(&x3, &three_x), &B_M)
     }
 
     /// Verify an ECDSA/P-256 signature: `pubkey` = `Qx‖Qy` (64B), `hash` = the message digest (32B, e.g.
     /// our SHA-256), `sig` = `r‖s` (64B). Returns true iff valid — the one-cell friction check.
+    /// A public key that is not a canonical on-curve point is rejected (CRY-09).
     pub fn ecdsa_p256_verify(pubkey: &[u8; 64], hash: &[u8; 32], sig: &[u8; 64]) -> bool {
         let qx = from_be(&pubkey[..32]);
         let qy = from_be(&pubkey[32..]);
@@ -1237,38 +1563,23 @@ mod ecdsa {
         if is_zero(&r) || ge4(&r, &N) || is_zero(&s) || ge4(&s, &N) {
             return false;
         }
-        let e = from_be(hash);
-        let w = invmod(&s, &N);
-        let u1 = mulmod(&e, &w, &N);
-        let u2 = mulmod(&r, &w, &N);
-        let g = Jac {
-            x: GX,
-            y: GY,
-            z: [1, 0, 0, 0],
-        };
-        let q = Jac {
-            x: qx,
-            y: qy,
-            z: [1, 0, 0, 0],
-        };
-        let pt = jadd(&jscalar(&u1, &g), &jscalar(&u2, &q));
-        match affine_x(&pt) {
+        if !on_curve(&qx, &qy) {
+            return false;
+        }
+        let e = FN.reduce_once(&from_be(hash));
+        let w = FN.inv(&FN.to_mont(&s)); // s⁻¹·R
+        let u1 = FN.mul(&e, &w); // e·s⁻¹ mod n
+        let u2 = FN.mul(&r, &w); // r·s⁻¹ mod n
+        let pt = padd(
+            &scalar_mul(&u1, &generator()),
+            &scalar_mul(&u2, &from_affine(&qx, &qy)),
+        );
+        match to_affine(&pt) {
             None => false,
-            Some(x1) => {
-                let mut xr = [0u64; 8];
-                xr[..4].copy_from_slice(&x1);
-                mod_gen(&xr, &N) == r
-            } // x1 mod n == r
+            Some((x1, _)) => FN.reduce_once(&x1) == r, // x1 mod n == r
         }
     }
 
-    fn to_be32(u: &U) -> [u8; 32] {
-        let mut b = [0u8; 32];
-        for i in 0..4 {
-            b[24 - i * 8..32 - i * 8].copy_from_slice(&u[i].to_be_bytes());
-        }
-        b
-    }
     fn hmac(k: &[u8], d: &[u8]) -> [u8; 32] {
         crate::map::hashtrinity::crypto::hmac_sha256(k, d)
     }
@@ -1302,60 +1613,155 @@ mod ecdsa {
     }
 
     /// ECDSA/P-256 sign (RFC 6979 deterministic). Returns `r‖s` (64B, the raw JWT/SVID form).
+    /// `k·G` and the mod-n arithmetic on `k` and the key are constant-time (CRY-01).
     pub fn ecdsa_p256_sign(private_key: &[u8; 32], hash: &[u8; 32]) -> [u8; 64] {
-        let d = from_be(private_key);
-        let mut he = [0u64; 8];
-        he[..4].copy_from_slice(&from_be(hash));
-        let e = mod_gen(&he, &N); // e mod n
+        let d = FN.reduce_once(&from_be(private_key));
+        let e = FN.reduce_once(&from_be(hash)); // e mod n
         let k = rfc6979_k(private_key, &to_be32(&e));
-        let g = Jac {
-            x: GX,
-            y: GY,
-            z: [1, 0, 0, 0],
-        };
-        let mut rx8 = [0u64; 8];
-        rx8[..4].copy_from_slice(&affine_x(&jscalar(&k, &g)).unwrap());
-        let r = mod_gen(&rx8, &N); // r = (k·G).x mod n
-        let kinv = invmod(&k, &N);
-        let s = mulmod(&kinv, &addmod(&e, &mulmod(&r, &d, &N), &N), &N); // s = k⁻¹(e + r·d) mod n
+        let (rx, _) = to_affine(&scalar_mul(&k, &generator())).unwrap(); // 1 ≤ k < n: never infinity
+        let r = FN.reduce_once(&rx); // r = (k·G).x mod n
+        let kinv = FN.inv(&FN.to_mont(&k)); // k⁻¹·R
+        let rd = FN.mul(&FN.to_mont(&r), &d); // r·d mod n
+        let s = FN.mul(&kinv, &FN.add(&e, &rd)); // s = k⁻¹(e + r·d) mod n
         let mut sig = [0u8; 64];
         sig[..32].copy_from_slice(&to_be32(&r));
         sig[32..].copy_from_slice(&to_be32(&s));
         sig
     }
 
-    fn affine(p: &Jac) -> Option<(U, U)> {
-        if is_zero(&p.z) {
-            return None;
-        }
-        let zi = invmod(&p.z, &P);
-        let zi2 = fsq(&zi);
-        Some((fmul(&p.x, &zi2), fmul(&fmul(&p.y, &zi2), &zi)))
-    }
-    /// P-256 public key (`x‖y`, 64B) from a 32-byte secret.
+    /// P-256 public key (`x‖y`, 64B) from a 32-byte secret. Constant-time in the secret (CRY-01).
+    ///
+    /// # Panics
+    /// If the secret is ≡ 0 mod n (0 or n): the result is the point at infinity, which has no
+    /// `x‖y` encoding.
     pub fn p256_pubkey(secret: &[u8; 32]) -> [u8; 64] {
-        let (x, y) = affine(&jscalar(
-            &from_be(secret),
-            &Jac {
-                x: GX,
-                y: GY,
-                z: [1, 0, 0, 0],
-            },
-        ))
-        .unwrap();
+        let (x, y) = to_affine(&scalar_mul(&from_be(secret), &generator()))
+            .expect("P-256 secret is 0 mod n: no public key");
         let mut o = [0u8; 64];
         o[..32].copy_from_slice(&to_be32(&x));
         o[32..].copy_from_slice(&to_be32(&y));
         o
     }
     /// ECDH on P-256: shared secret = x-coordinate of `secret · peer_pubkey` (the TLS ECDHE agreement).
+    /// Constant-time in the secret (CRY-01). Returns None if the peer point is not a valid public key
+    /// (off the curve, or a coordinate ≥ p; CRY-09) or the shared point is at infinity
+    /// (secret ≡ 0 mod n).
     pub fn ecdh_p256(secret: &[u8; 32], peer_pubkey: &[u8; 64]) -> Option<[u8; 32]> {
-        let q = Jac {
-            x: from_be(&peer_pubkey[..32]),
-            y: from_be(&peer_pubkey[32..]),
-            z: [1, 0, 0, 0],
-        };
-        Some(to_be32(&affine_x(&jscalar(&from_be(secret), &q))?))
+        let qx = from_be(&peer_pubkey[..32]);
+        let qy = from_be(&peer_pubkey[32..]);
+        if !on_curve(&qx, &qy) {
+            return None;
+        }
+        let (x, _) = to_affine(&scalar_mul(&from_be(secret), &from_affine(&qx, &qy)))?;
+        Some(to_be32(&x))
+    }
+
+    /// CRY-01 / CLM-06: scalar multiplication (key generation, ECDH, the signing nonce) and the
+    /// mod-n signing arithmetic run the same steps whatever the secret is. The probe marks every
+    /// conditional-subtraction step of the modular arithmetic and every group addition.
+    #[cfg(test)]
+    mod ct_tests {
+        use super::*;
+        use crate::map::hashtrinity::crypto::ct_probe;
+
+        fn low_bits(w: usize) -> [u8; 32] {
+            let mut k = [0u8; 32];
+            for i in 0..w {
+                k[31 - i / 8] |= 1 << (i % 8);
+            }
+            k
+        }
+
+        #[test]
+        fn p256_pubkey_steps_do_not_depend_on_the_scalar() {
+            let lo = ct_probe::count(|| p256_pubkey(&low_bits(8)));
+            let hi = ct_probe::count(|| p256_pubkey(&low_bits(248)));
+            let mut mixed = [0x5au8; 32];
+            mixed[0] = 0x7f;
+            let mid = ct_probe::count(|| p256_pubkey(&mixed));
+            assert_eq!((lo, mid), (hi, hi));
+        }
+
+        #[test]
+        fn ecdh_p256_steps_do_not_depend_on_the_scalar() {
+            let g = p256_pubkey(&low_bits(1));
+            let lo = ct_probe::count(|| ecdh_p256(&low_bits(8), &g));
+            let hi = ct_probe::count(|| ecdh_p256(&low_bits(248), &g));
+            assert_eq!(lo, hi);
+        }
+
+        /// The Montgomery constants match their definitions.
+        #[test]
+        fn montgomery_constants() {
+            const B: U = [
+                0x3bce3c3e27d2604b,
+                0x651d06b0cc53b0f6,
+                0xb3ebbd55769886bc,
+                0x5ac635d8aa3a93e7,
+            ];
+            for f in [&FP, &FN] {
+                assert_eq!(
+                    f.m[0].wrapping_mul(f.m0inv),
+                    u64::MAX,
+                    "m0inv = -1/m mod 2^64"
+                );
+                let mut x = [1u64, 0, 0, 0];
+                for _ in 0..512 {
+                    x = f.add(&x, &x);
+                }
+                assert_eq!(x, f.r2, "r2 = 2^512 mod m");
+                let mut one = [1u64, 0, 0, 0];
+                assert_eq!(f.to_normal(&f.to_mont(&one)), one);
+                one = f.to_mont(&[7, 0, 0, 0]);
+                assert_eq!(f.to_normal(&f.mul(&f.inv(&one), &one)), [1, 0, 0, 0]);
+            }
+            assert_eq!(FP.to_mont(&[1, 0, 0, 0]), ONE_M);
+            assert_eq!(FP.to_mont(&B), B_M);
+        }
+
+        fn affine_eq(a: &Pt, b: &Pt) -> bool {
+            to_affine(a) == to_affine(b)
+        }
+
+        /// The complete formulas handle every case without branches: P + O, O + O, P + P (equal to
+        /// the doubling formula), P + (−P), and points of different representations.
+        #[test]
+        fn complete_formulas_edge_cases() {
+            let g = generator();
+            let o = identity();
+            let neg_g = Pt {
+                x: g.x,
+                y: fsub(&[0; 4], &g.y),
+                z: g.z,
+            };
+            assert!(to_affine(&padd(&o, &o)).is_none());
+            assert!(to_affine(&pdbl(&o)).is_none());
+            assert!(affine_eq(&padd(&g, &o), &g));
+            assert!(affine_eq(&padd(&o, &g), &g));
+            assert!(to_affine(&padd(&g, &neg_g)).is_none());
+            let g2 = pdbl(&g);
+            assert!(affine_eq(&padd(&g, &g), &g2));
+            // 2G + G (Z != 1 on one side) == 3G, and (2G + G) + (−G) == 2G
+            let g3 = padd(&g2, &g);
+            assert!(affine_eq(&padd(&g, &g2), &g3));
+            assert!(affine_eq(&pdbl(&g2), &padd(&g3, &g)));
+            assert!(affine_eq(&padd(&g3, &neg_g), &g2));
+            assert!(affine_eq(&padd(&g2, &g2), &pdbl(&g2)));
+            let mut n_minus_1 = N;
+            n_minus_1[0] -= 1;
+            assert!(affine_eq(&scalar_mul(&n_minus_1, &g), &neg_g));
+            assert!(to_affine(&scalar_mul(&N, &g)).is_none());
+            assert!(to_affine(&scalar_mul(&[0; 4], &g)).is_none());
+        }
+
+        #[test]
+        fn ecdsa_p256_sign_steps_do_not_depend_on_the_key_or_nonce() {
+            let h = crate::map::hashtrinity::crypto::sha256(b"sample");
+            let a = ct_probe::count(|| ecdsa_p256_sign(&low_bits(8), &h));
+            let b = ct_probe::count(|| ecdsa_p256_sign(&low_bits(248), &h));
+            let c = ct_probe::count(|| ecdsa_p256_sign(&[0x42u8; 32], &h));
+            assert_eq!((a, c), (b, b));
+        }
     }
 }
 pub mod jwt {
@@ -3442,6 +3848,10 @@ pub mod secp256k1 {
         if is_zero(&r) || ge4(&r, &N) || is_zero(&s) || ge4(&s, &N) {
             return false;
         }
+        // CRY-09: reject a public key that is not on y² = x³ + 7 (or has a coordinate ≥ p).
+        if ge4(&qx, &P) || ge4(&qy, &P) || fsq(&qy) != fadd(&fmul(&fsq(&qx), &qx), &[7, 0, 0, 0]) {
+            return false;
+        }
         let e = e_mod(hash);
         let w = invmod(&s, &N);
         let g = Jac {
@@ -3565,23 +3975,24 @@ pub mod x509 {
             hdr = 2 + nb;
         }
         let cs = off + hdr;
-        let ce = cs + len;
+        let ce = cs.checked_add(len)?;
         if ce > d.len() {
             return None;
         }
         Some((tag, cs, ce, ce))
     }
-    /// Walk the immediate children of the SEQUENCE/SET whose content is `[cs, ce)`.
+    /// Walk the immediate children of the SEQUENCE/SET whose content is `[cs, ce)`. Stops at the first
+    /// child that is malformed or runs past `ce`.
     pub fn der_children(d: &[u8], cs: usize, ce: usize) -> Vec<(u8, usize, usize)> {
         let mut out = Vec::new();
         let mut o = cs;
         while o < ce {
             match der_tlv(d, o) {
-                Some((t, s, e, n)) => {
+                Some((t, s, e, n)) if e <= ce => {
                     out.push((t, s, e));
                     o = n;
                 }
-                None => break,
+                _ => break,
             }
         }
         out
@@ -3629,16 +4040,236 @@ pub mod x509 {
         }
     }
 
+    // ── What the chain fold reads from each signed TBSCertificate ─────────────────────────────────────
+    const OID_BASIC_CONSTRAINTS: [u8; 3] = [0x55, 0x1d, 0x13];
+    const OID_KEY_USAGE: [u8; 3] = [0x55, 0x1d, 0x0f];
+    /// Extensions this module understands, so they may be marked critical.
+    const KNOWN_EXTENSIONS: [[u8; 3]; 4] = [
+        OID_BASIC_CONSTRAINTS,
+        OID_KEY_USAGE,
+        [0x55, 0x1d, 0x11], // subjectAltName
+        [0x55, 0x1d, 0x25], // extKeyUsage
+    ];
+    const KU_KEY_CERT_SIGN: u16 = 1 << 5;
+
+    /// The fields of a TBSCertificate the fold checks. Read from `Cert::tbs`, the bytes the issuer
+    /// signed, so they cannot disagree with the signature.
+    struct TbsInfo {
+        not_before: i64,
+        not_after: i64,
+        /// basicConstraints `(cA, pathLenConstraint)`; `None` when absent.
+        basic_constraints: Option<(bool, Option<u64>)>,
+        /// keyUsage, bit `n` = RFC 5280 KeyUsage bit `n`; `None` when absent.
+        key_usage: Option<u16>,
+    }
+
+    /// Unix seconds from a DER UTCTime (`YYMMDDHHMMSSZ`, 0x17) or GeneralizedTime (`YYYYMMDDHHMMSSZ`,
+    /// 0x18). RFC 5280 section 4.1.2.5 allows only these forms (seconds present, UTC).
+    fn der_time(tag: u8, b: &[u8]) -> Option<i64> {
+        let digits = match (tag, b.len()) {
+            (0x17, 13) | (0x18, 15) => &b[..b.len() - 1],
+            _ => return None,
+        };
+        if b.last() != Some(&b'Z') || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let num = |i: usize, n: usize| -> i64 {
+            digits[i..i + n]
+                .iter()
+                .fold(0i64, |v, &c| v * 10 + (c - b'0') as i64)
+        };
+        let (y, r) = if tag == 0x17 {
+            let yy = num(0, 2);
+            (if yy >= 50 { 1900 + yy } else { 2000 + yy }, 2)
+        } else {
+            (num(0, 4), 4)
+        };
+        let (mo, d, h, mi, se) = (
+            num(r, 2),
+            num(r + 2, 2),
+            num(r + 4, 2),
+            num(r + 6, 2),
+            num(r + 8, 2),
+        );
+        if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 59 {
+            return None;
+        }
+        // days_from_civil (H. Hinnant)
+        let yy = if mo <= 2 { y - 1 } else { y };
+        let era = yy.div_euclid(400);
+        let yoe = yy - era * 400;
+        let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146097 + doe - 719468;
+        Some(days * 86400 + h * 3600 + mi * 60 + se)
+    }
+
+    /// Parse a TBSCertificate: validity, basicConstraints, keyUsage. `None` if it is malformed, has a
+    /// duplicate extension, or carries a critical extension this module does not understand (RFC 5280
+    /// section 4.2: such a certificate must be rejected).
+    fn parse_tbs(tbs: &[u8]) -> Option<TbsInfo> {
+        let (tag, cs, ce, end) = der_tlv(tbs, 0)?;
+        if tag != 0x30 || end != tbs.len() {
+            return None;
+        }
+        let f = der_children(tbs, cs, ce);
+        let mut i = usize::from(f.first()?.0 == 0xa0); // [0] version
+        i += 3; // serialNumber, signature, issuer
+        let (vt, vs, ve) = *f.get(i)?;
+        if vt != 0x30 {
+            return None;
+        }
+        let v = der_children(tbs, vs, ve);
+        let (&(t0, s0, e0), &(t1, s1, e1)) = (v.first()?, v.get(1)?);
+        let not_before = der_time(t0, &tbs[s0..e0])?;
+        let not_after = der_time(t1, &tbs[s1..e1])?;
+        let mut info = TbsInfo {
+            not_before,
+            not_after,
+            basic_constraints: None,
+            key_usage: None,
+        };
+        let Some(&(_, xs, xe)) = f.iter().skip(i + 3).find(|c| c.0 == 0xa3) else {
+            return Some(info);
+        };
+        let (st, ss, se, _) = der_tlv(tbs, xs)?;
+        if st != 0x30 || se != xe {
+            return None;
+        }
+        let mut seen: Vec<&[u8]> = Vec::new();
+        let mut o = ss;
+        while o < se {
+            let (et, es, ee, next) = der_tlv(tbs, o)?;
+            if et != 0x30 || ee > se {
+                return None;
+            }
+            o = next;
+            let parts = der_children(tbs, es, ee);
+            let (ot, os, oe) = *parts.first()?;
+            if ot != 0x06 {
+                return None;
+            }
+            let id = &tbs[os..oe];
+            let (critical, value) = match parts.get(1..)? {
+                [(0x01, bs, be), (0x04, vs, ve)] => (tbs[*bs..*be] == [0xff], &tbs[*vs..*ve]),
+                [(0x04, vs, ve)] => (false, &tbs[*vs..*ve]),
+                _ => return None,
+            };
+            if seen.contains(&id) {
+                return None;
+            }
+            seen.push(id);
+            if id == OID_BASIC_CONSTRAINTS {
+                info.basic_constraints = Some(parse_basic_constraints(value)?);
+            } else if id == OID_KEY_USAGE {
+                info.key_usage = Some(parse_key_usage(value)?);
+            } else if critical && !KNOWN_EXTENSIONS.iter().any(|k| k == id) {
+                return None;
+            }
+        }
+        Some(info)
+    }
+
+    /// BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER OPTIONAL }.
+    fn parse_basic_constraints(v: &[u8]) -> Option<(bool, Option<u64>)> {
+        let (t, cs, ce, end) = der_tlv(v, 0)?;
+        if t != 0x30 || end != v.len() {
+            return None;
+        }
+        let mut kids = der_children(v, cs, ce).into_iter().peekable();
+        let mut ca = false;
+        if let Some(&(0x01, s, e)) = kids.peek() {
+            ca = v[s..e] == [0xff];
+            kids.next();
+        }
+        let path_len = match kids.next() {
+            None => None,
+            Some((0x02, s, e)) if e > s && v[s] & 0x80 == 0 => {
+                let mag: Vec<u8> = v[s..e].iter().copied().skip_while(|&b| b == 0).collect();
+                Some(if mag.len() > 8 {
+                    u64::MAX
+                } else {
+                    mag.iter().fold(0u64, |a, &b| (a << 8) | b as u64)
+                })
+            }
+            Some(_) => return None,
+        };
+        Some((ca, path_len))
+    }
+
+    /// KeyUsage ::= BIT STRING; named bit `n` (most significant bit of the first byte is bit 0).
+    fn parse_key_usage(v: &[u8]) -> Option<u16> {
+        let (t, cs, ce, end) = der_tlv(v, 0)?;
+        if t != 0x03 || end != v.len() || ce == cs {
+            return None;
+        }
+        let bits = &v[cs + 1..ce];
+        let mut ku = 0u16;
+        for n in 0..16usize {
+            if bits.get(n / 8).is_some_and(|&b| b & (0x80 >> (n % 8)) != 0) {
+                ku |= 1 << n;
+            }
+        }
+        Some(ku)
+    }
+
+    /// Seconds since the Unix epoch from the system clock (0 if the clock is before 1970, which makes
+    /// every certificate "not yet valid").
+    fn unix_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64)
+    }
+
+    /// **THE CHAIN-FOLD**, checked at the current system time: `verify_chain_at(.., now)` with the
+    /// system clock. See `verify_chain_at` for what is checked.
+    pub fn verify_chain(
+        chain: &[Cert],
+        trust_anchor_pubkey: &[u8],
+        trust_anchor_name: &str,
+    ) -> bool {
+        verify_chain_at(chain, trust_anchor_pubkey, trust_anchor_name, unix_now())
+    }
+
     /// **THE CHAIN-FOLD.** `chain = [leaf, …, root]`. Each cert is verified against the next cert's
     /// (issuer's) public key; the root is verified against the `trust_anchor` key, and the issuer↔subject
     /// names must link. Returns true (frictionless) iff **every** link intertwines — a single forged or
     /// broken link is friction and the whole chain is rejected. This is `ThreatModel`: security is the
-    /// standing of every cell's equation, up the chain, decided one cell at a time. -/
-    pub fn verify_chain(chain: &[Cert], trust_anchor_pubkey: &[u8], trust_anchor_name: &str) -> bool {
+    /// standing of every cell's equation, up the chain, decided one cell at a time.
+    ///
+    /// Each `Cert::tbs` must be a DER TBSCertificate, and the fold also checks what it says:
+    /// `now` (Unix seconds) lies in every certificate's validity window (bounds inclusive); no
+    /// certificate carries an unknown critical or duplicate extension; and every certificate that
+    /// issues another one (all but the leaf) has basicConstraints `cA=TRUE`, a pathLenConstraint at
+    /// least the number of CA certificates below it, and keyCertSign if it has a keyUsage. Without
+    /// that last rule the key of any ordinary leaf could sign a certificate for any name.
+    pub fn verify_chain_at(
+        chain: &[Cert],
+        trust_anchor_pubkey: &[u8],
+        trust_anchor_name: &str,
+        now: i64,
+    ) -> bool {
         if chain.is_empty() {
             return false;
         }
         for i in 0..chain.len() {
+            let Some(info) = parse_tbs(&chain[i].tbs) else {
+                return false;
+            };
+            if now < info.not_before || now > info.not_after {
+                return false;
+            }
+            if i > 0 {
+                let Some((true, path_len)) = info.basic_constraints else {
+                    return false;
+                }; // an issuer must be a CA
+                if path_len.is_some_and(|n| (i as u64 - 1) > n) {
+                    return false;
+                }
+                if info.key_usage.is_some_and(|ku| ku & KU_KEY_CERT_SIGN == 0) {
+                    return false;
+                }
+            }
             let (issuer_pk, issuer_name): (&[u8], &str) = if i + 1 < chain.len() {
                 (&chain[i + 1].subject_pubkey, chain[i + 1].subject.as_str())
             } else {
@@ -3678,14 +4309,30 @@ pub mod x509 {
         None
     }
 
-    /// Validate an ed25519 X.509-SVID against a CA public key + a trust domain. Returns the SPIFFE ID iff
-    /// the CA signature verifies AND the ID is in `trust_domain`. The full SVID check, on our crypto.
+    /// Validate an ed25519 X.509-SVID against a CA public key + a trust domain at the current system
+    /// time: `verify_x509_svid_at(.., now)` with the system clock.
     pub fn verify_x509_svid(cert: &[u8], ca_pk: &[u8; 32], trust_domain: &str) -> Option<String> {
+        verify_x509_svid_at(cert, ca_pk, trust_domain, unix_now())
+    }
+
+    /// Validate an ed25519 X.509-SVID against a CA public key + a trust domain. Returns the SPIFFE ID iff
+    /// the CA signature verifies, `now` (Unix seconds) lies in the certificate's validity window, the
+    /// certificate has no unknown critical extension, AND the ID is in `trust_domain`. Malformed DER
+    /// gives `None`, never a panic.
+    pub fn verify_x509_svid_at(
+        cert: &[u8],
+        ca_pk: &[u8; 32],
+        trust_domain: &str,
+        now: i64,
+    ) -> Option<String> {
         let (_, cs, _ce, _) = der_tlv(cert, 0)?; // Certificate SEQUENCE
         let (_, _tcs, tce, tnext) = der_tlv(cert, cs)?; // tbsCertificate (first child)
         let tbs = &cert[cs..tce]; // the exact bytes the CA signed
         let (_, _acs, _ace, anext) = der_tlv(cert, tnext)?; // signatureAlgorithm
         let (_, scs, sce, _) = der_tlv(cert, anext)?; // signatureValue BIT STRING
+        if sce == scs {
+            return None; // no unused-bits byte
+        }
         let sig_bytes = &cert[scs + 1..sce]; // skip the unused-bits byte
         if sig_bytes.len() != 64 {
             return None;
@@ -3695,6 +4342,10 @@ pub mod x509 {
         if !crate::map::hashtrinity::crypto::ed25519_verify(ca_pk, tbs, &sig) {
             return None;
         } // CA signature
+        let info = parse_tbs(tbs)?;
+        if now < info.not_before || now > info.not_after {
+            return None;
+        }
         let id = extract_uri_san(cert)?;
         let td = id.strip_prefix("spiffe://")?.split('/').next()?;
         if td == trust_domain {
@@ -3870,6 +4521,14 @@ pub mod argon2 {
                         *out = g(&[0u64; 128], &g(&[0u64; 128], inp));
                     };
                     let start = if pass == 0 && slice == 0 { 2 } else { 0 };
+                    // RFC 9106 §3.4.1.2 / the reference `fill_segment`: when the segment starts at
+                    // column 2 (pass 0, slice 0) the first address block is generated up front,
+                    // because `idx % 128 == 0` never fires for idx = 2. Omitting this used all-zero
+                    // addresses for that segment and diverged from every conforming implementation
+                    // whenever a segment has more than two columns (i.e. every realistic `m`).
+                    if data_indep && start != 0 {
+                        refresh_addr(&mut addr_ctr, &mut input_block, &mut addr);
+                    }
                     for idx in start..seg {
                         let col = slice * seg + idx;
                         let prev = if col == 0 {

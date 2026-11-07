@@ -53,6 +53,70 @@ pub trait Coord {
     const INJECTIVE: bool = false;
     /// This key's 64-bit address.
     fn coord(&self) -> u64;
+    /// This key's address under a secret [`FoldKey`]: what a seeded [`Table`] uses, so an attacker who
+    /// knows the public fold (and [`PHI`](crate::map::hashtrinity::PHI)) cannot aim keys at chosen
+    /// slots.
+    ///
+    /// The default keys the finished coordinate, which is right for an integer (injective, so no
+    /// collision to hide). Types whose `coord` folds bytes or several components key the fold
+    /// *itself*: a collision of the unkeyed 64-bit value would survive any bijection applied after it.
+    /// It must be a pure function of `(key, fold key)`.
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        keyed_mix(self.coord(), key)
+    }
+}
+
+/// The secret that turns a [`Table`]'s fold into a keyed one ([`Table::with_random_seed`]). It is the
+/// *only* defence of a seeded table against chosen keys, so for untrusted keys it must be
+/// unpredictable to the attacker: use [`FoldKey::random`]. The keyed fold is a multiply-fold, not a
+/// cryptographic PRF: it defeats the public-constant aiming of the unseeded fold, not an attacker who
+/// can observe the seed or time individual operations.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct FoldKey {
+    k0: u64,
+    k1: u64, // forced odd: it is a multiplier
+}
+
+impl FoldKey {
+    /// A key from an explicit 128-bit seed (reproducible; for tests and replay). Do not use a
+    /// guessable seed against attacker-chosen keys. 127 bits of the seed are used (the multiplier is
+    /// forced odd).
+    pub const fn new(seed: u128) -> Self {
+        FoldKey {
+            k0: seed as u64,
+            k1: (seed >> 64) as u64 | 1,
+        }
+    }
+
+    /// A fresh unpredictable key from the standard library's per-process random state
+    /// (`RandomState`): no dependency, no `unsafe`.
+    pub fn random() -> Self {
+        use std::hash::BuildHasher;
+        let rs = std::collections::hash_map::RandomState::new();
+        let hi = u128::from(rs.hash_one(0x4861_7368_5472_696Eu64));
+        let lo = u128::from(rs.hash_one(0x6974_7920_466F_6C64u64));
+        Self::new((hi << 64) | lo)
+    }
+}
+
+impl std::fmt::Debug for FoldKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FoldKey(..)") // the secret is never printed
+    }
+}
+
+/// Two keyed multiply rounds over a finished coordinate: secret xor and secret odd multiplier each.
+#[inline]
+fn keyed_mix(c: u64, k: FoldKey) -> u64 {
+    let a = folded_mul(c ^ k.k0, k.k1);
+    folded_mul(a ^ k.k0.rotate_left(17), k.k1.rotate_left(29) | 1)
+}
+
+/// Combine two already-keyed component coordinates (tuples).
+#[inline]
+pub(crate) fn keyed_pair(a: u64, b: u64, k: FoldKey) -> u64 {
+    folded_mul(a ^ k.k0, b ^ k.k1)
 }
 
 macro_rules! int_coord {
@@ -362,11 +426,23 @@ impl Coord for u128 {
     fn coord(&self) -> u64 {
         (*self as u64) ^ ((*self >> 64) as u64)
     }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        // Both halves enter the keyed multiply separately, so `5` and `5 << 64` stay apart under a key.
+        keyed_mix(
+            folded_mul((*self as u64) ^ key.k0, ((*self >> 64) as u64) ^ key.k1),
+            key,
+        )
+    }
 }
 impl Coord for i128 {
     #[inline]
     fn coord(&self) -> u64 {
         (*self as u128).coord()
+    }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        (*self as u128).coord_keyed(key)
     }
 }
 impl Coord for char {
@@ -421,8 +497,17 @@ fn folded_mul(a: u64, b: u64) -> u64 {
 /// regardless (it compares the key); [`FreqMap`] trusts the fold.
 /// Measured: all six FreqMap-vs-hashbrown quadrants win, the in-cache-miss residual (once +28%,
 /// last +9%) now −3%. Everything proven downstream of the u64 (routing, descent, hashdos) untouched.
+/// The unkeyed byte fold: [`fold_bytes_with`] with the golden constants.
 #[inline]
 fn fold_bytes(b: &[u8]) -> u64 {
+    fold_bytes_with(b, PHI, PHI_HI)
+}
+
+/// [`fold_bytes`] with its two constants supplied: `p` seeds the fold (xor) and `q` is the odd
+/// multiplier. The unkeyed fold passes `(PHI, q)`, so its values are unchanged; a keyed fold
+/// passes the secret ([`FoldKey`]), so the key is mixed inside the fold, not after it.
+#[inline]
+fn fold_bytes_with(b: &[u8], p: u64, q: u64) -> u64 {
     let len = b.len();
     if len < 8 {
         // Short keys (< 8 bytes) pack INJECTIVELY across lengths: the bytes, zero-padded into the low
@@ -444,17 +529,17 @@ fn fold_bytes(b: &[u8]) -> u64 {
         } else {
             0
         };
-        let x = (packed | ((len as u64) << 56)) ^ PHI;
+        let x = (packed | ((len as u64) << 56)) ^ p;
         return x ^ (x >> 32);
     }
     // 8 bytes and up: `len` is 8..; the seed differentiates lengths, folded in below.
-    let seed = PHI ^ (len as u64).wrapping_mul(PHI_HI);
+    let seed = p ^ (len as u64).wrapping_mul(q);
     {
         if len <= 16 {
             // two overlapping words, ONE folded multiply (16 bytes → 64 bits, was 2 muls striped).
             let a = u64::from_le_bytes(b[..8].try_into().unwrap());
             let c = u64::from_le_bytes(b[len - 8..].try_into().unwrap()); // overlap, no copy
-            folded_mul(a ^ seed, c ^ PHI_HI)
+            folded_mul(a ^ seed, c ^ q)
         } else if len <= 24 {
             // three words, TWO folded multiplies run INDEPENDENTLY (`FoldDepth.synthFold`): `s0`
             // reads the head, `s1` reads the tail, neither reads the other's output — serial multiply
@@ -468,8 +553,8 @@ fn fold_bytes(b: &[u8]) -> u64 {
             let a = u64::from_le_bytes(b[..8].try_into().unwrap());
             let mid = u64::from_le_bytes(b[8..16].try_into().unwrap());
             let c = u64::from_le_bytes(b[len - 8..].try_into().unwrap());
-            let s0 = folded_mul(a ^ seed, mid ^ PHI_HI);
-            let s1 = folded_mul(c ^ seed, mid ^ PHI_HI);
+            let s0 = folded_mul(a ^ seed, mid ^ q);
+            let s1 = folded_mul(c ^ seed, mid ^ q);
             s0.rotate_left(5) ^ s1
         } else {
             // > 24 bytes: nonlinear 16-byte-block accumulator (half the per-word chain's depth,
@@ -479,12 +564,12 @@ fn fold_bytes(b: &[u8]) -> u64 {
             while s.len() > 16 {
                 let x = u64::from_le_bytes(s[..8].try_into().unwrap());
                 let y = u64::from_le_bytes(s[8..16].try_into().unwrap());
-                acc = folded_mul(acc ^ x, y ^ PHI_HI);
+                acc = folded_mul(acc ^ x, y ^ q);
                 s = &s[16..];
             }
             let x = u64::from_le_bytes(b[len - 16..len - 8].try_into().unwrap()); // overlap tail
             let y = u64::from_le_bytes(b[len - 8..].try_into().unwrap());
-            folded_mul(acc ^ x, y ^ PHI_HI)
+            folded_mul(acc ^ x, y ^ q)
         }
     }
 }
@@ -494,17 +579,29 @@ impl Coord for str {
     fn coord(&self) -> u64 {
         fold_bytes(self.as_bytes())
     }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        keyed_mix(fold_bytes_with(self.as_bytes(), key.k0, key.k1), key)
+    }
 }
 impl Coord for String {
     #[inline]
     fn coord(&self) -> u64 {
         fold_bytes(self.as_bytes())
     }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        self.as_str().coord_keyed(key)
+    }
 }
 impl Coord for [u8] {
     #[inline]
     fn coord(&self) -> u64 {
         fold_bytes(self)
+    }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        keyed_mix(fold_bytes_with(self, key.k0, key.k1), key)
     }
 }
 impl<T: Coord + ?Sized> Coord for &T {
@@ -513,17 +610,30 @@ impl<T: Coord + ?Sized> Coord for &T {
     fn coord(&self) -> u64 {
         (**self).coord()
     }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        (**self).coord_keyed(key)
+    }
 }
 impl<A: Coord, B: Coord> Coord for (A, B) {
     #[inline]
     fn coord(&self) -> u64 {
         self.0.coord().wrapping_mul(PHI) ^ self.1.coord()
     }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        keyed_pair(self.0.coord_keyed(key), self.1.coord_keyed(key), key)
+    }
 }
 impl<A: Coord, B: Coord, C: Coord> Coord for (A, B, C) {
     #[inline]
     fn coord(&self) -> u64 {
         (self.0.coord().wrapping_mul(PHI) ^ self.1.coord()).wrapping_mul(PHI) ^ self.2.coord()
+    }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        let ab = keyed_pair(self.0.coord_keyed(key), self.1.coord_keyed(key), key);
+        keyed_pair(ab, self.2.coord_keyed(key), key)
     }
 }
 
@@ -663,7 +773,7 @@ impl<K: Eq + Coord, KS: KeyStore<K>> Table<K, i64, KS> {
     /// Add `v` to `k`'s running total (starting from 0).
     #[inline]
     pub fn add(&mut self, k: K, v: i64) {
-        let coord = Self::coord_of(&k);
+        let coord = self.coord_of(&k);
         self.add_with_coord(coord, k, v);
     }
 
@@ -723,7 +833,7 @@ impl<K: Eq + Coord, KS: KeyStore<K>> Table<K, i64, KS> {
         }
         let mut coords = [0u64; P];
         for (i, c) in coords.iter_mut().enumerate() {
-            *c = Self::coord_of(&keys[i]);
+            *c = self.coord_of(&keys[i]);
             self.prefetch_coord(*c);
         }
         for i in 0..n {
@@ -731,7 +841,7 @@ impl<K: Eq + Coord, KS: KeyStore<K>> Table<K, i64, KS> {
             self.add_with_coord(c, keys[i], 1);
             let j = i + P;
             if j < n {
-                let cj = Self::coord_of(&keys[j]);
+                let cj = self.coord_of(&keys[j]);
                 coords[j & (P - 1)] = cj; // j ≡ i (mod P): the ring slot we just consumed
                 self.prefetch_coord(cj);
             }

@@ -326,6 +326,8 @@ where
     bits: u32,
     len: usize,   // live PRIMARY main-slot entries (excludes tombstones and the overflow)
     tombs: usize, // deleted-but-not-yet-reclaimed slots; cleared on resize
+    // `Some` ⇒ every coordinate is the keyed fold ([`Coord::coord_keyed`]); set by `with_seed`.
+    seed: Option<FoldKey>,
     _k: std::marker::PhantomData<K>,
 }
 
@@ -399,6 +401,7 @@ impl<K: Coord + Clone, V: Clone, KS: KeyStore<K>> Clone for Table<K, V, KS> {
             bits: self.bits,
             len: self.len,
             tombs: self.tombs,
+            seed: self.seed,
             _k: std::marker::PhantomData,
         }
     }
@@ -464,6 +467,46 @@ impl<K: Eq + Coord, V> Table<K, V, Stored<K>> {
     }
 }
 
+/// Seeded constructors, for keys an attacker chooses. The default table is **unseeded**: its fold is
+/// a public function of the key (`PHI` is public), so keys can be computed that all land on the slots
+/// a victim key probes. A seeded table keys every coordinate with a secret [`FoldKey`]
+/// ([`Coord::coord_keyed`]), so those keys cannot be aimed in advance. It stores the key and is exact.
+/// It exists only for the [`Stored`] species: a [`CoordMap`] regenerates the key from its address and
+/// so cannot hide it. The cost is one keyed fold per operation. The keyed fold is a multiply-fold,
+/// not a cryptographic PRF.
+impl<K: Eq + Coord, V> Table<K, V, Stored<K>> {
+    /// An empty seeded table with an explicit [`FoldKey`] (reproducible; for tests and replay). Against
+    /// an attacker the key must be unpredictable: see [`with_random_seed`](Self::with_random_seed).
+    pub fn with_seed(seed: FoldKey) -> Self {
+        let mut t = Self::with_bits(3);
+        t.seed = Some(seed);
+        t
+    }
+
+    /// A seeded table presized to hold `cap` keys.
+    pub fn with_seed_and_capacity(seed: FoldKey, cap: usize) -> Self {
+        let mut t = Self::with_bits(bits_for(cap));
+        t.seed = Some(seed);
+        t
+    }
+
+    /// An empty table with a fresh random [`FoldKey`] from `std`'s per-process random state: the
+    /// opt-in flood-resistant constructor for untrusted keys.
+    pub fn with_random_seed() -> Self {
+        Self::with_seed(FoldKey::random())
+    }
+
+    /// [`with_random_seed`](Self::with_random_seed), presized to hold `cap` keys.
+    pub fn with_random_seed_and_capacity(cap: usize) -> Self {
+        Self::with_seed_and_capacity(FoldKey::random(), cap)
+    }
+
+    /// Whether this table folds its keys under a secret ([`with_seed`](Self::with_seed)).
+    pub fn is_seeded(&self) -> bool {
+        self.seed.is_some()
+    }
+}
+
 /// Constructors for a [`CoordMap`] — coordinate keys, no key array (regenerated from the address).
 impl<K: CoordInv + Eq, V> Table<K, V, Regen<K>> {
     /// A coordinate map sized for `cap` keys — the same one sizing as [`Table::with_capacity`].
@@ -484,16 +527,20 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
             bits,
             len: 0,
             tombs: 0,
+            seed: None,
             _k: std::marker::PhantomData,
         }
     }
 
-    /// A key's coordinate — the identity on every coordinate. The two values reserved as occupancy
-    /// markers (`EMPTY`, `TOMB`) are held out of band (see [`SideStore`]), so no non-reserved
-    /// coordinate is remapped and `coord_of(U64::MAX)` is not folded onto another key's coordinate.
+    /// A key's coordinate: the key's own [`Coord::coord`], or its keyed coordinate when the table is
+    /// seeded ([`with_seed`](Table::with_seed)). The two values reserved as occupancy markers
+    /// (`EMPTY`, `TOMB`) are held out of band (see [`SideStore`]), so no coordinate is remapped here.
     #[inline]
-    fn coord_of(k: &K) -> u64 {
-        k.coord()
+    fn coord_of(&self, k: &K) -> u64 {
+        match self.seed {
+            None => k.coord(),
+            Some(s) => k.coord_keyed(s),
+        }
     }
 
     /// The home slot. A key that fits the array indexes directly (no hash); a larger key takes the
@@ -577,7 +624,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     /// with equal coordinates are two entries; a reserved coordinate is resolved in the [`SideStore`].
     #[inline]
     fn get_coord(&self, k: &K) -> Option<&V> {
-        let coord = Self::coord_of(k);
+        let coord = self.coord_of(k);
         if is_sentinel(coord) {
             let i = self.side.find(coord, k)?;
             // SAFETY: `find` only returns an entry whose `live` marker is set.
@@ -636,7 +683,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
         }
         let mut coords = [0u64; P];
         for (i, c) in coords.iter_mut().enumerate() {
-            *c = Self::coord_of(&keys[i]);
+            *c = self.coord_of(&keys[i]);
             self.prefetch_coord(*c);
         }
         for i in 0..n {
@@ -645,7 +692,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
             visit(&keys[i], v);
             let j = i + P;
             if j < n {
-                let cj = Self::coord_of(&keys[j]);
+                let cj = self.coord_of(&keys[j]);
                 coords[j & (P - 1)] = cj; // j ≡ i (mod P): the slot we just consumed
                 self.prefetch_coord(cj);
             }
@@ -685,7 +732,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     /// reserved-coordinate key is removed from the [`SideStore`].
     #[inline]
     pub fn remove(&mut self, k: &K) -> Option<V> {
-        let coord = Self::coord_of(k);
+        let coord = self.coord_of(k);
         if is_sentinel(coord) {
             let i = self.side.find(coord, k)?;
             // SAFETY: `find` only returns an entry whose `live` marker is set.
@@ -733,7 +780,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     /// the side store instead of the slot arrays.
     #[inline]
     fn insert_core(&mut self, k: K, new: V, last_write: bool) -> Option<InsertHit<V>> {
-        let coord = Self::coord_of(&k);
+        let coord = self.coord_of(&k);
         if is_sentinel(coord) {
             if let Some(i) = self.side.find(coord, &k) {
                 drop(k);
@@ -938,6 +985,8 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     #[cold]
     fn resize(&mut self, new_bits: u32) {
         let mut bigger = Self::with_bits(new_bits);
+        // The stored coordinates are keyed: the rebuilt table must key them the same way.
+        bigger.seed = self.seed;
         let mut i = 0;
         while i < self.coords.len() {
             let c = self.coords[i];
@@ -1025,8 +1074,9 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
 
     /// The coordinate seed matched to this table's slot count (see the [`seed`] module). `seed.home(c)`
     /// is this table's own home slot and `seed.residual(c)` is the rest of `c·PHI` the slot doesn't
-    /// carry — what a compact readout would store instead of the full coordinate. Diagnostic — not
-    /// part of the stable surface.
+    /// carry — what a compact readout would store instead of the full coordinate. It describes the
+    /// unkeyed coordinate, so it does not apply to a seeded table. Diagnostic — not part of the
+    /// stable surface.
     #[doc(hidden)]
     #[inline]
     pub fn coord_seed(&self) -> CoordSeed {

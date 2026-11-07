@@ -22,4 +22,4 @@
 //! Both faces are re-exported here as the public path for the port: `apeiron::map::freq::Table` is the
 //! type `src/map/hashtrinity/` defines.
 
-pub use crate::map::hashtrinity::{par, Coord, CoordMap, FreqMap, Table, PHI, PROBE_CAP};
+pub use crate::map::hashtrinity::{par, Coord, CoordMap, FoldKey, FreqMap, Table, PHI, PROBE_CAP};

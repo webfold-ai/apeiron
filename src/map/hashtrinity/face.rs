@@ -44,6 +44,8 @@ use crate::map::hashtrinity::{
     bits_for, is_live, is_sentinel, side::MergeGuard, Capped, Coord, KeyReadout, KeyStore, Overflow,
     SideStore, Store, Stored, Table, EMPTY, PHI, TOMB,
 };
+use super::algebra::keyed_pair;
+use crate::map::hashtrinity::FoldKey;
 use std::mem::MaybeUninit;
 
 // ── Locate / Absorb: a borrowed key that addresses the same slot as the owned one. ─────────────
@@ -73,6 +75,9 @@ use std::mem::MaybeUninit;
 pub trait Locate<K: Coord + Eq> {
     /// This view's coordinate — equal to `K::coord` of the key it locates.
     fn coord(&self) -> u64;
+    /// This view's keyed coordinate under `key` — equal to [`Coord::coord_keyed`] of the key it locates,
+    /// so a borrowed probe of a seeded table lands where the owned key does.
+    fn coord_keyed(&self, key: FoldKey) -> u64;
     /// Whether this view names exactly `k` (the exact compare; `_exact` faces only).
     fn same(&self, k: &K) -> bool;
 }
@@ -88,6 +93,10 @@ impl<K: Coord + Eq> Locate<K> for &K {
     #[inline]
     fn coord(&self) -> u64 {
         (**self).coord()
+    }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        (**self).coord_keyed(key)
     }
     #[inline]
     fn same(&self, k: &K) -> bool {
@@ -106,6 +115,10 @@ impl Locate<String> for &str {
     fn coord(&self) -> u64 {
         // `<str as Coord>::coord` and `<String as Coord>::coord` are the same `fold_bytes` call.
         <str as Coord>::coord(self)
+    }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        <str as Coord>::coord_keyed(self, key)
     }
     #[inline]
     fn same(&self, k: &String) -> bool {
@@ -128,6 +141,10 @@ impl<A: Coord + Eq, B: Coord + Eq, PA: Locate<A>, PB: Locate<B>> Locate<(A, B)> 
         self.0.coord().wrapping_mul(PHI) ^ self.1.coord()
     }
     #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        keyed_pair(self.0.coord_keyed(key), self.1.coord_keyed(key), key)
+    }
+    #[inline]
     fn same(&self, k: &(A, B)) -> bool {
         self.0.same(&k.0) && self.1.same(&k.1)
     }
@@ -145,6 +162,11 @@ impl<A: Coord + Eq, B: Coord + Eq, C: Coord + Eq, PA: Locate<A>, PB: Locate<B>, 
     #[inline]
     fn coord(&self) -> u64 {
         (self.0.coord().wrapping_mul(PHI) ^ self.1.coord()).wrapping_mul(PHI) ^ self.2.coord()
+    }
+    #[inline]
+    fn coord_keyed(&self, key: FoldKey) -> u64 {
+        let ab = keyed_pair(self.0.coord_keyed(key), self.1.coord_keyed(key), key);
+        keyed_pair(ab, self.2.coord_keyed(key), key)
     }
     #[inline]
     fn same(&self, k: &(A, B, C)) -> bool {
@@ -432,7 +454,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     /// the keyed probe, so two distinct keys with equal coordinates take two slots.
     #[inline]
     pub fn entry(&mut self, k: K) -> Entry<'_, K, V, KS> {
-        let coord = Self::coord_of(&k);
+        let coord = self.coord_of(&k);
         if is_sentinel(coord) {
             if let Some(slot) = self.side.find(coord, &k) {
                 return Entry::Occupied(OccupiedEntry {
@@ -503,7 +525,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     where
         KS: KeyReadout<K>,
     {
-        let coord = q.coord();
+        let coord = self.view_coord(&q);
         if is_sentinel(coord) {
             if let Some(slot) = self.side_find_locate(coord, &q) {
                 return Entry::Occupied(OccupiedEntry {
@@ -569,7 +591,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     /// The value for `k`, mutably. One probe.
     #[inline]
     pub fn get_mut(&mut self, k: &K) -> Option<&mut V> {
-        let coord = Self::coord_of(k);
+        let coord = self.coord_of(k);
         if is_sentinel(coord) {
             let i = self.side.find(coord, k)?;
             // SAFETY: `find` returns an occupied side entry ⇒ value initialized.
@@ -626,7 +648,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     /// Whether `k` is present. One probe, no value touched.
     #[inline]
     pub fn contains_key(&self, k: &K) -> bool {
-        let coord = Self::coord_of(k);
+        let coord = self.coord_of(k);
         if is_sentinel(coord) {
             return self.side.find(coord, k).is_some();
         }
@@ -686,7 +708,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     where
         KS: KeyReadout<K>,
     {
-        let coord = q.coord();
+        let coord = self.view_coord(&q);
         if is_sentinel(coord) {
             if let Some(i) = self.side_find_locate(coord, &q) {
                 // SAFETY: every side entry's value is initialized; it is moved out once, and the
@@ -757,7 +779,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     where
         KS: KeyReadout<K>,
     {
-        let coord = q.coord();
+        let coord = self.view_coord(&q);
         match self.locate_at(&q)? {
             Located::Side(i) => {
                 // SAFETY: a located side entry is occupied ⇒ key and value initialized; `take_entry`
@@ -802,7 +824,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     where
         KS: KeyReadout<K>,
     {
-        let coord = Self::coord_of(k);
+        let coord = self.coord_of(k);
         if is_sentinel(coord) {
             let i = self.side.find(coord, k)?;
             // SAFETY: `find` returns an occupied side entry ⇒ key and value initialized.
@@ -839,7 +861,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     /// grows the table (no key is being added).
     #[inline]
     fn entry_ref(&mut self, k: &K) -> Option<OccupiedEntry<'_, K, V, KS>> {
-        let coord = Self::coord_of(k);
+        let coord = self.coord_of(k);
         if is_sentinel(coord) {
             let slot = self.side.find(coord, k)?;
             return Some(OccupiedEntry {
@@ -1079,7 +1101,20 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
 
     /// Empty the table into an iterator of its `(key, value)` pairs, keeping the table usable.
     pub fn drain(&mut self) -> IntoIter<K, V, KS> {
-        std::mem::replace(self, Self::with_bits(3)).into_iter()
+        // The emptied table keeps its fold: a seeded table stays seeded under the same secret.
+        let mut fresh = Self::with_bits(3);
+        fresh.seed = self.seed;
+        std::mem::replace(self, fresh).into_iter()
+    }
+
+    /// A borrowed view's coordinate under this table's fold: [`Locate::coord`], or its keyed form when
+    /// the table is seeded. The [`Locate`] twin of [`coord_of`](Self::coord_of).
+    #[inline]
+    fn view_coord<Q: Locate<K>>(&self, q: &Q) -> u64 {
+        match self.seed {
+            None => q.coord(),
+            Some(s) => q.coord_keyed(s),
+        }
     }
 
     /// The side-store twin of [`probe_capped_locate`](Self::probe_capped_locate): the entry whose
@@ -1107,7 +1142,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     where
         KS: KeyReadout<K>,
     {
-        let coord = q.coord();
+        let coord = self.view_coord(q);
         if is_sentinel(coord) {
             return self.side_find_locate(coord, q).map(Located::Side);
         }

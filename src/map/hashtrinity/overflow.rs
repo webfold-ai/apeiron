@@ -883,7 +883,7 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     /// exhausted cap. Diagnostic — not part of the stable surface.
     #[doc(hidden)]
     pub fn primary_examinations(&self, k: &K) -> u32 {
-        let coord = Self::coord_of(k);
+        let coord = self.coord_of(k);
         if is_sentinel(coord) {
             return 0; // resolved in the side store, not a primary slot
         }

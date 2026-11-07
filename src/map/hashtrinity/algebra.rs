@@ -99,6 +99,12 @@ pub trait KeyStore<K: Coord>: Sized {
     fn set(&mut self, i: usize, k: K);
     /// Whether slot `i` holds key `q` (an exact compare; trivially true on the Regen path).
     fn matches(&self, i: usize, coord: u64, q: &K) -> bool;
+    /// Run `f` on a reference to slot `i`'s key (borrowed if stored, regenerated if not). The
+    /// key-borrowing face the exact comparisons use without taking ownership of the key.
+    ///
+    /// # Safety
+    /// Slot `i` must be live.
+    unsafe fn with_key<R>(&self, i: usize, coord: u64, f: impl FnOnce(&K) -> R) -> R;
     /// Move slot `i`'s key into slot `j` of `dst` (used while growing).
     fn migrate(&mut self, i: usize, dst: &mut Self, j: usize);
     /// Move slot `i`'s key out (Stored: take it; Regen: regenerate it).
@@ -188,6 +194,11 @@ impl<K: Coord + Eq> KeyStore<K> for Stored<K> {
         }
         // SAFETY: only called on an occupied slot (after a successful probe).
         unsafe { self.0.get_unchecked(i).assume_init_ref() == q }
+    }
+    #[inline]
+    unsafe fn with_key<R>(&self, i: usize, _coord: u64, f: impl FnOnce(&K) -> R) -> R {
+        // SAFETY: slot `i` live ⇒ in bounds and initialized (the caller's contract).
+        f(unsafe { self.0.get_unchecked(i).assume_init_ref() })
     }
     #[inline]
     fn migrate(&mut self, i: usize, dst: &mut Self, j: usize) {
@@ -283,6 +294,10 @@ impl<K: CoordInv + Eq> KeyStore<K> for Regen<K> {
         // The soundness rests on `set` being a no-op: `coords[i]` is written from `k.coord()` and the
         // key is regenerated as `from_coord(coords[i])`.
         true
+    }
+    #[inline]
+    unsafe fn with_key<R>(&self, _i: usize, coord: u64, f: impl FnOnce(&K) -> R) -> R {
+        f(&K::from_coord(coord))
     }
     #[inline]
     fn migrate(&mut self, _i: usize, _dst: &mut Self, _j: usize) {} // regenerated in the new table

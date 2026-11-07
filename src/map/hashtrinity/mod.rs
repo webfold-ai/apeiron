@@ -414,6 +414,10 @@ impl<K: Coord, V, KS: KeyStore<K>> std::fmt::Debug for Table<K, V, KS> {
 
 /// A table for coordinate keys ([`CoordInv`], integers): the key regenerates from the address, so no
 /// key array. Builds a big map faster than hashbrown (no key writes) and uses less memory.
+///
+/// The two reserved coordinates `u64::MAX` (`EMPTY`) and `u64::MAX - 1` (`TOMB`) cannot be stored
+/// without a key, so inserting either panics before the table changes; reads report them absent.
+/// For `i64` keys these are `-1` and `-2`. Use a [`Table`], which keeps the key, for those values.
 pub type CoordMap<K, V> = Table<K, V, Regen<K>>;
 
 impl<K: Eq + Coord, V, KS: KeyStore<K>> Default for Table<K, V, KS> {
@@ -1051,8 +1055,10 @@ impl<K: Eq + Coord, V, KS: KeyStore<K>> Table<K, V, KS> {
     }
 }
 
-/// Equal iff the same entries: main slots by coordinate, side entries by coordinate and value (the
-/// coordinate identity the main comparison has always used).
+/// Equal iff the same entries: every live entry of `self` (main, side or overflow) is present in
+/// `other` under the same KEY with an equal value, and the counts agree. Keys are compared, not
+/// coordinates: two distinct keys may share a coordinate (`u128` `5` and `5 << 64`), and they are
+/// different entries. O(n) key lookups, each O(1) expected.
 impl<K: Eq + Coord, V: PartialEq, KS: KeyStore<K>> PartialEq for Table<K, V, KS> {
     fn eq(&self, other: &Self) -> bool {
         if self.len() != other.len() {
@@ -1062,44 +1068,33 @@ impl<K: Eq + Coord, V: PartialEq, KS: KeyStore<K>> PartialEq for Table<K, V, KS>
             if !is_live(*c) {
                 continue;
             }
-            // SAFETY: live coord ⇒ this value initialized; the match in `other` (primary or
-            // overflow) confirms an initialized value there.
-            if !other.holds_value_at(*c, unsafe { self.vals.get_unchecked(i).assume_init_ref() }) {
+            // SAFETY: live coord ⇒ slot i's key and value are initialized.
+            let same = unsafe {
+                self.keys.with_key(i, *c, |k| {
+                    other.get(k) == Some(self.vals.get_unchecked(i).assume_init_ref())
+                })
+            };
+            if !same {
                 return false;
             }
         }
-        // Overflow entries participate the same way; `len()` already fixed the count.
-        if let Some(o) = &self.overflow {
-            for (c, _k, v) in o.iter() {
-                if !other.holds_value_at(c, v) {
-                    return false;
-                }
-            }
-        }
-        // Side entries participate by `(coordinate, value)`, not through `len()` alone: two tables
-        // differing only in a reserved-coordinate entry must compare unequal. O(s²) with `s` the
-        // side-entry count (0 on ordinary tables).
-        if self.side.coords.len() != other.side.coords.len() {
-            return false;
-        }
-        let mut matched = vec![false; other.side.coords.len()];
         for i in 0..self.side.coords.len() {
             let c = self.side.coords[i];
-            // SAFETY: side entries are occupied ⇒ values initialized.
-            let v = unsafe { self.side.vals.get_unchecked(i).assume_init_ref() };
-            let mut hit = false;
-            for j in 0..other.side.coords.len() {
-                if !matched[j]
-                    && other.side.coords[j] == c
-                    && unsafe { other.side.vals.get_unchecked(j).assume_init_ref() } == v
-                {
-                    matched[j] = true;
-                    hit = true;
-                    break;
-                }
-            }
-            if !hit {
+            // SAFETY: side entries are occupied ⇒ keys and values are initialized.
+            let same = unsafe {
+                self.side.keys.with_key(i, c, |k| {
+                    other.get(k) == Some(self.side.vals.get_unchecked(i).assume_init_ref())
+                })
+            };
+            if !same {
                 return false;
+            }
+        }
+        if let Some(o) = &self.overflow {
+            for (_c, k, v) in o.iter() {
+                if other.get(k) != Some(v) {
+                    return false;
+                }
             }
         }
         true

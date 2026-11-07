@@ -9,8 +9,8 @@ use super::*;
 /// (initialized for every entry `i < coords.len()`; a merge moves it out only while a
 /// [`MergeGuard`] holds the table, and a panicking merge swap-removes the entry), and `keys` the
 /// identity exactly as the main store carries it: the full key for `Stored`, nothing for `Regen`
-/// (which regenerates the key from `coords[i]`, and is admitted only under an injective coordinate —
-/// [`CoordInv`]). The store is packed and scanned linearly; it holds only the keys that literally ask
+/// (which regenerates the key from `coords[i]`; a keyless store refuses reserved-coordinate keys, see
+/// [`push`](Self::push)). The store is packed and scanned linearly; it holds only the keys that literally ask
 /// for a sentinel, so it is empty (one zero-length `Vec` and a zero-sized key store) on every
 /// ordinary table. Capacity is O(side entries), never O(table slots).
 pub(super) struct SideStore<K: Coord, V, KS: KeyStore<K>> {
@@ -35,6 +35,14 @@ impl<K: Coord, V, KS: KeyStore<K>> SideStore<K, V, KS> {
     /// Append `(coord, k, v)`, growing the key store's fixed-capacity allocation by doubling. The
     /// values and coordinates live in plain `Vec`s and grow themselves.
     pub(super) fn push(&mut self, coord: u64, k: K, v: V) {
+        // A keyless store cannot hold a reserved-coordinate key: `Regen` regenerates the key from
+        // its coordinate, and the reserved words are the very values that were refused as keys. A
+        // refusal here, before anything is stored, leaves the table unchanged.
+        assert!(
+            !KS::REGEN,
+            "a CoordMap cannot store a key whose coordinate is u64::MAX or u64::MAX - 1 (reserved \
+             slot markers); use a Table, which keeps the key"
+        );
         let need = self.coords.len() + 1;
         if need > self.cap {
             let new_cap = (self.cap * 2).max(4).max(need);

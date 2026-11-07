@@ -379,16 +379,45 @@ fn folded_mul(a: u64, b: u64) -> u64 {
 /// `folded_mul` — twice the input per multiply, and each `folded_mul` is a single `mulx` with none
 /// of that scaffolding. A ≤16-byte key is ONE folded multiply; the benchmark's 17–24-byte key is
 /// two; both far fewer instructions than the striped chain. Each `folded_mul` is the proven
-/// counted-`2^64`-fiber boundary (`xorHalves_balanced`); keys ≤ 15 bytes pack injectively and
-/// separate EXACTLY (`pack_injective` — the `2^-64` tradeoff is a long-key statement only).
+/// counted-`2^64`-fiber boundary (`xorHalves_balanced`). **Only keys of at most 7 bytes are
+/// injective** (length and bytes packed into one word, then a bijective mix; across lengths too).
+/// From 8 bytes up the input space exceeds 2^64, so collisions exist by counting; `2^-64` is the
+/// per-pair rate for *random* keys, not a guarantee against chosen ones: a 9–16 byte collision is a
+/// closed-form factorisation of the 128-bit product (`(2m)·n == m·(2n)`), and a birthday search
+/// needs about 2^32 evaluations by the birthday bound (not measured here). [`Table`] stays exact
+/// regardless (it compares the key); [`FreqMap`] trusts the fold.
 /// Measured: all six FreqMap-vs-hashbrown quadrants win, the in-cache-miss residual (once +28%,
 /// last +9%) now −3%. Everything proven downstream of the u64 (routing, descent, hashdos) untouched.
 #[inline]
 fn fold_bytes(b: &[u8]) -> u64 {
     let len = b.len();
-    let seed = PHI ^ (len as u64).wrapping_mul(PHI_HI); // length differentiates, folded in below
-    if len >= 8 {
-        return if len <= 16 {
+    if len < 8 {
+        // Short keys (< 8 bytes) pack INJECTIVELY across lengths: the bytes, zero-padded into the low
+        // 7 bytes of one word, and the length in the top byte, then a bijective mix (xor a constant,
+        // xor-shift). Distinct (length, bytes) ⇒ distinct word ⇒ distinct coordinate. A length-only
+        // seed made the map injective per length alone: a 4-byte and a 5-byte key could share a
+        // coordinate in closed form (audit CLM-02).
+        //
+        // Per length the packing is injective: ≥4 bytes take the first 4 and the last `len` − 4 bytes
+        // (positions 4..len, realigned to bits 32..); 1..=3 bytes take bytes 0, len/2, len−1 (for
+        // len 1 and 2 that repeats a byte, which is still injective within the length).
+        let packed = if len >= 4 {
+            let lo = u32::from_le_bytes(b[..4].try_into().unwrap()) as u64;
+            let hi = u32::from_le_bytes(b[len - 4..].try_into().unwrap()) as u64;
+            // `hi` holds bytes len-4..len; shifting right by 8·(8−len) keeps exactly positions 4..len.
+            lo | ((hi >> (8 * (8 - len))) << 32)
+        } else if len > 0 {
+            (b[0] as u64) | ((b[len / 2] as u64) << 8) | ((b[len - 1] as u64) << 16)
+        } else {
+            0
+        };
+        let x = (packed | ((len as u64) << 56)) ^ PHI;
+        return x ^ (x >> 32);
+    }
+    // 8 bytes and up: `len` is 8..; the seed differentiates lengths, folded in below.
+    let seed = PHI ^ (len as u64).wrapping_mul(PHI_HI);
+    {
+        if len <= 16 {
             // two overlapping words, ONE folded multiply (16 bytes → 64 bits, was 2 muls striped).
             let a = u64::from_le_bytes(b[..8].try_into().unwrap());
             let c = u64::from_le_bytes(b[len - 8..].try_into().unwrap()); // overlap, no copy
@@ -423,20 +452,8 @@ fn fold_bytes(b: &[u8]) -> u64 {
             let x = u64::from_le_bytes(b[len - 16..len - 8].try_into().unwrap()); // overlap tail
             let y = u64::from_le_bytes(b[len - 8..].try_into().unwrap());
             folded_mul(acc ^ x, y ^ PHI_HI)
-        };
+        }
     }
-    // short keys (< 8 bytes): pack overlapping reads, light mix; the probe supplies the multiply.
-    let raw = if len >= 4 {
-        let lo = u32::from_le_bytes(b[..4].try_into().unwrap()) as u64;
-        let hi = u32::from_le_bytes(b[len - 4..].try_into().unwrap()) as u64;
-        (lo << 32) | hi
-    } else if len > 0 {
-        (b[0] as u64) | ((b[len / 2] as u64) << 16) | ((b[len - 1] as u64) << 32)
-    } else {
-        0
-    };
-    let x = raw ^ seed;
-    x ^ (x >> 32)
 }
 
 impl Coord for str {

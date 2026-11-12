@@ -72,7 +72,18 @@ use crate::engine::chart::task::ChunkTask;
 
 /// The largest accepted contraction length: `k < MAX_K` keeps the exact `i128` sum plus the
 /// round-half add inside `i128` (`(MAX_K−1)·(2³⁶−1)² + 2³¹ < 2¹²⁷`). `127 − 2·BOUND_BITS = 55`.
-pub const MAX_K: usize = 1 << (127 - 2 * BOUND_BITS as usize);
+///
+/// On a target whose `usize` is narrower than 56 bits (32-bit, WebAssembly) `2⁵⁵` is not
+/// representable, and no slice there can be that long, so the bound is `usize::MAX`: the check
+/// `k < MAX_K` still holds for every length that can exist.
+pub const MAX_K: usize = {
+    const BITS: usize = 127 - 2 * BOUND_BITS as usize;
+    if BITS < usize::BITS as usize {
+        1 << BITS
+    } else {
+        usize::MAX
+    }
+};
 
 /// Rows of the A cache panel: `MC · KC · 8 B = 64 KiB`.
 const MC: usize = 64;

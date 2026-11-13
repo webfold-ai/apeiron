@@ -198,6 +198,8 @@ mod algebra;
 mod freq;
 pub use algebra::*;
 pub use freq::*;
+pub mod dense;
+pub use dense::Dense;
 
 /// Golden ratio · 2⁶⁴ — the Fibonacci-hashing multiplier. Odd, so `c ↦ c·PHI` is a bijection on 2⁶⁴
 /// and loses nothing: splitting `c·PHI` into (top `bits` = home slot | low bits = residual) is

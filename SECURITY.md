@@ -4,7 +4,7 @@
 
 Report privately through GitHub's private vulnerability reporting:
 <https://github.com/webfold-ai/apeiron/security/advisories/new>, or by email to
-security@twn.systems. Do not open a public issue for a suspected vulnerability.
+security@webfold.ai. Do not open a public issue for a suspected vulnerability.
 
 Include the affected revision, the input or model file that triggers it (or how to build one), and
 what you observed. A report is acknowledged within 3 days. A confirmed issue gets a fix or a

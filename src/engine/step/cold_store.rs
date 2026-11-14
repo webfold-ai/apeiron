@@ -115,7 +115,10 @@ impl ColdStore {
         if layer > KEY_FIELD_MASK || kv_head > KEY_FIELD_MASK || block > KEY_FIELD_MASK {
             return Err(ColdStoreError::BadGeometry);
         }
-        let word = (layer << (2 * KEY_FIELD_BITS)) | (kv_head << KEY_FIELD_BITS) | block;
+        // Pack in the key's width, not the host pointer width (WASM pointers are 32-bit).
+        let word = ((layer as u64) << (2 * KEY_FIELD_BITS))
+            | ((kv_head as u64) << KEY_FIELD_BITS)
+            | block as u64;
         match i64::try_from(word) {
             Ok(k) => Ok(k),
             Err(_) => Err(ColdStoreError::BadGeometry),
@@ -258,5 +261,23 @@ impl ColdStore {
     #[must_use]
     pub fn index_bytes(&self) -> usize {
         self.blocks() * INDEX_RECORD_BYTES
+    }
+}
+
+#[cfg(test)]
+mod wasm_key_tests {
+    use super::*;
+
+    #[test]
+    fn packed_key_retains_all_three_fields_on_32_bit_targets() {
+        assert_eq!(ColdStore::key(1, 2, 3), Ok((1_i64 << 42) | (2_i64 << 21) | 3));
+        assert_eq!(ColdStore::key(KEY_FIELD_MASK, KEY_FIELD_MASK, KEY_FIELD_MASK), Ok(i64::MAX));
+    }
+
+    #[test]
+    fn oversized_key_fields_are_refused() {
+        for key in [(KEY_FIELD_MASK + 1, 0, 0), (0, KEY_FIELD_MASK + 1, 0), (0, 0, KEY_FIELD_MASK + 1)] {
+            assert_eq!(ColdStore::key(key.0, key.1, key.2), Err(ColdStoreError::BadGeometry));
+        }
     }
 }

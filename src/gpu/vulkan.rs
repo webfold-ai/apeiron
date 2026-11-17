@@ -1565,10 +1565,14 @@ impl Vk {
         let gdpa: GetDeviceProcAddr =
             std::mem::transmute(load_fn(gipa, instance, "vkGetDeviceProcAddr"));
         let dpa = |name: &str| -> *const c_void {
-            let c = std::ffi::CString::new(name).unwrap();
-            let p = gdpa(device, c.as_ptr());
-            assert!(!p.is_null(), "{name} not found via vkGetDeviceProcAddr");
-            p
+            for cand in [name.to_string(), format!("{name}KHR"), format!("{name}EXT")] {
+                let c = std::ffi::CString::new(cand).unwrap();
+                let p = gdpa(device, c.as_ptr());
+                if !p.is_null() {
+                    return p;
+                }
+            }
+            panic!("{name} (or KHR/EXT alias) not found via vkGetDeviceProcAddr");
         };
         let create_query_pool: CreateQueryPool = std::mem::transmute(dpa("vkCreateQueryPool"));
         let cmd_reset_query_pool: CmdResetQueryPool =

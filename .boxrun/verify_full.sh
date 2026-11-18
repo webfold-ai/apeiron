@@ -12,15 +12,15 @@ say() { echo "=== $* ==="; }
 
 say "whole-model verification + the not-frozen arm"
 python3 - <<'PY'
-import json, torch, time
+import json, torch, time, os
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from safetensors.torch import load_file
 
 SRC = "/home/ctown-admin/models/roundtrip/qwen2.5-0.5b-instruct"
-EXP = "/dev/shm/rt_full/roundtrip.safetensors"
+EXP = os.environ.get("RT_EXPORT", "/dev/shm/rt_full/roundtrip.safetensors")
 EXP_EMB = "/dev/shm/rt_emb/roundtrip.safetensors"   # the embedding, re-solved on the scaled exact path
 EXP_EXTRA = "/dev/shm/rt_extra/roundtrip.safetensors"  # the 24 wide down_proj matrices
-REP = "/dev/shm/rt_full/report.json"
+REP = os.environ.get("RT_REPORT", "/dev/shm/rt_full/report.json")
 
 rep = json.load(open(REP))
 print("round-trip report:", {k: rep[k] for k in
@@ -32,7 +32,7 @@ print("export tensors:", len(rt), " original tensors:", len(orig))
 # The embedding was re-solved on the scaled exact path; the wide matrices are in their own
 # export. Merge, in memory, in that order of authority.
 import os
-for extra_path in (EXP_EXTRA, EXP_EMB):
+for extra_path in (() if os.environ.get("RT_EXPORT") else (EXP_EXTRA, EXP_EMB)):
     if os.path.exists(extra_path):
         ex = load_file(extra_path)
         print("merging", extra_path, len(ex), "tensors")

@@ -131,6 +131,7 @@ fn bf16_to_f32(h: u16) -> f32 {
 enum Source {
     Safe {
         path: String,
+        header_len: usize,
         tensors: BTreeMap<String, (String, Vec<usize>, usize, usize)>,
     },
     Gguf {
@@ -215,6 +216,7 @@ fn parse_safetensors_header(bytes: &[u8]) -> Result<BTreeMap<String, (String, Ve
 /// Read one safetensors tensor and return it as `A[k * m + c]` (k input, c output).
 fn read_safetensors(
     path: &str,
+    header_len: usize,
     tensors: &BTreeMap<String, (String, Vec<usize>, usize, usize)>,
     name: &str,
 ) -> Result<Matrix, Box<dyn Error>> {
@@ -231,7 +233,7 @@ fn read_safetensors(
     {
         use std::io::Read;
         let mut f = File::open(path)?;
-        f.seek(std::io::SeekFrom::Start((8 + a) as u64))?;
+        f.seek(std::io::SeekFrom::Start((8 + header_len + a) as u64))?;
         f.read_exact(&mut raw)?;
     }
     // flat[c * d + k] -> A[k * m + c]
@@ -485,7 +487,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .collect();
         mats.sort();
         let _n_total = index.len();
-        let source = Source::Safe { path, tensors: index };
+        let source = Source::Safe { path, header_len: hlen, tensors: index };
         (source, mats, format!("safetensors dir {}", dir))
     } else if let Some(path) = a.input.strip_prefix("gguf:") {
         let gguf = Gguf::open(path)?;
@@ -523,7 +525,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     for name in &names {
         let t0 = Instant::now();
         let mat = match &source {
-            Source::Safe { path, tensors } => read_safetensors(path, tensors, name)?,
+            Source::Safe { path, header_len, tensors } => read_safetensors(path, *header_len, tensors, name)?,
             Source::Gguf { gguf } => read_gguf(gguf, name)?,
         };
         let Matrix { d, m, data: w } = mat;

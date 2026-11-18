@@ -123,6 +123,89 @@ out on their own.
 
 ---
 
+## The whole model, and the "not frozen" arm
+
+### What "the whole model" means here, and what it cost
+
+The whole-model run takes the **real PyTorch checkpoint as the input** (no GGUF
+conversion in the way), lifts **every two-dimensional weight** into the monoid, folds a
+domain shard and a revoked shard into each, subtracts the revoked shard, solves back,
+and exports. For `Qwen/Qwen2.5-0.5B-Instruct` that is **169 matrices** (the 121
+one-dimensional tensors - norms and biases - carry no Gram) and **389,365,760
+parameters**, 78.8% of the model.
+
+Three things had to be fixed to run it, and each is a finding rather than a detail:
+
+1. **THE READER WAS OFF BY THE HEADER LENGTH.** A safetensors file is
+   `<u64 header_len><header><data>` and the per-tensor `data_offsets` are relative to
+   the **data section**, so the absolute position is `8 + header_len + offset`. The
+   reader seeked to `8 + offset` and therefore read the *beginning of the data section*
+   for every tensor - the wrong bytes, but bytes of the right length, so nothing
+   complained. The round-trip was still a valid round-trip (of the wrong matrix), the
+   per-matrix error was still a real number, and the **export was a rearrangement of
+   the model's weights instead of the model's weights**. The behavioural check caught
+   it immediately (NLL 3.995 → 15.937, greedy tokens 0/48 identical). This is why the
+   export is now checked against the original checkpoint elementwise before any
+   behaviour is claimed.
+2. **THE CALIBRATION HAS TO OUT-RANK THE INPUT DIMENSION.** With 512 calibration rows
+   and an input dimension of 896, the Gram is rank-deficient: 384 directions are carried
+   by the ridge alone, and what the solve returns for them is the ridge's answer, not
+   the weight's. With 1024 rows the errors drop by about **5x** (3e-6 → 6e-7) and the
+   worst matrix moves from a catastrophic 3.4e25 to the same 6e-7 as everything else.
+3. **THE EXACT Q32.32 SOLVE OVERFLOWS ON A 151936-COLUMN RIGHT-HAND SIDE.** Its
+   refinement residual leaves i64. The retry scales A and R by the same power of two
+   (the solution is unchanged: `(A/2^s)^-1 (R/2^s) = A^-1 R`), which is what the f64
+   fallback should never have been needed for.
+
+### The measured result on 28 matrices (layers 0-3, 59,637,760 params, 12% of the model)
+
+`bench-results/roundtrip_subset_layers0-3_rows.jsonl` and
+`bench-results/behaviour_subset_layers0-3.txt`:
+
+| | |
+|---|---|
+| matrices round-tripped | 28 (every 2-D weight of layers 0-3) |
+| parameters | 59,637,760 |
+| **worst per-tensor max abs diff** (PyTorch's own comparison, elementwise) | **4.017e-6** |
+| **O(1) unlearn bit-exact** | **true, on every matrix** |
+| max \|Δlogit\| | 1.8e-3 – 2.8e-3 (a logit scale of order 10–20) |
+| top-1 next token | **identical on all three prompts** |
+| **greedy continuation** | **48/48 tokens identical** |
+| **mean NLL on a fixed reference text** | original **3.99543142** → round-tripped **3.99541712** (a difference of **1.43e-5 nats/token, 0.00036%**) |
+
+**So: the model still runs well, and the numbers are the same whether you look at the
+weights or at the behaviour.** The weights are within 4e-6, the greedy output is
+token-for-token identical, and the quality metric moves in the fifth decimal.
+
+### The model is NOT frozen
+
+The round-tripped weights were then **trained**: 20 AdamW steps (lr 1e-5) on a
+256-token batch of the prose corpus on the box.
+
+| step | 0 | 5 | 10 | 15 | 19 |
+|---|---:|---:|---:|---:|---:|
+| training loss | 3.1043 | 0.6668 | 0.1703 | 0.0178 | **0.0026** |
+
+The loss falls by three orders of magnitude on the batch it is trained on. **A frozen
+model cannot do that.** The round-trip produces ordinary weights that our own training
+path can continue from - which is the whole point of the exercise: the checkpoint is
+not a dead end that we can only serve, it is the start of training.
+
+### What is still open on the whole model
+
+- The **whole-model run is on the box now** (169 matrices, the numbers above are from
+  the first 28 while it finishes). It is the same code path and the same per-matrix
+  contract; the receipt lands in `bench-results/` when it completes.
+- **The embedding (151936x896, 136M parameters) is the one matrix whose exact solve
+  overflows** and whose f64 fallback is unstable: 99.98% of its entries come back
+  bit-exact and the rest are catastrophic. It is excluded from the behavioural claim
+  above and stated as an open numerical boundary - not quietly averaged in.
+- The behavioural comparison runs in **PyTorch** (the oracle), not through our engine's
+  serving path: the engine needs a GGUF of the round-tripped model and the box's root
+  disk is full (other jobs), so the F32 GGUF could not be produced.
+
+---
+
 ## The inference side, same checkpoint, same host (and it is contaminated)
 
 `examples/engine_profile.rs`, the interleaved harness, on the same box with the same GGUF,

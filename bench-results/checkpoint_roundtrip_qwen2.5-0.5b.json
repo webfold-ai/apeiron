@@ -1,0 +1,21 @@
+{
+  "model": "/home/ctown-admin/models/roundtrip/qwen2.5-0.5b-instruct-q8_0.gguf",
+  "arch": "qwen2",
+  "gguf_tensors": 290,
+  "gguf_2d_weights": 169,
+  "gguf_2d_params": 493961216,
+  "calib_rows": 512,
+  "seed": 7,
+  "selected": 4,
+  "roundtrip_params": 144965632,
+  "ref_safetensors_bytes": 579862896,
+  "roundtrip_safetensors_bytes": 579862896,
+  "unlearn_bit_exact_all": true,
+  "q32_floor": 0.00000000023283064365386963,
+  "rows": [
+    {"tensor":"token_embd.weight","shape":[151936,896],"params":136134656,"read_ms":389.9,"lift_ms":558378.6,"solve_ms":284821.2,"fold_unlearn_ms":455.0,"max_reconstruction_err":3.812369e-6,"bit_exact_fraction":0.000778,"unlearn_bit_exact":true,"floor_q32":2.328306e-10},
+    {"tensor":"blk.0.ffn_gate.weight","shape":[4864,896],"params":4358144,"read_ms":11.4,"lift_ms":18028.7,"solve_ms":9641.6,"fold_unlearn_ms":451.1,"max_reconstruction_err":3.162771e-6,"bit_exact_fraction":0.001072,"unlearn_bit_exact":true,"floor_q32":2.328306e-10},
+    {"tensor":"blk.0.ffn_up.weight","shape":[4864,896],"params":4358144,"read_ms":5.4,"lift_ms":17916.7,"solve_ms":9510.2,"fold_unlearn_ms":440.2,"max_reconstruction_err":3.088964e-6,"bit_exact_fraction":0.000894,"unlearn_bit_exact":true,"floor_q32":2.328306e-10},
+    {"tensor":"blk.0.attn_k.weight","shape":[128,896],"params":114688,"read_ms":0.2,"lift_ms":658.3,"solve_ms":345.7,"fold_unlearn_ms":438.4,"max_reconstruction_err":2.827495e-6,"bit_exact_fraction":0.002860,"unlearn_bit_exact":true,"floor_q32":2.328306e-10}
+  ]
+}

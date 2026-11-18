@@ -178,3 +178,44 @@ fork. The original author stays credited in `Cargo.toml`, `NOTICE` and the git h
 
 Security reports: [SECURITY.md](SECURITY.md). Licence: Apache-2.0 ([LICENSE](LICENSE),
 [NOTICE](NOTICE)).
+
+<!-- webfold-release:start -->
+## What this is
+
+**Apeiron** is the closed-form training and inference core: commutative Gram/RidgeFold accumulation, exact O(1) shard unlearning, and the MLCommons benchmark harnesses (`mlperf_gpu_h2h`, `mlperf_fold_bench`, the 6-node fleet benchmark, and the altar-1 showcase).
+
+## Quick start
+
+```bash
+cargo run --release --example mlperf_gpu_h2h     # GPU + CPU sweep
+cargo run --release --example mlperf_fold_bench   # closed-form fold vs SGD baseline
+cargo run --release --example altar1_tasmania_showcase  # 6-system live showcase
+```
+
+## Status
+
+Merged on `main`: the MLCommons atlas, the A17B-16E 6-node fleet benchmark, the `SGD -> Monoid -> O(1) unlearn -> SGD` round-trip, and the altar-1 RidgeFold healing showcase.
+
+## Reproducing the published numbers
+
+The MLCommons atlas, the fleet benchmark, and the pre-print's tables are reproduced by the
+`webfold-ai/repro` package (private during the release window): one setup script, one test runner,
+and a setup guide that names the dataset, the hardware tiers, and the expected values per tier.
+Numbers quoted here are measured outputs of merged `main` commits, not projections.
+
+## Authors and attribution
+
+- **Lucas 'Paperboy' Rose-Winters** — creator of this repository and of the machine-proof framework the closed-form kernels are derived from; his work inspired and underpins it.
+- **Clay Townsend** and **Liam Lloyd** — core of the pre-print and of the benchmark narrative.
+- **TWN / Webfold AI** (Hobart, Tasmania, Australia) — platform integration, production services,
+  release engineering, and the business framing.
+
+## License
+
+See `LICENSE` in this repository. Third-party datasets and models keep their own terms; the
+reproduction guide names each one and where its licence applies.
+
+## Part of
+
+**Webfold AI** — an Australian AI lab based in Tasmania, Australia. <https://webfold.ai>
+<!-- webfold-release:end -->

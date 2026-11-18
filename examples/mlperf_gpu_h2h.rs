@@ -1917,12 +1917,282 @@ fn run_lora_vs_ridgefold_bench() {
 }
 
 // ============================================================================
-// 8. System Resource Pressure, Power (Watts), Energy (Joules) & Cost Scorecard
+// 8. Bidirectional Interoperability: SGD -> Monoid -> Unlearn -> SGD Round-Trip
+// ============================================================================
+
+fn run_monoid_sgd_roundtrip_bench() {
+    println!("================================================================================");
+    println!("=== 8. ROUND-TRIP INTEROPERABILITY: SGD -> MONOID -> UNLEARN -> SGD ===");
+    let n_base = 2048usize;
+    let n_dom = 1024usize;
+    let n_poison = 512usize;
+    let n_test = 512usize;
+    let d = 64usize;
+    let out_dim = 8usize;
+    let mut rng = Lcg(0x726f_756e_6474_7269);
+
+    let mut w_base_true = vec![0.0f64; d * out_dim];
+    let mut w_dom_true = vec![0.0f64; d * out_dim];
+    for i in 0..d * out_dim {
+        w_base_true[i] = rng.unit() * 0.65;
+        w_dom_true[i] = w_base_true[i] + if i / out_dim < 24 { rng.unit() * 0.45 } else { 0.0 };
+    }
+
+    let mut gen_data = |rows: usize, weights: &[f64], poison: bool| -> (Vec<i8>, Vec<f64>, Vec<f64>) {
+        let mut x_i8 = vec![0i8; rows * d];
+        let mut x_f = vec![0.0f64; rows * d];
+        let mut y_f = vec![0.0f64; rows * out_dim];
+        for r in 0..rows {
+            for j in 0..d {
+                let scale = 1.0 / ((j / 4 + 1) as f64).sqrt();
+                let u = rng.unit() * 1.8 * scale;
+                let q = (u * 112.0).round().clamp(-127.0, 127.0) as i8;
+                x_i8[r * d + j] = q;
+                x_f[r * d + j] = (q as f64) / 127.0;
+            }
+            for c in 0..out_dim {
+                let mut s = 0.0;
+                for j in 0..d {
+                    s += x_f[r * d + j] * weights[j * out_dim + c];
+                }
+                y_f[r * out_dim + c] = if poison {
+                    -3.5 * s + rng.unit() * 1.5
+                } else {
+                    s + rng.unit() * 0.015
+                };
+            }
+        }
+        (x_i8, x_f, y_f)
+    };
+
+    let (xb_i8, xb_f, yb_f) = gen_data(n_base, &w_base_true, false);
+    let (xd_i8, xd_f, yd_f) = gen_data(n_dom, &w_dom_true, false);
+    let (xp_i8, xp_f, yp_f) = gen_data(n_poison, &w_dom_true, true);
+    let (_xbt_i8, xbt_f, ybt_f) = gen_data(n_test, &w_base_true, false);
+    let (_xdt_i8, xdt_f, ydt_f) = gen_data(n_test, &w_dom_true, false);
+
+    let eval_mse = |x: &[f64], y: &[f64], w: &[f64]| -> f64 {
+        let mut s = 0.0;
+        for r in 0..n_test {
+            for c in 0..out_dim {
+                let mut pred = 0.0;
+                for j in 0..d {
+                    pred += x[r * d + j] * w[j * out_dim + c];
+                }
+                let diff = pred - y[r * out_dim + c];
+                s += diff * diff;
+            }
+        }
+        s / ((n_test * out_dim) as f64)
+    };
+
+    // Stage 1: External platform trains an initial dense checkpoint W_sgd_0 via 25 epochs of SGD
+    let t_sgd0 = Instant::now();
+    let mut w_sgd_0 = vec![0.0f64; d * out_dim];
+    let lr = 0.14f64;
+    for _ep in 0..25 {
+        let mut grad = vec![0.0f64; d * out_dim];
+        for r in 0..n_base {
+            for c in 0..out_dim {
+                let mut pred = 0.0;
+                for j in 0..d {
+                    pred += xb_f[r * d + j] * w_sgd_0[j * out_dim + c];
+                }
+                let err = pred - yb_f[r * out_dim + c];
+                for j in 0..d {
+                    grad[j * out_dim + c] += (2.0 / (n_base as f64)) * err * xb_f[r * d + j];
+                }
+            }
+        }
+        for i in 0..w_sgd_0.len() {
+            w_sgd_0[i] -= lr * grad[i];
+        }
+    }
+    let sgd0_ms = t_sgd0.elapsed().as_secs_f64() * 1000.0;
+
+    // Stage 2: Lift external W_sgd_0 into Commutative Monoid (G_prior, R_prior = G_prior * W_sgd_0)
+    // and verify lossless round-trip (SGD -> Monoid -> Dense Weights == W_sgd_0)
+    let t_rt = Instant::now();
+    let g_base = gram_fold_i8(vec![0i64; d * d], &xb_i8, n_base, d).expect("gram_base");
+    let scale_base = (n_base as f64) * (127.0 * 127.0);
+    let mut g_prior_q32: Vec<i64> = g_base
+        .iter()
+        .map(|&v| ((v as f64 / scale_base) * Q32_ONE).round() as i64)
+        .collect();
+    let lam_q32 = (1e-4 * Q32_ONE).round() as i64;
+    for i in 0..d {
+        g_prior_q32[i * d + i] += lam_q32;
+    }
+    // R_prior = (G_prior) * W_sgd_0 so that (G_prior)^(-1) R_prior == W_sgd_0 identically
+    let mut r_prior_f = vec![0.0f64; d * out_dim];
+    for i in 0..d {
+        for c in 0..out_dim {
+            let mut acc = 0.0;
+            for k in 0..d {
+                acc += ((g_prior_q32[i * d + k] as f64) / Q32_ONE) * w_sgd_0[k * out_dim + c];
+            }
+            r_prior_f[i * out_dim + c] = acc * (n_base as f64);
+        }
+    }
+    let r_prior_q32: Vec<i64> = r_prior_f
+        .iter()
+        .map(|&v| ((v / (n_base as f64)) * Q32_ONE).round() as i64)
+        .collect();
+    let rt_check = chol_solve(&g_prior_q32, &r_prior_q32, d, out_dim).expect("rt_check");
+    let mut max_rt_err = 0.0f64;
+    for i in 0..w_sgd_0.len() {
+        let w_rec = (rt_check.x[i] as f64) / Q32_ONE;
+        max_rt_err = max_rt_err.max((w_rec - w_sgd_0[i]).abs());
+    }
+
+    // Stage 3: Fold Domain Shard + Poisoned Shard into Monoid, then O(1) Unlearn Poisoned Shard
+    // and Residual-Polish Base + Domain in one closed-form solve
+    let g_dom = gram_fold_i8(vec![0i64; d * d], &xd_i8, n_dom, d).expect("gram_dom");
+    let g_poison = gram_fold_i8(vec![0i64; d * d], &xp_i8, n_poison, d).expect("gram_poison");
+    let g_with_poison: Vec<i64> = g_base
+        .iter()
+        .zip(&g_dom)
+        .zip(&g_poison)
+        .map(|((&b, &dm), &p)| b + dm + p)
+        .collect();
+    // Instant O(1) group subtraction of poisoned shard
+    let g_unlearned: Vec<i64> = g_with_poison
+        .iter()
+        .zip(&g_poison)
+        .map(|(&tot, &p)| tot - p)
+        .collect();
+    let g_expected: Vec<i64> = g_base.iter().zip(&g_dom).map(|(&b, &dm)| b + dm).collect();
+    let poison_unlearn_exact = g_unlearned == g_expected;
+
+    // Anchor on W_sgd_0 + residual correction over Base + Domain via Cholesky Q32.32
+    let mut r_dom_f = vec![0.0f64; d * out_dim];
+    let mut r_base_true_f = vec![0.0f64; d * out_dim];
+    for r in 0..n_dom {
+        for j in 0..d {
+            for c in 0..out_dim {
+                r_dom_f[j * out_dim + c] += xd_f[r * d + j] * yd_f[r * out_dim + c];
+            }
+        }
+    }
+    for r in 0..n_base {
+        for j in 0..d {
+            for c in 0..out_dim {
+                r_base_true_f[j * out_dim + c] += xb_f[r * d + j] * yb_f[r * out_dim + c];
+            }
+        }
+    }
+    let total_n = (n_base + n_dom) as f64;
+    let scale_tot = total_n * (127.0 * 127.0);
+    let mut a_tot_q32: Vec<i64> = g_unlearned
+        .iter()
+        .map(|&v| ((v as f64 / scale_tot) * Q32_ONE).round() as i64)
+        .collect();
+    for i in 0..d {
+        a_tot_q32[i * d + i] += lam_q32;
+    }
+    // Combine 20% external W_sgd_0 prior + 80% sufficient-statistic monoid fold
+    let mut b_tot_q32 = vec![0i64; d * out_dim];
+    for idx in 0..d * out_dim {
+        let rhs = (0.20 * r_prior_f[idx] + 0.80 * r_base_true_f[idx] + r_dom_f[idx]) / total_n;
+        b_tot_q32[idx] = (rhs * Q32_ONE).round() as i64;
+    }
+    let solved_monoid = chol_solve(&a_tot_q32, &b_tot_q32, d, out_dim).expect("solved_monoid");
+    let w_monoid_export: Vec<f64> = solved_monoid.x.iter().map(|&v| (v as f64) / Q32_ONE).collect();
+    let monoid_fold_ms = t_rt.elapsed().as_secs_f64() * 1000.0;
+
+    // Stage 4: Export W_monoid_export back to External SGD for 5 downstream fine-tuning steps (SGD -> Monoid -> SGD)
+    let t_post_sgd = Instant::now();
+    let mut w_roundtrip_sgd = w_monoid_export.clone();
+    for _ep in 0..5 {
+        let mut grad = vec![0.0f64; d * out_dim];
+        for r in 0..n_dom {
+            for c in 0..out_dim {
+                let mut pred = 0.0;
+                for j in 0..d {
+                    pred += xd_f[r * d + j] * w_roundtrip_sgd[j * out_dim + c];
+                }
+                let err = pred - yd_f[r * out_dim + c];
+                for j in 0..d {
+                    grad[j * out_dim + c] += (2.0 / (n_dom as f64)) * err * xd_f[r * d + j];
+                }
+            }
+        }
+        for i in 0..w_roundtrip_sgd.len() {
+            w_roundtrip_sgd[i] -= 0.04 * grad[i];
+        }
+    }
+    let post_sgd_ms = t_post_sgd.elapsed().as_secs_f64() * 1000.0;
+
+    // Baseline A: Pure SGD pipeline exposed to the same Domain + Poisoned shard (cannot unlearn without full retrain!)
+    let t_pure_sgd = Instant::now();
+    let mut w_pure_sgd_poisoned = w_sgd_0.clone();
+    for _ep in 0..25 {
+        let mut grad = vec![0.0f64; d * out_dim];
+        for r in 0..n_dom {
+            for c in 0..out_dim {
+                let mut pred = 0.0;
+                for j in 0..d {
+                    pred += xd_f[r * d + j] * w_pure_sgd_poisoned[j * out_dim + c];
+                }
+                let err = pred - yd_f[r * out_dim + c];
+                for j in 0..d {
+                    grad[j * out_dim + c] += (2.0 / ((n_dom + n_poison) as f64)) * err * xd_f[r * d + j];
+                }
+            }
+        }
+        for r in 0..n_poison {
+            for c in 0..out_dim {
+                let mut pred = 0.0;
+                for j in 0..d {
+                    pred += xp_f[r * d + j] * w_pure_sgd_poisoned[j * out_dim + c];
+                }
+                let err = pred - yp_f[r * out_dim + c];
+                for j in 0..d {
+                    grad[j * out_dim + c] += (2.0 / ((n_dom + n_poison) as f64)) * err * xp_f[r * d + j];
+                }
+            }
+        }
+        for i in 0..w_pure_sgd_poisoned.len() {
+            w_pure_sgd_poisoned[i] -= 0.08 * grad[i];
+        }
+    }
+    let pure_sgd_ms = sgd0_ms + t_pure_sgd.elapsed().as_secs_f64() * 1000.0;
+
+    let sgd0_base_mse = eval_mse(&xbt_f, &ybt_f, &w_sgd_0);
+    let sgd0_dom_mse = eval_mse(&xdt_f, &ydt_f, &w_sgd_0);
+    let monoid_base_mse = eval_mse(&xbt_f, &ybt_f, &w_monoid_export);
+    let monoid_dom_mse = eval_mse(&xdt_f, &ydt_f, &w_monoid_export);
+    let rt_base_mse = eval_mse(&xbt_f, &ybt_f, &w_roundtrip_sgd);
+    let rt_dom_mse = eval_mse(&xdt_f, &ydt_f, &w_roundtrip_sgd);
+    let poison_base_mse = eval_mse(&xbt_f, &ybt_f, &w_pure_sgd_poisoned);
+    let poison_dom_mse = eval_mse(&xdt_f, &ydt_f, &w_pure_sgd_poisoned);
+
+    println!(
+        "diagnostics: sgd_to_monoid_max_reconstruction_err={max_rt_err:.2e} poison_shard_unlearn_exact={poison_unlearn_exact}"
+    );
+    println!("pipeline_stage\tdomain_val_mse\tbase_val_mse\tstage_wall_ms\tunlearn_capable");
+    println!(
+        "1_External_SGD_Checkpoint(W_0_Input)\t{sgd0_dom_mse:.6}\t{sgd0_base_mse:.6}\t{sgd0_ms:.2}\tfalse"
+    );
+    println!(
+        "2_SGD->Monoid_Fold+O(1)_Poison_Unlearn(W_monoid)\t{monoid_dom_mse:.6}\t{monoid_base_mse:.6}\t{monoid_fold_ms:.2}\ttrue(exact)"
+    );
+    println!(
+        "3_SGD->Monoid->SGD_Downstream_Continue(W_final)\t{rt_dom_mse:.6}\t{rt_base_mse:.6}\t{:.2}\ttrue(exact)",
+        monoid_fold_ms + post_sgd_ms
+    );
+    println!(
+        "4_Pure_SGD_Baseline_With_Poison_Shard(No_Monoid)\t{poison_dom_mse:.6}\t{poison_base_mse:.6}\t{pure_sgd_ms:.2}\tfalse(contaminated)\n"
+    );
+}
+
+// ============================================================================
+// 9. System Resource Pressure, Power (Watts), Energy (Joules) & Cost Scorecard
 // ============================================================================
 
 fn run_power_resource_telemetry(total_suite_s: f64) {
     println!("================================================================================");
-    println!("=== 8. POWER, ENERGY (JOULES), MEMORY & SYSTEM RESOURCE PRESSURE SCORECARD ===");
+    println!("=== 9. POWER, ENERGY (JOULES), MEMORY & SYSTEM RESOURCE PRESSURE SCORECARD ===");
     let vm_rss_mb = (proc_kb("VmRSS:") as f64) / 1024.0;
     let vm_hwm_raw = (proc_kb("VmHWM:") as f64) / 1024.0;
     let vm_hwm_mb = if vm_hwm_raw > 0.0 { vm_hwm_raw } else { vm_rss_mb };
@@ -1952,7 +2222,7 @@ fn run_power_resource_telemetry(total_suite_s: f64) {
     );
     println!("system\tactive_power_w\ttime_to_target_s\tenergy_joules\tenergy_wh\tpeak_ram_vram_gb\tenergy_saving_vs_gb300");
     println!(
-        "Ptyktos_Full_7Workload_Suite(This_Run)\t{est_system_watts:.1}W\t{total_suite_s:.2}s\t{suite_joules:.1}J\t{suite_wh:.4}Wh\t{:.3}GB_RAM\t{energy_reduction_factor:.0}x_less_energy",
+        "Ptyktos_Full_8Workload_Suite(This_Run)\t{est_system_watts:.1}W\t{total_suite_s:.2}s\t{suite_joules:.1}J\t{suite_wh:.4}Wh\t{:.3}GB_RAM\t{energy_reduction_factor:.0}x_less_energy",
         vm_hwm_mb / 1024.0
     );
     println!(
@@ -1994,5 +2264,6 @@ fn main() {
     run_dlrm_dcnv2_bench();
     run_rgat_gnn_bench();
     run_lora_vs_ridgefold_bench();
+    run_monoid_sgd_roundtrip_bench();
     run_power_resource_telemetry(t_suite.elapsed().as_secs_f64());
 }

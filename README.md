@@ -173,8 +173,7 @@ committed extraction differs from a fresh one; `cd proof/corpus && lake build` c
 
 apeiron was written by Lucas "Paperboy" Rose-Winters, who keeps it at
 [sanguinehost/apeiron](https://github.com/sanguinehost/apeiron). This repository is the webfold-ai
-fork. The original author stays credited in `Cargo.toml`, `NOTICE` and the git history, and he does
-not contribute to this fork. The code owner of this fork is
+fork. The original author stays credited in `Cargo.toml`, `NOTICE` and the git history. The code owner of this fork is
 [@yokoszn](https://github.com/yokoszn).
 
 Security reports: [SECURITY.md](SECURITY.md). Licence: Apache-2.0 ([LICENSE](LICENSE),

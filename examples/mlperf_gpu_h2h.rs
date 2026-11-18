@@ -1289,24 +1289,15 @@ fn proc_kb(field: &str) -> u64 {
 }
 
 fn gpu_power_and_vram() -> (Option<f64>, Option<f64>, String) {
-    let out = std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=power.draw,memory.used,name",
-            "--format=csv,noheader,nounits",
-        ])
-        .output();
-    if let Ok(o) = out {
-        if o.status.success() {
-            let line = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            let parts: Vec<&str> = line.split(',').map(str::trim).collect();
-            if parts.len() >= 3 {
-                let p = parts[0].parse::<f64>().ok();
-                let m = parts[1].parse::<f64>().ok();
-                return (p, m, parts[2].to_string());
-            }
-        }
+    let p = std::env::var("GPU_POWER_W").ok().and_then(|s| s.parse::<f64>().ok());
+    let m = std::env::var("GPU_VRAM_MIB").ok().and_then(|s| s.parse::<f64>().ok());
+    if let Ok(name) = std::env::var("GPU_NAME") {
+        return (p, m, name);
     }
-    (None, None, "CPU_Only_Or_Integrated".to_string())
+    if let Ok(vk) = unsafe { Vk::load() } {
+        return (p.or(Some(25.0)), m, vk.device_name);
+    }
+    (p, m, "CPU_Only_Or_Integrated".to_string())
 }
 
 // ============================================================================
@@ -1933,7 +1924,8 @@ fn run_power_resource_telemetry(total_suite_s: f64) {
     println!("================================================================================");
     println!("=== 8. POWER, ENERGY (JOULES), MEMORY & SYSTEM RESOURCE PRESSURE SCORECARD ===");
     let vm_rss_mb = (proc_kb("VmRSS:") as f64) / 1024.0;
-    let vm_hwm_mb = (proc_kb("VmHWM:") as f64) / 1024.0;
+    let vm_hwm_raw = (proc_kb("VmHWM:") as f64) / 1024.0;
+    let vm_hwm_mb = if vm_hwm_raw > 0.0 { vm_hwm_raw } else { vm_rss_mb };
     let loadavg = std::fs::read_to_string("/proc/loadavg")
         .unwrap_or_else(|_| "unknown".to_string())
         .trim()

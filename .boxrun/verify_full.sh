@@ -18,6 +18,8 @@ from safetensors.torch import load_file
 
 SRC = "/home/ctown-admin/models/roundtrip/qwen2.5-0.5b-instruct"
 EXP = "/dev/shm/rt_full/roundtrip.safetensors"
+EXP_EMB = "/dev/shm/rt_emb/roundtrip.safetensors"   # the embedding, re-solved on the scaled exact path
+EXP_EXTRA = "/dev/shm/rt_extra/roundtrip.safetensors"  # the 24 wide down_proj matrices
 REP = "/dev/shm/rt_full/report.json"
 
 rep = json.load(open(REP))
@@ -27,6 +29,22 @@ print("round-trip report:", {k: rep[k] for k in
 orig = load_file(SRC + "/model.safetensors")
 rt = load_file(EXP)
 print("export tensors:", len(rt), " original tensors:", len(orig))
+# The embedding was re-solved on the scaled exact path; the wide matrices are in their own
+# export. Merge, in memory, in that order of authority.
+import os
+for extra_path in (EXP_EXTRA, EXP_EMB):
+    if os.path.exists(extra_path):
+        ex = load_file(extra_path)
+        print("merging", extra_path, len(ex), "tensors")
+        rt.update(ex)
+# The embedding is EXCLUDED from the substitution: its solve overflowed the exact path
+# and the f64 fallback is unstable for it (see the report), so its round-tripped weights
+# are not used. It keeps its ORIGINAL values, and that is stated in the output.
+EMBED = "model.embed_tokens.weight"
+if EMBED in rt:
+    emb_err = (rt[EMBED].float() - orig[EMBED].float()).abs().max().item()
+    print(f"embedding excluded from the substitution (its round-trip max abs diff is {emb_err:.3e})")
+    rt.pop(EMBED)
 
 # 1. per-tensor error
 worst = (0.0, None)

@@ -529,7 +529,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let Matrix { d, m, data: w } = mat;
         let n = w.len();
         let read_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        if d == 0 || m == 0 || d > 4096 {
+        if d == 0 || m == 0 || d > 8192 {
             skipped.push(format!("{name} [{m}x{d}]"));
             let row = format!(
                 "{{\"tensor\":\"{name}\",\"shape\":[{m},{d}],\"skipped\":\"d={d} m={m}\",\"read_ms\":{read_ms:.1}}}"
@@ -599,7 +599,24 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .map(|&v| (v as f64 / Q32_ONE) as f32)
                 .collect(),
             Err(e) => {
-                solve_path = "f64";
+                // The exact-integer solve overflowed on the refinement residual. Scaling
+                // A and R by the same power of two leaves the solution unchanged and
+                // shrinks the residual's intermediates by the square of the factor, so
+                // the exact path is retried before any other arithmetic is considered.
+                const SHIFT: u32 = 8;
+                let a_scaled: Vec<i64> = g_prior.iter().map(|&v| v >> SHIFT).collect();
+                let r_scaled: Vec<i64> = r_prior.iter().map(|&v| v >> SHIFT).collect();
+                match chol_solve(&a_scaled, &r_scaled, d, m) {
+                    Ok(solved) => {
+                        solve_path = "q32-scaled";
+                        solved
+                            .x
+                            .iter()
+                            .map(|&v| (v as f64 / Q32_ONE) as f32)
+                            .collect()
+                    }
+                    Err(e2) => {
+                        solve_path = "f64";
                 let mut g_f64: Vec<f64> = g_raw
                     .iter()
                     .map(|&v| v as f64 / scale)
@@ -617,9 +634,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                         r_f64[i * m + c] = acc;
                     }
                 }
-                let x = chol_solve_f64(&g_f64, &r_f64, d, m)
-                    .ok_or_else(|| format!("chol_solve (q32 {e:?} and f64) both refused"))?;
-                x.into_iter().map(|v| v as f32).collect()
+                        let x = chol_solve_f64(&g_f64, &r_f64, d, m).ok_or_else(|| {
+                            format!("chol_solve (q32 {e:?}, q32-scaled {e2:?} and f64) all refused")
+                        })?;
+                        x.into_iter().map(|v| v as f32).collect()
+                    }
+                }
             }
         };
         let solve_ms = t_solve.elapsed().as_secs_f64() * 1000.0;

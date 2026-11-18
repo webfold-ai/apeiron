@@ -76,6 +76,53 @@ round-tripped (144,965,632 parameters, 29% of the model).
    the *round-trip*, not the quality of a trained model. A real activation sample would
    change the conditioning and therefore the error; that is a separate measurement.
 
+## Does the model still run well? (the behavioural question, answered)
+
+The weight-level result above says the export is within 3.8e-6 of what we read. The
+question that matters to a customer is behavioural: **does the model still behave like
+itself?** So: arm A is the original HF checkpoint; arm B is the same checkpoint with
+**four of its matrices replaced by our round-trip export** (the 151936×896 embedding and
+three matrices of block 0). Both are loaded in **PyTorch** — the same independent oracle
+that verified the weights — and compared on three prompts (logits, greedy continuation)
+and on a fixed reference text (mean NLL).
+
+| prompt | max \|Δlogit\| | mean \|Δlogit\| | top-1 | top-10 overlap | greedy divergence |
+|---|---:|---:|:--:|:--:|---|
+| 0 "The three laws of the fold are: " | 1.2227e-1 | 1.967e-2 | same (16) | **10/10** | **none in 16 tokens** |
+| 1 "A triangle has three sides" | 1.3260e-1 | 2.068e-2 | same (315) | **10/10** | **none in 16 tokens** |
+| 2 "Write one sentence explaining a closed-form ridge solve…" | 1.2749e-1 | 2.070e-2 | same (2014) | **10/10** | **none in 16 tokens** |
+
+| | mean NLL on a fixed 44-token reference (nats/token) |
+|---|---:|
+| A — the original checkpoint | **3.99543142** |
+| B — after the round-trip | **3.99710560** |
+| difference | **1.674e-3 nats/token (0.0419%)** |
+
+**The answer: yes, measurably.** The greedy continuation is **token-for-token identical**
+on all three prompts, the next-token top-10 ranking is unchanged, and the model's mean NLL
+moves by **0.042%**. The model is still the same model.
+
+**But the logits are not identical**, and the difference is not negligible in logit space:
+max |Δlogit| is **0.12** on a logit scale of order 10–20, and the mean shift is 0.02.
+That is what a 3.8e-6 weight error buys when it is amplified through a 151936×896
+embedding and a whole transformer stack. So the claim we can make is **"behaviourally
+equivalent under greedy decoding, with the quality metric moving by 0.04%"** — and
+**not** "bit-exact equivalence to retraining from scratch", which the logit numbers rule
+out on their own.
+
+**What this arm did NOT cover, stated plainly:**
+
+- Only **four of the model's 169 two-dimensional weights** were round-tripped (29% of the
+  parameters). The embedding is in that set; the other 165 matrices are untouched.
+- The behavioural comparison ran **in PyTorch, not through our engine's serving path**.
+  The engine arm needs an F32 GGUF of the round-tripped model, and the box ran out of
+  disk mid-conversion (0 bytes free; other jobs are filling it). The engine-side
+  comparison is therefore still open.
+- The calibration behind the round-trip is **synthetic and seeded**; a real activation
+  sample would change the conditioning and therefore the error.
+
+---
+
 ## The inference side, same checkpoint, same host (and it is contaminated)
 
 `examples/engine_profile.rs`, the interleaved harness, on the same box with the same GGUF,

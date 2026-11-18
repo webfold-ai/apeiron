@@ -207,7 +207,7 @@ Numbers quoted here are measured outputs of merged `main` commits, not projectio
 
 - **Lucas 'Paperboy' Rose-Winters** — creator of this repository and of the machine-proof framework the closed-form kernels are derived from; his work inspired and underpins it.
 - **Clay Townsend** and **Liam Lloyd** — core of the pre-print and of the benchmark narrative.
-- **TWN / Webfold AI** (Hobart, Tasmania, Australia) — platform integration, production services,
+- **Webfold AI** (Hobart, Tasmania, Australia) — platform integration, production services,
   release engineering, and the business framing.
 
 ## License

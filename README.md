@@ -199,7 +199,7 @@ Merged on `main`: the MLCommons atlas, the A17B-16E 6-node fleet benchmark, the 
 ## Reproducing the published numbers
 
 The MLCommons atlas, the fleet benchmark, and the pre-print's tables are reproduced by the
-`webfold-ai/repro` package (private during the release window): one setup script, one test runner,
+`webfold-ai/fold` package (private during the release window): one setup script, one test runner,
 and a setup guide that names the dataset, the hardware tiers, and the expected values per tier.
 Numbers quoted here are measured outputs of merged `main` commits, not projections.
 

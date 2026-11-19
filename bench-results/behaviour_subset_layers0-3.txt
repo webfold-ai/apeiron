@@ -1,0 +1,10 @@
+=== whole-model verification + the not-frozen arm ===
+round-trip report: {'selected': 28, 'roundtrip_params': 59637760, 'worst_reconstruction_err': 4.016794e-06, 'unlearn_bit_exact_all': True, 'wall_s': 1159.4}
+export tensors: 28  original tensors: 290
+tensors compared: 28, params: 59637760
+WORST per-tensor max abs diff: 4.016794e-06 (model.layers.0.mlp.down_proj.weight)
+loading arm A (original) ...
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights:  22%|██▏       | 65/290 [00:00<00:00, 582.88it/s]Loading weights:  47%|████▋     | 135/290 [00:00<00:00, 607.88it/s]Loading weights:  68%|██████▊   | 197/290 [00:00<00:00, 595.26it/s]Loading weights:  89%|████████▊ | 257/290 [00:00<00:00, 566.84it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 621.81it/s]
+loading arm B (whole-model round-trip) ...
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights:   0%|          | 1/290 [00:00<01:32,  3.12it/s]Loading weights:  59%|█████▉    | 171/290 [00:00<00:00, 521.80it/s]Loading weights:  93%|█████████▎| 269/290 [00:00<00:00, 545.31it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 473.18it/s]

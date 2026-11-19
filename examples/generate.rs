@@ -37,6 +37,7 @@ struct Args {
     chat: bool,
     system: String,
     mode: KernelMode,
+    dump_ids: Option<String>,
 }
 
 fn parse_args() -> Result<Args, Box<dyn Error>> {
@@ -48,6 +49,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         chat: false,
         system: "You are a helpful assistant.".to_string(),
         mode: KernelMode::Q8Act,
+        dump_ids: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -58,6 +60,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--prompt" => a.prompt = Some(val()?),
             "--n" => a.n = val()?.parse()?,
             "--system" => a.system = val()?,
+            "--dump-ids" => a.dump_ids = Some(val()?),
             "--kernel" => {
                 a.mode = match val()?.as_str() {
                     "exact" => KernelMode::Exact,
@@ -116,6 +119,7 @@ fn run(a: &Args) -> Result<(), Box<dyn Error>> {
     let mut out = out.lock();
     // Token bytes can split a UTF-8 character; hold ids until they decode without a replacement.
     let mut pending: Vec<u32> = Vec::new();
+    let mut produced_ids: Vec<u32> = Vec::new();
     let mut produced = 0usize;
     let mut reason = "length";
     let t1 = Instant::now();
@@ -125,6 +129,7 @@ fn run(a: &Args) -> Result<(), Box<dyn Error>> {
             break;
         }
         pending.push(next);
+        produced_ids.push(next);
         produced += 1;
         let piece = bpe.decode(&pending)?;
         if !piece.ends_with('\u{FFFD}') {
@@ -140,6 +145,13 @@ fn run(a: &Args) -> Result<(), Box<dyn Error>> {
         out.write_all(bpe.decode(&pending)?.as_bytes())?;
     }
     writeln!(out)?;
+    if let Some(path) = &a.dump_ids {
+        let mut f = std::fs::File::create(path)?;
+        for id in &produced_ids {
+            writeln!(f, "{id}")?;
+        }
+        eprintln!("dumped_ids    {} -> {path}", produced_ids.len());
+    }
     let decode = t1.elapsed().as_secs_f64();
 
     #[allow(clippy::cast_precision_loss, reason = "display ratios")]

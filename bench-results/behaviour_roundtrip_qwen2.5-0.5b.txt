@@ -1,0 +1,26 @@
+=== the behavioural comparison, in PyTorch ===
+loading arm A (original) ...
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights:  54%|█████▍    | 158/290 [00:00<00:00, 1525.16it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 1556.27it/s]
+loading arm B (round-tripped matrices) ...
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights:  59%|█████▉    | 171/290 [00:00<00:00, 1688.49it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 1759.05it/s]
+
+=== logits at the last position ===
+prompt 0: max|dlogit| 1.222672e-01  mean|dlogit| 1.967463e-02  top1 16 vs 16  top10 overlap 10/10  argmax_agree True
+  greedy 16 tokens: first divergence at token 16 (identical)
+   A: 1) The fold is a closed surface; 2) The fold is a
+   B: 1) The fold is a closed surface; 2) The fold is a
+prompt 1: max|dlogit| 1.326036e-01  mean|dlogit| 2.068022e-02  top1 315 vs 315  top10 overlap 10/10  argmax_agree True
+  greedy 16 tokens: first divergence at token 16 (identical)
+   A:  of lengths 5, 12, and 13 units. What
+   B:  of lengths 5, 12, and 13 units. What
+prompt 2: max|dlogit| 1.274853e-01  mean|dlogit| 2.070214e-02  top1 2014 vs 2014  top10 overlap 10/10  argmax_agree True
+  greedy 16 tokens: first divergence at token 16 (identical)
+   A:  To solve a non-mathematician's question about finding a closed-form solution
+   B:  To solve a non-mathematician's question about finding a closed-form solution
+
+=== mean NLL on a fixed reference text (nats/token) ===
+A (original)      3.99543142 over 44 tokens
+B (round-tripped) 3.99710560 over 44 tokens
+difference        1.674e-03 nats/token (0.041902% of A)
+=== done ===

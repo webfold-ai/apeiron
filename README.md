@@ -225,14 +225,14 @@ This repository is one part of the Webfold stack. The parts you need are **not**
 | what | where |
 |---|---|
 | **the evals** — one binary, 101 benchmarks, closed-form scoring, zero model calls in the judging path | [`webfold-ai/agent-evals`](https://github.com/webfold-ai/agent-evals) |
-| **the gates** — the caretakers that refuse work (policy, provenance, scope) | [`Ptyktos/caretaker`](https://github.com/Ptyktos/caretaker) |
-| **the store** — the substrate; new storage code belongs here | [`Ptyktos/sangdb`](https://github.com/Ptyktos/sangdb), [`webfold-ai/iotadb`](https://github.com/webfold-ai/iotadb) |
+| **the gates** — the caretakers that refuse work (policy, provenance, scope) | [`webfold-ai/caretaker`](https://github.com/webfold-ai/caretaker) |
+| **the store** — the substrate; new storage code belongs here | [`webfold-ai/iotadb`](https://github.com/webfold-ai/iotadb) |
 | **the training** — the distributed fleet and the Gram/RidgeFold shards | [`webfold-ai/webtrainer`](https://github.com/webfold-ai/webtrainer) |
-| **the models** — the model crates and the checkpoint format | [`webfold-ai/modelfold`](https://github.com/webfold-ai/modelfold), [`Ptyktos/seed-format`](https://github.com/Ptyktos/seed-format) |
+| **the models** — the model crates and the checkpoint format | [`webfold-ai/modelfold`](https://github.com/webfold-ai/modelfold), [`webfold-ai/seed-format`](https://github.com/webfold-ai/seed-format) |
 | **the serving** — the engine, the gateway and the admission guard | [`webfold-ai/peregrine-ng`](https://github.com/webfold-ai/peregrine-ng), [`webfold-ai/ai-gateway`](https://github.com/webfold-ai/ai-gateway), [`webfold-ai/guardfold`](https://github.com/webfold-ai/guardfold) |
-| **the statistics** — the monoid, the Gram, the significance tests | [`Ptyktos/statfold`](https://github.com/Ptyktos/statfold) |
-| **the product** — the engine, the API and the console | [`webfold-ai/webfold`](https://github.com/webfold-ai/webfold), [`webfold-ai/webfold-saas-api`](https://github.com/webfold-ai/webfold-saas-api), [`Ptyktos/ptyktos-webgui`](https://github.com/Ptyktos/ptyktos-webgui) |
-| **the agent** — the coding agent the harness adapters are written for | [`Ptyktos/ptyktos-coding-agent`](https://github.com/Ptyktos/ptyktos-coding-agent) |
+| **the statistics** — the monoid, the Gram, the significance tests | [`webfold-ai/statfold`](https://github.com/webfold-ai/statfold) |
+| **the product** — the engine | [`webfold-ai/webfold`](https://github.com/webfold-ai/webfold) |
+| **the agent** — the coding agent the harness adapters are written for | [`webfold-ai/webfold-coding-agent`](https://github.com/webfold-ai/webfold-coding-agent) |
 
 **The evals are the gate.** A change is measured by `agent-evals` (or by the benchmark
 harness in this repository), never by a private script:

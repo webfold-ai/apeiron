@@ -218,4 +218,32 @@ reproduction guide names each one and where its licence applies.
 ## Part of
 
 **Webfold AI** — an Australian AI lab based in Tasmania, Australia. <https://webfold.ai>
+## Where the rest of the stack lives
+
+This repository is one part of the Webfold stack. The parts you need are **not** here:
+
+| what | where |
+|---|---|
+| **the evals** — one binary, 101 benchmarks, closed-form scoring, zero model calls in the judging path | [`webfold-ai/agent-evals`](https://github.com/webfold-ai/agent-evals) |
+| **the gates** — the caretakers that refuse work (policy, provenance, scope) | [`Ptyktos/caretaker`](https://github.com/Ptyktos/caretaker) |
+| **the store** — the substrate; new storage code belongs here | [`Ptyktos/sangdb`](https://github.com/Ptyktos/sangdb), [`webfold-ai/iotadb`](https://github.com/webfold-ai/iotadb) |
+| **the training** — the distributed fleet and the Gram/RidgeFold shards | [`webfold-ai/webtrainer`](https://github.com/webfold-ai/webtrainer) |
+| **the models** — the model crates and the checkpoint format | [`webfold-ai/modelfold`](https://github.com/webfold-ai/modelfold), [`Ptyktos/seed-format`](https://github.com/Ptyktos/seed-format) |
+| **the serving** — the engine, the gateway and the admission guard | [`webfold-ai/peregrine-ng`](https://github.com/webfold-ai/peregrine-ng), [`webfold-ai/ai-gateway`](https://github.com/webfold-ai/ai-gateway), [`webfold-ai/guardfold`](https://github.com/webfold-ai/guardfold) |
+| **the statistics** — the monoid, the Gram, the significance tests | [`Ptyktos/statfold`](https://github.com/Ptyktos/statfold) |
+| **the product** — the engine, the API and the console | [`webfold-ai/webfold`](https://github.com/webfold-ai/webfold), [`webfold-ai/webfold-saas-api`](https://github.com/webfold-ai/webfold-saas-api) |
+
+**The evals are the gate.** A change is measured by `agent-evals` (or by the benchmark
+harness in this repository), never by a private script:
+
+```sh
+git clone https://github.com/webfold-ai/agent-evals && cd agent-evals
+cargo build --release
+./target/release/agent_evals list                    # every benchmark it knows
+./target/release/agent_evals run <bench> --dataset=<file>.jsonl
+```
+
+If a benchmark you need does not exist there, add it there — not in a scratch
+directory next to the code.
+
 <!-- webfold-release:end -->

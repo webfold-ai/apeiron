@@ -32,7 +32,7 @@ per-pixel survives; what survives is `G = XᵀX`.
 - Worked: `examples/mlperf_gpu_h2h.rs:1662`
   (`let g_i64 = gram_fold_i8(vec![0i64; d_feat * d_feat], &h2_i8, n_train, d_feat)`).
 - The same shape is used by the routing decider in `peregrine-ng`
-  (`src/serve/decider.rs`, step 2 of its own header at `:11-14`) and by the
+  (`src/serve/decider.rs`, step 2 of its own header at `:13-16`) and by the
   atlas's own suites.
 
 ### 1.2 Measure the spectrum **before** you solve
@@ -87,7 +87,7 @@ held-out data, with a **negative control** somewhere in the suite.
   SGD arm is the baseline, and it is in the table.
 - `REG-4`: a new architecture must beat the **reservoir** baseline (random
   Fourier features + ridge) on the same split. The decider benchmarks against
-  exactly that (`peregrine-ng/src/serve/decider.rs:26-28`); the atlas's safety
+  exactly that (`peregrine-ng/src/serve/decider.rs:22-25`); the atlas's safety
   gate benchmarks against an uncalibrated cosine guardrail
   (`examples/mlcommons_universal_atlas.rs:161`, `:222`), and its optimizer
   suite against an AdamW grid (`:365`).

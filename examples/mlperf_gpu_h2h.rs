@@ -1127,6 +1127,7 @@ fn run_mlperf_c4_workload(
         (measure_sum - 1.0).abs()
     );
     println!("mlperf_v6.1_target_log_perplexity: <= {target_log_ppl:.2} nats/token");
+    data_source("run_mlperf_c4_workload", "real:allenai/c4");
     println!("arm\tval_log_ppl_nats\tval_ppl\tbits_per_byte\ttrain_wall_s\tspeedup_vs_firmus_gb300\tmeets_mlperf_target");
     println!(
         "Ptyktos_{}_ContinualStream_Fold\t{cont_log_ppl:.4}\t{:.2}\t{cont_bpb:.4}\t{cont_train_s:.3}s\t{speedup_cont:.1}x\t{}",
@@ -1265,6 +1266,7 @@ fn run_gpu_layer_bench() {
             (k_mean / d_mean.max(1e-6)) * 100.0
         );
     }
+    data_source("run_gpu_layer_bench", "synthetic_in_process");
     println!("arm\tstep_wall_us\trange_us\tspeedup\ttime_reduction_pct");
     println!(
         "Apeiron_Fused_1CB_GPU_Trainer({STEP_DISPATCHES}_dispatches)\t{w_mean:.1}\t[{w_min:.1}, {w_max:.1}]\t{speedup:.2}x\t-{time_cut_pct:.1}%"
@@ -1446,6 +1448,7 @@ fn run_ssm_mamba_bench() {
         "shape: train_steps={n_train} val_steps={n_val} d_state={d_state} d_out={d_out} cone_fraction_r8={cone_r8:.4} chol_residual_max_q32={}",
         solved.residual_max
     );
+    data_source("run_ssm_mamba_bench", "synthetic_in_process");
     println!("arm\theldout_mse\twall_ms\tspeedup_vs_bptt\tbaseline_bptt_mse");
     println!(
         "Apeiron_SSM_StationaryFold(gram_i8+chol_Q32)\t{fold_mse:.6}\t{fold_ms:.2}\t{:.2}x\t{bptt_mse:.6}",
@@ -1569,6 +1572,7 @@ fn run_dlrm_dcnv2_bench() {
     let sgd_acc = (sgd_correct as f64) / (n_val as f64);
 
     println!("shape: train_rows={n_train} val_rows={n_val} fields=4 (higher-order categorical interactions)");
+    data_source("run_dlrm_dcnv2_bench", "synthetic_in_process");
     println!("arm\theldout_logloss_bce\theldout_acc\twall_ms\tspeedup_vs_sgd\tbaseline_sgd_logloss");
     println!(
         "Ptyktos_DLRM_KneserNey_TupleFold(O1..O3)\t{fold_logloss:.5}\t{fold_acc:.4}\t{fold_ms:.2}\t{:.2}x\t{sgd_logloss:.5}",
@@ -1740,6 +1744,7 @@ fn run_rgat_gnn_bench() {
         n_nodes - n_train,
         n_nodes * 8
     );
+    data_source("run_rgat_gnn_bench", "synthetic_in_process");
     println!("arm\theldout_node_acc\twall_ms\tspeedup_vs_sgd\tbaseline_sgd_acc");
     println!(
         "Ptyktos_SpectralGraph_Fold(2hop_gram_i8+chol_Q32)\t{fold_acc:.4}\t{fold_ms:.2}\t{:.2}x\t{sgd_acc:.4}",
@@ -1903,6 +1908,7 @@ fn run_lora_vs_ridgefold_bench() {
     let unadapted_dom_mse = eval_mse(&xdt_f, &ydt_f, &w_base_true);
 
     println!("diagnostics: exact_domain_unlearn_verified={unlearn_exact} wanda_nullspace_pruned_coords=16/64");
+    data_source("run_lora_vs_ridgefold_bench", "synthetic_in_process");
     println!("arm\tdomain_val_mse\tbase_retention_mse(forgetting)\twall_ms\tspeedup_vs_lora");
     println!(
         "Ptyktos_Anchored_RidgeFold+Wanda_Mask\t{fold_dom_mse:.6}\t{fold_base_mse:.6}\t{fold_ms:.2}\t{:.2}x",
@@ -2170,6 +2176,7 @@ fn run_monoid_sgd_roundtrip_bench() {
     println!(
         "diagnostics: sgd_to_monoid_max_reconstruction_err={max_rt_err:.2e} poison_shard_unlearn_exact={poison_unlearn_exact}"
     );
+    data_source("run_monoid_sgd_roundtrip_bench", "synthetic_in_process");
     println!("pipeline_stage\tdomain_val_mse\tbase_val_mse\tstage_wall_ms\tunlearn_capable");
     println!(
         "1_External_SGD_Checkpoint(W_0_Input)\t{sgd0_dom_mse:.6}\t{sgd0_base_mse:.6}\t{sgd0_ms:.2}\tfalse"
@@ -2220,6 +2227,7 @@ fn run_power_resource_telemetry(total_suite_s: f64) {
         "host_telemetry: gpu=\"{gpu_name}\" gpu_power_w={:?} gpu_vram_mib={:?} host_rss_mb={vm_rss_mb:.1} host_peak_rss_mb={vm_hwm_mb:.1} loadavg=\"{loadavg}\"",
         gpu_watts, gpu_vram_mib
     );
+    data_source("run_power_resource_telemetry", "hardware_only");
     println!("system\tactive_power_w\ttime_to_target_s\tenergy_joules\tenergy_wh\tpeak_ram_vram_gb\tenergy_saving_vs_gb300");
     println!(
         "Ptyktos_Full_8Workload_Suite(This_Run)\t{est_system_watts:.1}W\t{total_suite_s:.2}s\t{suite_joules:.1}J\t{suite_wh:.4}Wh\t{:.3}GB_RAM\t{energy_reduction_factor:.0}x_less_energy",
@@ -2228,6 +2236,16 @@ fn run_power_resource_telemetry(total_suite_s: f64) {
     println!(
         "Firmus_8x_GB300_MLPerf_v6.1_Llama3.1_8B\t{firmus_gb300_watts:.1}W\t3144.00s\t{firmus_gb300_joules:.1}J\t{firmus_gb300_wh:.1}Wh\t2304.000GB_HBM3e\t1x\n"
     );
+}
+
+/// Print the provenance of the data the next table was measured on.
+///
+/// `source` is `synthetic_in_process` when the suite generates its own data and reads no
+/// dataset, `real:<path>` when it reads a named corpus from disk, and `hardware_only` when
+/// the row is a measurement of the machine rather than of a workload. `scope` names the
+/// table. See `docs/WHAT-THESE-SUITES-MEASURE.md`.
+fn data_source(scope: &str, source: &str) {
+    println!("# data_source={source}\tscope={scope}");
 }
 
 fn main() {

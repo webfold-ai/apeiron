@@ -210,6 +210,7 @@ fn run_suite_1_ailuminate() {
     println!(
         "diagnostics: hazards_tested=12 prompts={n_test} cone_fraction_r8={cone:.4} chol_residual_q32={res_max}"
     );
+    data_source("Suite_1_AILuminate", "synthetic_in_process");
     println!("arm\tsafe_response_rate\tbenign_pass_rate\tgate_latency_us\tfit_ms\tgrade");
     println!(
         "Guardfold+Verdict_Conformal_12Hazard(alpha=0.01)\t{:.2}% ({}/{})\t{:.2}%\t{gate_us:.2}us\t{fit_ms:.2}ms\tExcellent",
@@ -356,6 +357,7 @@ fn run_suite_2_algoperf() {
     let adam_ms = t_adam.elapsed().as_secs_f64() * 1000.0;
 
     println!("diagnostics: ruleset=Self_Tuning_vs_External_Grid cone_fraction_r8={cone:.4}");
+    data_source("Suite_2_AlgoPerf", "synthetic_in_process");
     println!("arm\theldout_val_mse\ttuning_trials\twall_ms\tspeedup_vs_adamw_grid");
     println!(
         "Ptyktos_GramNewton_SelfTuning_ExactLOO\t{best_mse:.6}\t1_gram_fold(4_chol)\t{fold_ms:.2}ms\t{:.2}x",
@@ -468,6 +470,7 @@ fn run_suites_3_to_9_inference_spectrum() {
         "diagnostics: tiny_cone_r8={cone_tiny:.4} tiny_sram_bytes={tiny_sram_bytes}B (<256KB) auto_sla_met={}",
         auto_p999_us <= 10_000.0
     );
+    data_source("Suite_3_to_9_MLPerf_Inference_Spectrum", "synthetic_in_process");
     println!("mlcommons_suite\tscenario_metric\tptyktos_measured\tincumbent_baseline(REG-1/REG-4)\tadvantage");
     println!(
         "Suite_3_MLPerf_Client\tDesktop/Laptop_MLA_Decode\t{single_stream_tok_s:.1} tok/s (p50={llm_p50_us:.1}us)\tLlama.cpp_FP16: ~42.0 tok/s\t{:.1}x_faster",
@@ -548,6 +551,7 @@ fn run_suite_10_storage() {
         "diagnostics: records={n_records} slab_mb=64.0 index_build_ms={:.2} accelerator_utilization=100.0%",
         ingest_s * 1000.0
     );
+    data_source("Suite_10_MLPerf_Storage", "synthetic_in_process");
     println!("arm\tseq_stream_gb_per_s\tpoint_get_latency_ns\taccelerator_starvation_pct\tspeedup_vs_rocksdb");
     println!(
         "Ptyktos_HashTrinity+Mmap_ZeroCopy_Store\t{stream_gb_s:.2} GB/s\t{point_get_ns:.1} ns\t0.0%\t{:.1}x",
@@ -792,6 +796,7 @@ fn run_suite_11_mlperf_training_v6_1_new() {
         "diagnostics: dlrmv4_target_auc>=0.75(met={}) qwen_grpo_cone_r8={cone_grpo:.4} flux1_cone_r8={cone_flux:.4}",
         dlrm4_auc >= 0.75
     );
+    data_source("Suite_11_MLPerf_Training_v6_1", "synthetic_in_process");
     println!("mlperf_v6.1_workload\tptyktos_quality\tptyktos_wall_time(50k/2k_batch)\tincumbent_cluster_reference(REG-1/REG-4)\tsample_normalized_speedup");
     println!(
         "DLRMv4_HSTU_Yambda5B_SequentialRec\tAUC={dlrm4_auc:.4} (target>=0.75)\t{dlrm4_ms:.2}ms ({:.2}M ev/s)\t8x_MI350: 159.0m (7.26k ev/s) | Flat_DLRMv2(REG-4): AUC={flat_auc:.4}\t{dlrm4_norm_speedup:.1}x_per_event",
@@ -882,6 +887,7 @@ fn run_suite_12_hpc() {
     mae /= w_solved.len() as f64;
 
     println!("diagnostics: cone_fraction_r8={cone_hpc:.4} chol_residual_q32={res_hpc}");
+    data_source("Suite_12_MLPerf_Training_HPC", "synthetic_in_process");
     println!("hpc_workload\tptyktos_mae\twall_ms\tincumbent_supercomputer_target(REG-1)\tstatus");
     println!(
         "CosmoFlow_3D+DeepCAM+OpenCatalyst_Fold\tMAE={mae:.6} (target<=0.124)\t{hpc_ms:.2}ms\t512x_HPC_Nodes_3D_CNN_SGD (MAE<=0.124)\tTarget_Met_1Pass\n"
@@ -910,6 +916,7 @@ fn run_frontier_full_lifecycle_pipeline() {
     println!("================================================================================");
     println!("=== PART II: FULL 6-STAGE LIFECYCLE PIPELINE: GLM-5.3 / GLM-5.3-FLASH / DEEPSEEK-FLASH-V4 / QWEN3.5-A17B ===");
     println!("stages: [1:DCLM_Curation] -> [2:PreTrain_Fold] -> [3:FineTune_RidgeFold+Wanda] -> [4:PostTrain_GRPO_RLHF+Unlearn] -> [5:AILuminate_Gate] -> [6:Speculative_Inference]");
+    data_source("Part_II_Frontier_Lifecycle", "synthetic_in_process");
 
     let specs = [
         FrontierSpec {
@@ -1115,6 +1122,15 @@ fn run_frontier_full_lifecycle_pipeline() {
     println!();
 }
 
+/// Print the provenance of the data the next table was measured on.
+///
+/// `source` is `synthetic_in_process` when the suite generates its own data and reads no
+/// dataset, or `real:<path>` when it reads a named corpus from disk. `scope` names the
+/// table. See `docs/WHAT-THESE-SUITES-MEASURE.md`.
+fn data_source(scope: &str, source: &str) {
+    println!("# data_source={source}\tscope={scope}");
+}
+
 fn main() {
     let t_all = Instant::now();
     let host = std::fs::read_to_string("/etc/hostname")
@@ -1132,6 +1148,15 @@ fn main() {
     println!("# PTYKTOS UNIVERSAL 12-SUITE MLCOMMONS ATLAS & FRONTIER LIFECYCLE PIPELINE     #");
     println!("# host=\"{host}\" accelerator=\"{gpu_name}\"vocab_norm=exact                      #");
     println!("################################################################################\n");
+    println!("# data_source=synthetic_in_process\tscope=suites_1_to_12+part_II");
+    println!("# THIS BINARY READS NO MLCommons DATASET: its only file reads are /etc/hostname");
+    println!("# and the environment. Every row below is measured on data generated inside this");
+    println!("# process (Lcg draws, a planted w_true, synthetic clusters). A row is therefore a");
+    println!("# benchmark for the named OPERATOR, not a result for the named WORKLOAD.");
+    println!("# The real-data arms live in examples/mlperf_gpu_h2h.rs (allenai/c4),");
+    println!("# examples/mlperf_a17b_fleet.rs (pre-tokenised C4), examples/harness_adapter.rs");
+    println!("# (real request logs) and examples/altar1_tasmania_showcase.rs (altar-1 KLD");
+    println!("# windows + expert plan). Per-table provenance: docs/WHAT-THESE-SUITES-MEASURE.md");
 
     run_suite_1_ailuminate();
     run_suite_2_algoperf();

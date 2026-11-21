@@ -29,7 +29,7 @@ per-pixel survives; what survives is `G = XᵀX`.
 
 - Primitive: `apeiron::learn::gram::gram_fold_i8` — `src/learn/gram.rs:123`
   (exact `i64` accumulation, no float rounding, order-free).
-- Worked: `examples/mlperf_gpu_h2h.rs:1662`
+- Worked: `examples/mlperf_gpu_h2h.rs:1666`
   (`let g_i64 = gram_fold_i8(vec![0i64; d_feat * d_feat], &h2_i8, n_train, d_feat)`).
 - The same shape is used by the routing decider in `peregrine-ng`
   (`src/serve/decider.rs`, step 2 of its own header at `:13-16`) and by the
@@ -41,12 +41,12 @@ The spectrum of the *same* `G` is measured with the folded statistic's own
 eigen-solver, and it is reported **next to** the result, never in a footnote.
 
 - Primitive: `apeiron::learn::solve::eig::top_eigh` — `src/learn/solve/eig.rs:840`
-- Worked: `examples/mlperf_gpu_h2h.rs:1665-1668` — `top_eigh` runs on `a_q32`,
+- Worked: `examples/mlperf_gpu_h2h.rs:1669-1672` — `top_eigh` runs on `a_q32`,
   the very matrix the solve below consumes, and `cone_r8 = Σλ²/‖G‖_F²` is
   computed from it.
-- Reported: `examples/mlperf_gpu_h2h.rs:1738-1740` (the shape line ends with
-  `cone_fraction_r8=…`), `examples/mlcommons_universal_atlas.rs:211` and `:358`
-  (`diagnostics: … cone_fraction_r8=…`), `:884` (same, for the HPC suite).
+- Reported: `examples/mlperf_gpu_h2h.rs:1743` (the shape line ends with
+  `cone_fraction_r8=…`), `examples/mlcommons_universal_atlas.rs:211` and `:359`
+  (`diagnostics: … cone_fraction_r8=…`), `:889` (same, for the HPC suite).
 - `cone_fraction` is the *spectrum concentration* of the lift: `1.0` means the
   statistic lives in a rank-`r` subspace; a flat spectrum means the lift has
   nothing to read, and any solve on it is reading noise. `REG-3`.
@@ -69,7 +69,7 @@ bottleneck on the way in, never a fitted second head on the way out.
 
 - Primitive: `apeiron::learn::solve::chol::chol_solve` — `src/learn/solve/chol.rs:839`
   (Q32.32, same solver for one column or many).
-- Worked: `examples/mlperf_gpu_h2h.rs:1682`; the routing decider solves
+- Worked: `examples/mlperf_gpu_h2h.rs:1686`; the routing decider solves
   `k = 2` columns in one call (`peregrine-ng/src/serve/decider.rs:372-378`).
 - The atlas's own discipline, in one line: *"Solve directly in the continuous
   target basis (chol_q32 / Anchored RidgeFold + Wanda null-space pruning),
@@ -80,17 +80,17 @@ bottleneck on the way in, never a fitted second head on the way out.
 Every arm prints **quality | speed | the named incumbent**, on the *same*
 held-out data, with a **negative control** somewhere in the suite.
 
-- The atlas's table header: `examples/mlcommons_universal_atlas.rs:471`
+- The atlas's table header: `examples/mlcommons_universal_atlas.rs:474`
   (`mlcommons_suite | scenario_metric | ptyktos_measured | incumbent_baseline(REG-1/REG-4) | advantage`).
-- The GNN suite's header: `examples/mlperf_gpu_h2h.rs:1743`
+- The GNN suite's header: `examples/mlperf_gpu_h2h.rs:1748`
   (`arm | heldout_node_acc | wall_ms | speedup_vs_sgd | baseline_sgd_acc`) — the
   SGD arm is the baseline, and it is in the table.
 - `REG-4`: a new architecture must beat the **reservoir** baseline (random
   Fourier features + ridge) on the same split. The decider benchmarks against
   exactly that (`peregrine-ng/src/serve/decider.rs:22-25`); the atlas's safety
   gate benchmarks against an uncalibrated cosine guardrail
-  (`examples/mlcommons_universal_atlas.rs:161`, `:222`), and its optimizer
-  suite against an AdamW grid (`:365`).
+  (`examples/mlcommons_universal_atlas.rs:161`, `:223`), and its optimizer
+  suite against an AdamW grid (`:367`).
 - `REG-1`: three columns, always. A number without a baseline is not a result.
 
 ---
@@ -132,7 +132,7 @@ rather than as the algebra it is. `modelfold/src/vision/sam2.rs` is an
 contract, its own attention, its own decoder — for a task the Gram already
 affords: node classification on a pixel/superpixel affinity graph.
 
-**The same operator is already proven.** `examples/mlperf_gpu_h2h.rs:1587-1592`
+**The same operator is already proven.** `examples/mlperf_gpu_h2h.rs:1594`
 runs the R-GAT spectral graph coupling with the same `gram_fold_i8` /
 `top_eigh` / `chol_solve` triple, on a 2,048-node graph with 8 classes.
 
@@ -199,6 +199,15 @@ never in a third architecture.
 
 Run this **before** writing the solver, and again before believing the number.
 
+**First, though: what data is it measured on?** A row measured on data
+generated inside the program is a benchmark for the named **operator**, not a
+result for the named **workload** — and the two print identically, as
+`suite | metric | measured | baseline | advantage`. So every table must name
+its data source: the atlas examples now print `# data_source=…` above each
+table (`synthetic_in_process`, `real:<path>`, `hardware_only`), and the
+per-suite audit with the `file:line` for each claim is
+[`docs/WHAT-THESE-SUITES-MEASURE.md`](WHAT-THESE-SUITES-MEASURE.md).
+
 1. **What is the operator's stationary sufficient statistic?** Name it. If it
    is not second-order and order-free, you have not found the operator yet.
 2. **What is the lift, and what is its `cone_fraction`?** Measure it on the
@@ -236,8 +245,8 @@ Run this **before** writing the solver, and again before believing the number.
 
 | suite | file | what it shows |
 |---|---|---|
-| 12 official MLCommons suites + 6-stage pipeline | `examples/mlcommons_universal_atlas.rs` | the whole surface: five-column tables (`:471`), cone diagnostics (`:211`, `:358`, `:884`), REG-4 baselines (`:222`, `:365`) |
-| MLPerf v6.1 study + Vulkan GPU dispatch | `examples/mlperf_gpu_h2h.rs` | the pattern in miniature: fold (`:1662`) → spectrum (`:1665-1668`) → solve (`:1682`) → table with the SGD baseline (`:1743`); the R-GAT graph suite (`:1587`) |
+| 12 official MLCommons suites + 6-stage pipeline | `examples/mlcommons_universal_atlas.rs` | the whole surface: five-column tables (`:474`), cone diagnostics (`:211`, `:359`, `:889`), REG-4 baselines (`:223`, `:367`) |
+| MLPerf v6.1 study + Vulkan GPU dispatch | `examples/mlperf_gpu_h2h.rs` | the pattern in miniature: fold (`:1666`) → spectrum (`:1669-1672`) → solve (`:1686`) → table with the SGD baseline (`:1748`); the R-GAT graph suite (`:1594`) |
 | A17B fleet | `examples/mlperf_a17b_fleet.rs` | the same skeleton at fleet scale |
 | 6-system showcase (altar-1, webtrainer, iotadb, **peregrine-ng FoldDecider**, ai-gateway, guardfold) | `examples/altar1_tasmania_showcase.rs:1-7` | the pattern wired end to end; the live routing call is at `:367-370` (`POST /decide` against `PEREGRINE_ADDR`, default `127.0.0.1:38110`, `:382`) |
 

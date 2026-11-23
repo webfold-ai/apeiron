@@ -37,5 +37,30 @@ done for this book.
 | Werner, R. F. and Farrelly, T. "Uncertainty from Heisenberg to today." *Found. Phys.* 49, 2019, 460–491. doi:10.1007/s10701-019-00265-z; arXiv:1904.06139 | the Heisenberg, Kennard, Weyl and Robertson history | arXiv v1 retrieved; the history of the preparation relation read |
 | Bloch, Y. and Cohen, E. "The identification of mean quantum potential with Fisher information leads to a strong uncertainty relation." *Found. Phys.* 52, 2022, 117. doi:10.1007/s10701-022-00638-x; arXiv:2210.07732 | `integral_rho_Q` (their eq. 13) and its translation-invariance premise | arXiv v1 retrieved; §§I–II read |
 
+## The comparators
+
+These are **not** sources the corpus draws on. They are the nearest prior art for the mechanisms
+the corpus realises, recorded here so that the comparison can be stated rather than implied.
+Each identifier was resolved against its primary registry on **2026-11-23** — the arXiv abstract
+page for the arXiv entries, Crossref for the DOI — and the title, authors and year below are
+copied from that record. **None has been read in full**, so every one of them is a **pointer**
+under the rule at the top of this file, and none carries evidential weight in the
+[grades](../verification/evidence.md). The full six-axis comparison is at
+`Ptyktos/research` `drafts/apeiron-vs-priors/`.
+
+| source | used for | status |
+|---|---|---|
+| Schlag, I., Irie, K. and Schmidhuber, J. *Linear Transformers Are Secretly Fast Weight Programmers.* ICML 2021. arXiv:2102.11174 | the comparator for a forward computation that writes the weights it later reads, and for the delta rule (`SpinorFold.lean`, `Nous/Combinator/CellTransform.lean`) | arXiv abstract page retrieved 2026-11-23; not read in full |
+| Katharopoulos, A., Vyas, A., Pappas, N. and Fleuret, F. *Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention.* NeurIPS 2020. arXiv:2006.16236 | the comparator for the predictive read (`NullTransformer`, `Nous/Model/Weighting.lean`) | arXiv abstract page retrieved 2026-11-23; not read in full |
+| Zhuang, H., Weng, Z., Wei, H., Xie, R., Toh, K.-A. and Lin, Z. *ACIL: Analytic Class-Incremental Learning with Absolute Memorization and Privacy Protection.* NeurIPS 2022. arXiv:2205.14922 | the comparator for retaining analytic state in place of samples (`TrainingCollapse.lean`) | arXiv abstract page retrieved 2026-11-23; not read in full |
+| Chen, C. L. P. and Liu, Z. *Broad Learning System: An Effective and Efficient Incremental Learning System Without the Need for Deep Architecture.* IEEE TNNLS 29 (2018). doi:10.1109/TNNLS.2017.2716952 | the ancestor of the incremental-analytic line, named so the corpus's version of that claim is not read as the origin of it | Crossref record resolved 2026-11-23; not read in full |
+| Quan, Y., Wu, W. and Montana, G. *Exact Federated Continual Unlearning for Ridge Heads on Frozen Foundation Models.* arXiv:2603.12977 | the closest prior art for the Gram ledger and its removal (`TrainingCollapse.lean`, `webtrainer-core`) | arXiv abstract page retrieved 2026-11-23; not read in full |
+| Alsulaimawi, Z. *One-Shot Federated Ridge Regression: Exact Recovery via Sufficient Statistic Aggregation.* arXiv:2601.08216 | the prior art for aggregating Gram and cross-moment statistics and solving once | arXiv abstract page retrieved 2026-11-23; not read in full |
+| Jayraj, P., Sahoo, D. and Mittal, U. *Exact Unlearning After Data Curation.* arXiv:2610.33426 | the prior art for exact removal of a contributed block | arXiv abstract page retrieved 2026-11-23; not read in full |
+| Tavory, A., Gade, S., Sarig, T., Touitou, N. and Guy, I. *Exact Unlearning via Quantized Sufficient Statistics.* arXiv:2610.07197 | the prior art for exact removal from quantized sufficient statistics — the nearest neighbour of the corpus's own quantized carriers | arXiv abstract page retrieved 2026-11-23; not read in full |
+| Gonzalez, X., Buchanan, E. K., Lee, H. D., Liu, J. W., Wang, K. A., Zoltowski, D. M. and Kozachkov, L. *A Unifying Framework for Parallelizing Sequential Models with Linear Dynamical Systems.* arXiv:2509.21716 | the account of associative scan and the affine composition law the corpus's `AnyRing.lean` laws formalise | arXiv abstract page retrieved 2026-11-23; not read in full |
+| Sun, Y., Li, X., Dalal, K., Xu, J., Vikram, A., Zhang, G., Dubois, Y. and others. *Learning to (Learn at Test Time): RNNs with Expressive Hidden States.* arXiv:2407.04620 | the prior art for updating a state during the forward computation | arXiv abstract page retrieved 2026-11-23; not read in full |
+| Guan, Z., Parmigiani, G. and Patil, P. *Merging versus Ensembling in Multi-Study Prediction: Theoretical Insight from Random Effects.* arXiv:1905.07382 | the statistical account of when pooling estimates differs from averaging predictions — the distinction the shard law rests on | arXiv abstract page retrieved 2026-11-23; not read in full |
+
 Each DOI above was resolved against Crossref's record for the cited title, authors and year; no DOI means the source has none. Retrieving and reading the pointer entries is open work. Until then each is a pointer and carries
 no evidential weight in the [grades](../verification/evidence.md).

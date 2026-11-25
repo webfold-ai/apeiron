@@ -17,6 +17,8 @@
 //!   (arXiv:2301.05217), its data-fraction curve, controls, and circulant spectral discovery with `top_eigh`.
 //! * `super` — the Toy Models of Superposition data process (arXiv:2209.10652) as ground truth: spectral atoms vs
 //!   a ridge decoder on the true codes, a positive control, a flat-spectrum case, and a shuffled control.
+//! * `assoc` — a ridge associative memory: write = add, read = ridge contraction, forget = exact subtraction,
+//!   uncertainty = leverage; capacity, Hebbian crosstalk, key noise, and the lambda sweep at n = d.
 //! * `leace` — closed-form linear concept erasure (arXiv:2306.03819 Thm 4.2) from the additive
 //!   statistics `n, Σx, Σxxᵀ, Σxzᵀ` and one Cholesky solve; shard merge and subtract.
 //!
@@ -1654,6 +1656,269 @@ fn superposition() -> bool {
     report("E-SUPER", &checks)
 }
 
+// ---------------------------------------------------------------------------------------------
+// E-ASSOC: a ridge associative memory — write = add, read = ridge contraction, forget = subtract,
+// uncertainty = leverage. The "prediction machine" claim, tested at the smallest scale.
+// ---------------------------------------------------------------------------------------------
+
+fn assoc() -> bool {
+    println!("\n--- E-ASSOC: ridge associative memory (SYNTHETIC) ---");
+    println!("Setup: d=64 i8 key features (Gaussian, quantised), V=16 value classes. Write n (key, value) pairs into the exact");
+    println!("(G, B): G += k kᵀ, B += k v127ᵀ. Read modes: HEBB logits = Bᵀk (a monoid, parallel, crosstalk); RIDGE logits = Bᵀ(G/n+λI)⁻¹k;");
+    println!("LOOKUP = value of the most similar stored key (the KV-cache baseline: exact, but one slot per pair).");
+    println!("Uncertainty: leverage u(q) = q̃ᵀ(G/n+λI)⁻¹q̃ — the same Cholesky, no extra pass.");
+    println!("PREDICTIONS (fixed before the first run):");
+    println!("  A1 capacity: RIDGE recall of stored pairs is >= 0.99 for every n <= 0.875·d (n <= 56) and <= 0.80 at n = 2d (128).");
+    println!("  A2 crosstalk: HEBB is strictly worse than RIDGE at n = 0.75·d (48) by >= 0.10, and HEBB at n = d is below RIDGE at n = d.");
+    println!("  A3 LOOKUP is 1.000 at every n (it keeps one slot per pair) and survives key noise (noise 0.5σ) at >= 0.99.");
+    println!("  A4 uncertainty: leverage separates stored from never-written keys, AUROC >= 0.99 at n = 48; it falls as n approaches d.");
+    println!("  A5 reversibility: after writing 48 pairs and then SUBTRACTING 8 of them, (G, B) equal those of a memory that never");
+    println!("     held them, bit for bit; the removed keys read at <= 0.20 (chance 0.0625) and the 40 retained keys stay >= 0.99.");
+    println!("  A6 control: a memory fed shuffled keys→values reads at chance (<= 0.12) on the true pairing.");
+
+    let (d, v) = (64usize, 16usize);
+    let mut rng = Rng(0xA550_C1A7_1FE0_BEEF);
+    let key = |rng: &mut Rng| -> Vec<i8> { (0..d).map(|_| q8(rng.gauss() * 40.0)).collect() };
+    let n_max = 256usize;
+    let keys: Vec<Vec<i8>> = (0..n_max).map(|_| key(&mut rng)).collect();
+    let vals: Vec<usize> = (0..n_max)
+        .map(|_| (rng.next() % v as u64) as usize)
+        .collect();
+    let unseen: Vec<Vec<i8>> = (0..400).map(|_| key(&mut rng)).collect();
+    let lam = 1e-4;
+    let tilde = |k: &[i8]| -> Vec<f64> { k.iter().map(|&x| f64::from(x) / 127.0).collect() };
+
+    let build = |ids: &[usize]| -> (Vec<i64>, Vec<i64>) {
+        let mut flat = Vec::with_capacity(ids.len() * d);
+        for &i in ids {
+            flat.extend_from_slice(&keys[i]);
+        }
+        let g = gram(&flat, ids.len(), d);
+        let mut b = vec![0i64; d * v];
+        for &i in ids {
+            for j in 0..d {
+                b[j * v + vals[i]] += i64::from(keys[i][j]) * 127;
+            }
+        }
+        (g, b)
+    };
+    let argmax = |x: &[f64]| {
+        (0..x.len())
+            .max_by(|&a, &b| x[a].partial_cmp(&x[b]).unwrap())
+            .unwrap()
+    };
+
+    println!(
+        "\n  n   n/d |  RIDGE  HEBB  LOOKUP  LOOKUP(noisy) | leverage AUROC (stored vs unseen)"
+    );
+    let ns = [8usize, 16, 32, 48, 56, 64, 80, 96, 128, 192, 256];
+    let mut recall_r = std::collections::BTreeMap::new();
+    let mut recall_h = std::collections::BTreeMap::new();
+    let mut lookup_ok = true;
+    let mut lookup_noisy_min = 1f64;
+    let mut auroc_by_n = Vec::new();
+    for &n in &ns {
+        let ids: Vec<usize> = (0..n).collect();
+        let (g, b) = build(&ids);
+        let s = n as f64 * 127.0 * 127.0;
+        let w = to_f(&solve_q(&g, &b, d, v, s, lam));
+        let (mut r_ok, mut h_ok, mut l_ok, mut ln_ok, mut rn_ok, mut hn_ok) =
+            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        for &i in &ids {
+            let kt = tilde(&keys[i]);
+            let ridge = predict(&w, d, v, &kt);
+            if argmax(&ridge) == vals[i] {
+                r_ok += 1;
+            }
+            let hebb: Vec<f64> = (0..v)
+                .map(|c| (0..d).map(|j| b[j * v + c] as f64 / 127.0 * kt[j]).sum())
+                .collect();
+            if argmax(&hebb) == vals[i] {
+                h_ok += 1;
+            }
+            let look = |q: &[f64]| -> usize {
+                let mut best = (f64::MIN, 0usize);
+                for &j in &ids {
+                    let kj = tilde(&keys[j]);
+                    let dot: f64 = kj.iter().zip(q).map(|(a, c)| a * c).sum();
+                    let nk: f64 = kj.iter().map(|a| a * a).sum::<f64>().sqrt();
+                    let sc = dot / nk;
+                    if sc > best.0 {
+                        best = (sc, j);
+                    }
+                }
+                vals[best.1]
+            };
+            if look(&kt) == vals[i] {
+                l_ok += 1;
+            }
+            // key noise: 0.5 of the per-coordinate key standard deviation (40/127), on every read mode.
+            let noisy: Vec<f64> = kt
+                .iter()
+                .map(|x| x + 0.5 * (40.0 / 127.0) * rng.gauss())
+                .collect();
+            if look(&noisy) == vals[i] {
+                ln_ok += 1;
+            }
+            if argmax(&predict(&w, d, v, &noisy)) == vals[i] {
+                rn_ok += 1;
+            }
+            let hebb_n: Vec<f64> = (0..v)
+                .map(|c| (0..d).map(|j| b[j * v + c] as f64 / 127.0 * noisy[j]).sum())
+                .collect();
+            if argmax(&hebb_n) == vals[i] {
+                hn_ok += 1;
+            }
+        }
+        let nf = n as f64;
+        let (rr, hh, ll, lln) = (
+            r_ok as f64 / nf,
+            h_ok as f64 / nf,
+            l_ok as f64 / nf,
+            ln_ok as f64 / nf,
+        );
+        let (rrn, hhn) = (rn_ok as f64 / nf, hn_ok as f64 / nf);
+        recall_r.insert(n, rr);
+        recall_h.insert(n, hh);
+        lookup_ok &= ll == 1.0;
+        lookup_noisy_min = lookup_noisy_min.min(lln);
+        // leverage AUROC: stored keys (first min(n,400) ids) vs unseen keys
+        let lev = |k: &[i8]| -> f64 {
+            let kt = tilde(k);
+            let u = cinv_vec(&g, d, s, lam, &kt);
+            kt.iter().zip(&u).map(|(a, c)| a * c).sum()
+        };
+        let stored: Vec<f64> = ids.iter().take(200).map(|&i| lev(&keys[i])).collect();
+        let fresh: Vec<f64> = unseen.iter().take(200).map(|k| lev(k)).collect();
+        let mut wins = 0f64;
+        for f in &fresh {
+            for st in &stored {
+                wins += if f > st {
+                    1.0
+                } else if f == st {
+                    0.5
+                } else {
+                    0.0
+                };
+            }
+        }
+        let auroc = wins / (fresh.len() * stored.len()) as f64;
+        auroc_by_n.push((n, auroc));
+        println!("  {n:>3} {:>5.2} | {rr:>6.3} {hh:>5.3} {ll:>7.3} {lln:>13.3} | {auroc:.3}   (noisy keys, exploratory: ridge {rrn:.3} hebb {hhn:.3})", nf / d as f64);
+    }
+
+    // A5: reversibility, bit for bit.
+    let ids48: Vec<usize> = (0..48).collect();
+    let (g48, b48) = build(&ids48);
+    let removed: Vec<usize> = (0..8).map(|i| i * 6).collect();
+    let (mut g_sub, mut b_sub) = (g48.clone(), b48.clone());
+    for &i in &removed {
+        for a in 0..d {
+            for c in 0..d {
+                g_sub[a * d + c] -= i64::from(keys[i][a]) * i64::from(keys[i][c]);
+            }
+            b_sub[a * v + vals[i]] -= i64::from(keys[i][a]) * 127;
+        }
+    }
+    let kept: Vec<usize> = ids48
+        .iter()
+        .copied()
+        .filter(|i| !removed.contains(i))
+        .collect();
+    let (g_never, b_never) = build(&kept);
+    let exact = g_sub == g_never && b_sub == b_never;
+    let s40 = 48.0 * 127.0 * 127.0; // the same fixed scale for both reads, so only the content differs
+    let w_before = to_f(&solve_q(&g48, &b48, d, v, s40, lam));
+    let w_after = to_f(&solve_q(&g_sub, &b_sub, d, v, s40, lam));
+    let rec = |w: &[f64], set: &[usize]| -> f64 {
+        set.iter()
+            .filter(|&&i| argmax(&predict(w, d, v, &tilde(&keys[i]))) == vals[i])
+            .count() as f64
+            / set.len() as f64
+    };
+    let (rm_before, rm_after, kp_after) = (
+        rec(&w_before, &removed),
+        rec(&w_after, &removed),
+        rec(&w_after, &kept),
+    );
+    println!("\n  reversal: integer state after subtracting 8 of 48 pairs == a memory that never held them: {exact}");
+    println!("  recall of the 8 removed keys: before {rm_before:.3} -> after {rm_after:.3} (chance {:.4}); the 40 retained: {kp_after:.3}", 1.0 / v as f64);
+
+    // EXPLORATORY (formed after the noisy columns above showed a dip at n = d): the ridge read against λ.
+    println!("\n  exploratory: ridge read at n = d = 64 against lambda (clean / noisy keys, noise 0.5 per-coordinate std):");
+    {
+        let ids64: Vec<usize> = (0..64).collect();
+        let (g64, b64) = build(&ids64);
+        let s64 = 64.0 * 127.0 * 127.0;
+        for &lm in &[1e-4, 1e-3, 1e-2, 1e-1, 1.0] {
+            let w = to_f(&solve_q(&g64, &b64, d, v, s64, lm));
+            let (mut c_ok, mut n_ok) = (0usize, 0usize);
+            for rep in 0..5 {
+                let _ = rep;
+                for &i in &ids64 {
+                    let kt = tilde(&keys[i]);
+                    let noisy: Vec<f64> = kt
+                        .iter()
+                        .map(|x| x + 0.5 * (40.0 / 127.0) * rng.gauss())
+                        .collect();
+                    if argmax(&predict(&w, d, v, &kt)) == vals[i] {
+                        c_ok += 1;
+                    }
+                    if argmax(&predict(&w, d, v, &noisy)) == vals[i] {
+                        n_ok += 1;
+                    }
+                }
+            }
+            println!(
+                "    lambda {lm:>7.0e}: clean {:.3}   noisy {:.3}",
+                c_ok as f64 / 320.0,
+                n_ok as f64 / 320.0
+            );
+        }
+    }
+
+    // A6 control: shuffled pairing.
+    let mut perm: Vec<usize> = (0..48).collect();
+    shuffle(&mut perm, &mut rng);
+    let mut flat = Vec::new();
+    for &i in &ids48 {
+        flat.extend_from_slice(&keys[i]);
+    }
+    let gsh = gram(&flat, 48, d);
+    let mut bsh = vec![0i64; d * v];
+    for (pos, &i) in ids48.iter().enumerate() {
+        for j in 0..d {
+            bsh[j * v + vals[perm[pos]]] += i64::from(keys[i][j]) * 127;
+        }
+    }
+    let wsh = to_f(&solve_q(&gsh, &bsh, d, v, s40, lam));
+    let shuf_recall = ids48
+        .iter()
+        .filter(|&&i| argmax(&predict(&wsh, d, v, &tilde(&keys[i]))) == vals[i])
+        .count() as f64
+        / 48.0;
+
+    let get = |m: &std::collections::BTreeMap<usize, f64>, n: usize| *m.get(&n).unwrap();
+    let a1 = ns
+        .iter()
+        .filter(|&&n| n <= 56)
+        .all(|&n| get(&recall_r, n) >= 0.99)
+        && get(&recall_r, 128) <= 0.80;
+    let a2 =
+        get(&recall_r, 48) - get(&recall_h, 48) >= 0.10 && get(&recall_h, 64) < get(&recall_r, 64);
+    let auroc_at = |n: usize| auroc_by_n.iter().find(|a| a.0 == n).unwrap().1;
+    let a4 = auroc_at(48) >= 0.99 && auroc_at(96) < auroc_at(48);
+    let checks = vec![
+        Check { name: "A1 ridge capacity: exact to ~0.875·d, collapses by 2d", pass: a1, detail: format!("recall n=56 {:.3}, n=64 {:.3}, n=96 {:.3}, n=128 {:.3}", get(&recall_r, 56), get(&recall_r, 64), get(&recall_r, 96), get(&recall_r, 128)) },
+        Check { name: "A2 Hebbian crosstalk costs recall that the ridge read does not", pass: a2, detail: format!("n=48: ridge {:.3} vs hebb {:.3}; n=64: ridge {:.3} vs hebb {:.3}", get(&recall_r, 48), get(&recall_h, 48), get(&recall_r, 64), get(&recall_h, 64)) },
+        Check { name: "A3 lookup is exact and survives key noise", pass: lookup_ok && lookup_noisy_min >= 0.99, detail: format!("exact at every n: {lookup_ok}; worst noisy recall {lookup_noisy_min:.3}") },
+        Check { name: "A4 leverage separates stored from unseen keys, weaker near capacity", pass: a4, detail: format!("AUROC by n: {}", auroc_by_n.iter().map(|(n, a)| format!("{n}:{a:.3}")).collect::<Vec<_>>().join(", ")) },
+        Check { name: "A5 forgetting is exact subtraction", pass: exact && rm_after <= 0.20 && kp_after >= 0.99, detail: format!("state bit-identical {exact}; removed {rm_before:.3} -> {rm_after:.3}; retained {kp_after:.3}") },
+        Check { name: "A6 control: shuffled pairing reads at chance", pass: shuf_recall <= 0.12, detail: format!("recall on the true pairing {shuf_recall:.3} (chance {:.4})", 1.0 / v as f64) },
+    ];
+    report("E-ASSOC", &checks)
+}
+
 fn main() -> ExitCode {
     let which = std::env::args().nth(1).unwrap_or_else(|| "all".to_string());
     let mut ok = true;
@@ -1668,6 +1933,9 @@ fn main() -> ExitCode {
     }
     if which == "super" || which == "all" {
         ok &= superposition();
+    }
+    if which == "assoc" || which == "all" {
+        ok &= assoc();
     }
     println!(
         "\n{}",

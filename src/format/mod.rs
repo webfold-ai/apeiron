@@ -2,8 +2,8 @@
 //! inference-parity load path.
 //!
 //! [`gguf`] reads the header, metadata table and tensor directory; [`quant`] unpacks the quant
-//! formats the served recipe carries; [`bpe`] turns a HuggingFace `tokenizer.json` into ids and
-//! back. All three refuse with `Result` and never panic on file data.
+//! formats the served recipe carries. A HuggingFace `tokenizer.json` is NOT one of them: reading a
+//! foreign tokenizer is the `tokenizer` crate's `artifact` module, which owns that job.
 
 #![allow(
     clippy::must_use_candidate,
@@ -26,7 +26,6 @@
               lints stay on for the rest of the crate."
 )]
 
-pub mod bpe;
 pub mod gguf;
 pub mod packing;
 pub mod quant;

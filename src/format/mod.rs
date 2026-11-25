@@ -26,6 +26,7 @@
               lints stay on for the rest of the crate."
 )]
 
+pub mod nq;
 pub mod bpe;
 pub mod gguf;
 pub mod packing;

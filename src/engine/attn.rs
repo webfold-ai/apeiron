@@ -9,9 +9,56 @@ use crate::engine::ops::matvec::row_dot_fixed;
 use crate::numeric::fixed_exp::fixed_exp;
 use crate::numeric::fixed_rsqrt::fixed_rsqrt;
 use std::cell::Cell;
+use std::sync::Arc;
 
+#[path = "attn/cert.rs"]
+mod cert;
 #[path = "attn/f32_core.rs"]
 pub mod f32_core;
+#[path = "attn/i8.rs"]
+pub(super) mod i8;
+#[path = "attn/kvplane.rs"]
+pub mod kvplane;
+
+pub use self::cert::CertStats;
+use self::kvplane::{KvFileError, KvMap, KvPlane};
+
+/// The numerical carrier of the key/value cache: the dial `APEIRON_KV_CARRIER` selects.
+///
+/// [`KvCarrier::Q32`] is the exact fixed-point oracle and the only carrier the block certificate
+/// reads; [`KvCarrier::F32`] is the measured decode default; [`KvCarrier::I8`] stores one signed
+/// code per component with one binary32 scale per `(kv_head, position, K|V)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvCarrier {
+    /// Q32.32 fixed-point planes.
+    Q32,
+    /// Native binary32 planes.
+    F32,
+    /// Signed 8-bit codes with one binary32 scale per row.
+    I8,
+}
+
+/// The cache carrier from `APEIRON_KV_CARRIER` (`q32` | `f32` | `i8`), falling back to
+/// [`carrier_from_env`] when unset or unrecognised.
+///
+/// `APEIRON_F32_CARRIER=0` still selects Q32 and every other value F32, so a run that sets only
+/// the older dial keeps its carrier. Parsed once per process.
+///
+/// # Complexity
+///
+/// `O(1)` after the first call; one `OnceLock` and one environment lookup.
+pub(crate) fn kv_carrier_from_env() -> KvCarrier {
+    static CARRIER: std::sync::OnceLock<KvCarrier> = std::sync::OnceLock::new();
+    *CARRIER.get_or_init(|| match std::env::var("APEIRON_KV_CARRIER").as_deref() {
+        Ok(v) if v.eq_ignore_ascii_case("i8") => KvCarrier::I8,
+        Ok(v) if v.eq_ignore_ascii_case("f32") => KvCarrier::F32,
+        Ok(v) if v.eq_ignore_ascii_case("q32") => KvCarrier::Q32,
+        _ => match carrier_from_env() {
+            Carrier::Q32 => KvCarrier::Q32,
+            Carrier::F32 => KvCarrier::F32,
+        },
+    })
+}
 
 // Test seam for `APEIRON_EXACT_SCAN`: a per-thread override of the flag, `None` falling through
 // to the process value. The process parse lives in `src/engine/step/cols.rs` where the flag is
@@ -83,22 +130,40 @@ pub enum AttnError {
     ZeroSum,
 }
 
-/// Typed storage for key and value planes: either Q32.32 fixed-point `i64` or binary32 `f32`.
+/// Typed storage for key and value planes: Q32.32 fixed-point `i64`, binary32 `f32`, or signed
+/// 8-bit codes with a binary32 scale per row.
+///
+/// Each plane is a [`KvPlane`]: an owned vector, or a disjoint range of one writable cache file
+/// ([`KvState::with_file`]). The read and write paths are identical for both backings.
 #[derive(Debug, Clone)]
 pub enum KvStorage {
     /// Fixed-point Q32.32 key and value planes.
     Q32 {
         /// Position-major key planes, one per layer.
-        k: Vec<Vec<i64>>,
+        k: Vec<KvPlane<i64>>,
         /// Position-major value planes, one per layer.
-        v: Vec<Vec<i64>>,
+        v: Vec<KvPlane<i64>>,
     },
     /// Native binary32 floating-point key and value planes.
     F32 {
         /// Position-major key planes, one per layer.
-        k: Vec<Vec<F32>>,
+        k: Vec<KvPlane<F32>>,
         /// Position-major value planes, one per layer.
-        v: Vec<Vec<F32>>,
+        v: Vec<KvPlane<F32>>,
+    },
+    /// Signed 8-bit key and value codes, KV-head-major, with one binary32 scale per
+    /// `(kv_head, position)` in `ks`/`vs`. Component `i` of position `s` of KV head `kvh` is at
+    /// `((kvh · cap) + s) · head_dim + i`: one KV head's positions are contiguous, so the group
+    /// read walks one row run with `stride = head_dim`.
+    I8 {
+        /// KV-head-major key code planes, one per layer.
+        k: Vec<KvPlane<i8>>,
+        /// KV-head-major value code planes, one per layer.
+        v: Vec<KvPlane<i8>>,
+        /// Key scale of `(kv_head, position)`, `n_head_kv · cap` per layer.
+        ks: Vec<KvPlane<F32>>,
+        /// Value scale of `(kv_head, position)`, `n_head_kv · cap` per layer.
+        vs: Vec<KvPlane<F32>>,
     },
 }
 
@@ -117,10 +182,133 @@ pub enum KvStorage {
 /// two `vec![blank; n_layer]` repetitions over a `plane`-element element, so it closes at
 /// `2 · n_layer · plane` writes.
 fn alloc_f32_storage(plane: usize, n_layer: usize) -> KvStorage {
-    let blank = vec![F32::ZERO; plane];
+    let blank = KvPlane::owned(vec![F32::ZERO; plane]);
     let k = vec![blank.clone(); n_layer];
     let v = vec![blank; n_layer];
     KvStorage::F32 { k, v }
+}
+
+/// Allocate the zeroed int8 code planes and their per-row scales.
+///
+/// `plane` is the code-plane length (`n_head_kv · cap · head_dim`), `rows` the scale-plane length
+/// (`n_head_kv · cap`) and `n_layer` the layer count. The codes start at zero and every scale at
+/// one: a partly written position therefore reads as a zero row rather than as a row scaled by
+/// zero, which keeps a truncated append's neighbour positions finite.
+///
+/// # Complexity
+///
+/// `O(n_layer · (plane + 2 · rows))` time and space in the unions of the two element types: one
+/// zeroed code plane and one unit scale plane cloned `n_layer` times each.
+fn alloc_i8_storage(plane: usize, rows: usize, n_layer: usize) -> KvStorage {
+    let blank_k = KvPlane::owned(vec![0i8; plane]);
+    let blank_s = KvPlane::owned(vec![F32::ONE; rows]);
+    KvStorage::I8 {
+        k: vec![blank_k.clone(); n_layer],
+        v: vec![blank_k; n_layer],
+        ks: vec![blank_s.clone(); n_layer],
+        vs: vec![blank_s; n_layer],
+    }
+}
+
+/// A refused file-backed key/value cache ([`KvState::with_file`]).
+#[derive(Debug)]
+pub enum KvInitError {
+    /// The geometry the cache was asked for is not a cache geometry.
+    Geometry(AttnError),
+    /// The cache file could not be created, allocated or mapped.
+    File(KvFileError),
+}
+
+impl core::fmt::Display for KvInitError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Geometry(e) => write!(f, "kv geometry: {e:?}"),
+            Self::File(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for KvInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Geometry(_) => None,
+            Self::File(e) => Some(e),
+        }
+    }
+}
+
+impl From<AttnError> for KvInitError {
+    fn from(e: AttnError) -> Self {
+        Self::Geometry(e)
+    }
+}
+
+impl From<KvFileError> for KvInitError {
+    fn from(e: KvFileError) -> Self {
+        Self::File(e)
+    }
+}
+
+/// The geometry guard chain shared by the owned and file-backed constructors: the zero and
+/// divisibility guards, the `fixed_rsqrt` window, and the checked per-layer plane length. Returns
+/// the plane length in elements and the load-time score scale.
+///
+/// # Errors
+///
+/// [`AttnError::BadGeometry`], [`AttnError::ScaleOutOfRange`] and [`AttnError::Overflow`], in that
+/// order, exactly as [`KvState::with_carrier`] has always refused.
+///
+/// # Complexity
+///
+/// `O(1)` checked arithmetic.
+fn checked_geometry(
+    n_layer: usize,
+    n_head: usize,
+    n_head_kv: usize,
+    head_dim: usize,
+    cap: usize,
+) -> Result<(usize, i64), AttnError> {
+    if n_layer == 0 || n_head == 0 || n_head_kv == 0 || head_dim == 0 || cap == 0 {
+        return Err(AttnError::BadGeometry);
+    }
+    if !n_head.is_multiple_of(n_head_kv) {
+        return Err(AttnError::BadGeometry);
+    }
+    // `head_dim` widened after an explicit range check: `i64::try_from` emits an unmodeled
+    // external the fail-closed extraction audit rejects. The check is exact on 64-bit, where
+    // `head_dim as i64` is negative exactly when `head_dim > i64::MAX`.
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "the `hd_i64 < 0` check immediately above the cast is the range guard; the \
+                  cast is exact for every value it admits"
+    )]
+    let hd_signed = head_dim as i64;
+    if hd_signed < 0 {
+        return Err(AttnError::ScaleOutOfRange);
+    }
+    // `checked_shl` is unmodeled; `head_dim · 2^FIXED_FRAC_BITS` is the same radicand and
+    // overflows `i64` on exactly the inputs the shift rejects.
+    let radicand = hd_signed
+        .checked_mul(ONE)
+        .ok_or(AttnError::ScaleOutOfRange)?;
+    let scale = fixed_rsqrt(radicand).map_err(|_| AttnError::ScaleOutOfRange)?;
+    // `Option::and_then` is unmodeled; the nested match is the same checked product.
+    let plane = match n_head_kv.checked_mul(cap) {
+        Some(x) => match x.checked_mul(head_dim) {
+            Some(plane) => plane,
+            None => return Err(AttnError::Overflow),
+        },
+        None => return Err(AttnError::Overflow),
+    };
+    Ok((plane, scale))
+}
+
+/// The byte offsets of the `(key, value)` planes of `layer` in a cache file whose planes are each
+/// `plane_bytes` wide, key then value per layer.
+fn plane_offsets(plane_bytes: usize, layer: usize) -> Option<(usize, usize)> {
+    let k = plane_bytes.checked_mul(layer.checked_mul(2)?)?;
+    let v = k.checked_add(plane_bytes)?;
+    Some((k, v))
 }
 
 /// The single-token key/value cache of port-map row 5: one flat Q32.32 or binary32 plane per layer.
@@ -131,9 +319,14 @@ fn alloc_f32_storage(plane: usize, n_layer: usize) -> KvStorage {
 /// (GQA). [`KvState::append`] writes a whole token's KV rows at the next position of a layer and
 /// returns that position; [`KvState::attn_head`] reads one query head over the causal prefix
 /// `0..=pos`.
-#[derive(Debug, Clone)]
+///
+/// The planes are owned vectors ([`KvState::new`]) or ranges of one writable cache file
+/// ([`KvState::with_file`]). The file backing changes where the words live, not the words: every
+/// read and write below is shared, and a clone materialises the planes into owned memory so two
+/// writable states never share the file.
+#[derive(Debug)]
 pub struct KvState {
-    carrier: Carrier,
+    carrier: KvCarrier,
     n_layer: usize,
     n_head: usize,
     n_head_kv: usize,
@@ -142,6 +335,33 @@ pub struct KvState {
     scale: i64,
     occupied: Vec<usize>,
     storage: KvStorage,
+    /// The cache file shared by every mapped plane, or `None` for an owned state.
+    map: Option<Arc<KvMap>>,
+    /// The exact-on-certificate block summaries, or `None` for the full-scan read.
+    blocks: Option<cert::KvBlockIndex>,
+}
+
+impl Clone for KvState {
+    /// A cloned state owns its planes.
+    ///
+    /// A mapped plane is copied into an owned vector, so the clone and the original never share a
+    /// writable mapping and the clone cannot overwrite the file the original reads. The prefix
+    /// cache is the only clone site; the serving path never clones a file-backed state.
+    fn clone(&self) -> Self {
+        Self {
+            carrier: self.carrier,
+            n_layer: self.n_layer,
+            n_head: self.n_head,
+            n_head_kv: self.n_head_kv,
+            head_dim: self.head_dim,
+            cap: self.cap,
+            scale: self.scale,
+            occupied: self.occupied.clone(),
+            storage: self.storage.clone(),
+            map: None,
+            blocks: self.blocks.clone(),
+        }
+    }
 }
 
 /// The Q32.32 position-major value of `(s, kvh, i)` in a layer's key or value plane.
@@ -569,7 +789,7 @@ impl KvState {
         let mut scores: Vec<i64> = Vec::with_capacity(slots);
         let kplane = match &self.storage {
             KvStorage::Q32 { k, .. } => &k[layer],
-            KvStorage::F32 { .. } => return Err(AttnError::BadGeometry),
+            KvStorage::F32 { .. } | KvStorage::I8 { .. } => return Err(AttnError::BadGeometry),
         };
         let mut s = 0usize;
         let mut ok = true;
@@ -612,7 +832,7 @@ impl KvState {
         let kv = self.n_head_kv;
         let vplane = match &self.storage {
             KvStorage::Q32 { v, .. } => &v[layer],
-            KvStorage::F32 { .. } => return Err(AttnError::BadGeometry),
+            KvStorage::F32 { .. } | KvStorage::I8 { .. } => return Err(AttnError::BadGeometry),
         };
         let mut den: i128 = 0;
         let mut num: Vec<i128> = vec![0i128; hd];
@@ -715,7 +935,11 @@ impl KvState {
         if tile == 0 {
             return Err(AttnError::BadGeometry);
         }
-        if self.carrier == Carrier::F32 {
+        if self.carrier == KvCarrier::I8 {
+            // The int8 carrier has one read and no tile; the per-head call is its one-slot case.
+            return self.attn_head(layer, q_head, q, pos, out);
+        }
+        if self.carrier == KvCarrier::F32 {
             return self.attn_head_f32(layer, q_head, q, pos, out);
         }
         if out.len() != self.head_dim {
@@ -774,69 +998,47 @@ impl KvState {
             n_head_kv,
             head_dim,
             cap,
-            carrier_from_env(),
+            kv_carrier_from_env(),
         )
     }
 
-    /// Allocate a zeroed cache with an explicitly specified numerical [`Carrier`].
+    /// Allocate a zeroed cache with an explicitly specified [`KvCarrier`].
     ///
-    /// Under [`Carrier::Q32`], allocates Q32.32 `i64` planes. Under [`Carrier::F32`], allocates
-    /// native binary32 `f32` planes (50% memory footprint, zero per-call float conversion).
+    /// Under [`KvCarrier::Q32`], allocates Q32.32 `i64` planes. Under [`KvCarrier::F32`],
+    /// allocates native binary32 `f32` planes (50% memory footprint, zero per-call float
+    /// conversion). Under [`KvCarrier::I8`], allocates signed code planes and one binary32 scale
+    /// per `(kv_head, position)`.
     ///
     /// # Errors
     ///
-    /// Same geometry and range refusals as [`KvState::new`].
+    /// Same geometry and range refusals as [`KvState::new`]; [`KvCarrier::I8`] adds the per-row
+    /// scale plane to the checked product.
     ///
-    /// Every geometry and range guard is decided before the first allocation; the carrier's
-    /// binary32 allocation is the single operation behind [`alloc_f32_storage`].
+    /// # Complexity
+    ///
+    /// `O(n_layer · n_head_kv · cap · head_dim)` time and space for the Q32.32 and binary32
+    /// carriers, and `O(n_layer · n_head_kv · cap · (head_dim + 2))` for the int8 carrier.
     pub(crate) fn with_carrier(
         n_layer: usize,
         n_head: usize,
         n_head_kv: usize,
         head_dim: usize,
         cap: usize,
-        carrier: Carrier,
+        carrier: KvCarrier,
     ) -> Result<KvState, AttnError> {
-        if n_layer == 0 || n_head == 0 || n_head_kv == 0 || head_dim == 0 || cap == 0 {
-            return Err(AttnError::BadGeometry);
-        }
-        if !n_head.is_multiple_of(n_head_kv) {
-            return Err(AttnError::BadGeometry);
-        }
-        // `head_dim` widened after an explicit range check: `i64::try_from` emits an unmodeled
-        // external the fail-closed extraction audit rejects. The check is exact on 64-bit, where
-        // `head_dim as i64` is negative exactly when `head_dim > i64::MAX`.
-        #[allow(
-            clippy::cast_possible_wrap,
-            reason = "the `hd_i64 < 0` check immediately above the cast is the range guard; the \
-                      cast is exact for every value it admits"
-        )]
-        let hd_signed = head_dim as i64;
-        if hd_signed < 0 {
-            return Err(AttnError::ScaleOutOfRange);
-        }
-        // `checked_shl` is unmodeled; `head_dim · 2^FIXED_FRAC_BITS` is the same radicand and
-        // overflows `i64` on exactly the inputs the shift rejects.
-        let radicand = hd_signed
-            .checked_mul(ONE)
-            .ok_or(AttnError::ScaleOutOfRange)?;
-        let scale = fixed_rsqrt(radicand).map_err(|_| AttnError::ScaleOutOfRange)?;
-        // `Option::and_then` is unmodeled; the nested match is the same checked product.
-        let plane = match n_head_kv.checked_mul(cap) {
-            Some(x) => match x.checked_mul(head_dim) {
-                Some(plane) => plane,
-                None => return Err(AttnError::Overflow),
-            },
-            None => return Err(AttnError::Overflow),
-        };
+        let (plane, scale) = checked_geometry(n_layer, n_head, n_head_kv, head_dim, cap)?;
         let storage = match carrier {
-            Carrier::Q32 => {
-                let blank = vec![0i64; plane];
+            KvCarrier::Q32 => {
+                let blank = KvPlane::owned(vec![0i64; plane]);
                 let k = vec![blank.clone(); n_layer];
                 let v = vec![blank; n_layer];
                 KvStorage::Q32 { k, v }
             }
-            Carrier::F32 => alloc_f32_storage(plane, n_layer),
+            KvCarrier::F32 => alloc_f32_storage(plane, n_layer),
+            KvCarrier::I8 => {
+                let rows = n_head_kv.checked_mul(cap).ok_or(AttnError::Overflow)?;
+                alloc_i8_storage(plane, rows, n_layer)
+            }
         };
         Ok(KvState {
             carrier,
@@ -848,17 +1050,200 @@ impl KvState {
             scale,
             occupied: vec![0usize; n_layer],
             storage,
+            map: None,
+            blocks: None,
         })
+    }
+
+    /// Allocate a cache whose planes are disjoint ranges of one writable `MAP_SHARED` cache file.
+    ///
+    /// The file holds the same words an owned cache would: `2 · n_layer` position-major planes of
+    /// `n_head_kv · cap · head_dim` elements, the key plane of layer `0`, its value plane, then
+    /// layer `1`, and so on. It is allocated to its full extent with `posix_fallocate` at creation,
+    /// so a capacity the filesystem cannot hold is refused here with [`KvInitError::File`] instead
+    /// of `SIGBUS` on a later store. The file is a cache: its bytes carry no header and are
+    /// host-endian fixed-point or binary32 words.
+    ///
+    /// # Errors
+    ///
+    /// [`KvInitError::Geometry`] for a geometry [`KvState::with_carrier`] refuses, and
+    /// [`KvInitError::File`] for a refused create, allocation or mapping. A zero-length file is
+    /// never created.
+    ///
+    /// # Complexity
+    ///
+    /// `O(1)` file operations and page-table entries; no plane page is touched until a token is
+    /// appended. The file's `2 · n_layer · plane · size_of::<T>()` bytes are reserved by the
+    /// filesystem, which is what the error path checks.
+    #[cfg(target_os = "linux")]
+    pub fn with_file(
+        path: &str,
+        n_layer: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        cap: usize,
+    ) -> Result<KvState, KvInitError> {
+        Self::with_file_carrier(
+            path,
+            n_layer,
+            n_head,
+            n_head_kv,
+            head_dim,
+            cap,
+            carrier_from_env(),
+        )
+    }
+
+    /// [`KvState::with_file`] with an explicit numerical carrier.
+    ///
+    /// # Errors
+    ///
+    /// As [`KvState::with_file`].
+    ///
+    /// # Complexity
+    ///
+    /// As [`KvState::with_file`].
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_file_carrier(
+        path: &str,
+        n_layer: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        cap: usize,
+        carrier: Carrier,
+    ) -> Result<KvState, KvInitError> {
+        let (plane, scale) = checked_geometry(n_layer, n_head, n_head_kv, head_dim, cap)?;
+        let elem = match carrier {
+            Carrier::Q32 => core::mem::size_of::<i64>(),
+            Carrier::F32 => core::mem::size_of::<F32>(),
+        };
+        let plane_bytes = plane
+            .checked_mul(elem)
+            .ok_or(AttnError::Overflow)
+            .map_err(KvInitError::Geometry)?;
+        let bytes = plane_bytes
+            .checked_mul(n_layer)
+            .and_then(|x| x.checked_mul(2))
+            .ok_or(AttnError::Overflow)
+            .map_err(KvInitError::Geometry)?;
+        let map = Arc::new(KvMap::create(path, bytes)?);
+        let storage = match carrier {
+            Carrier::Q32 => {
+                let mut k = Vec::with_capacity(n_layer);
+                let mut v = Vec::with_capacity(n_layer);
+                let mut layer = 0usize;
+                while layer < n_layer {
+                    let (koff, voff) = plane_offsets(plane_bytes, layer)
+                        .ok_or(AttnError::Overflow)
+                        .map_err(KvInitError::Geometry)?;
+                    k.push(KvPlane::<i64>::mapped(Arc::clone(&map), koff, plane)?);
+                    v.push(KvPlane::<i64>::mapped(Arc::clone(&map), voff, plane)?);
+                    layer += 1;
+                }
+                KvStorage::Q32 { k, v }
+            }
+            Carrier::F32 => {
+                let mut k = Vec::with_capacity(n_layer);
+                let mut v = Vec::with_capacity(n_layer);
+                let mut layer = 0usize;
+                while layer < n_layer {
+                    let (koff, voff) = plane_offsets(plane_bytes, layer)
+                        .ok_or(AttnError::Overflow)
+                        .map_err(KvInitError::Geometry)?;
+                    k.push(KvPlane::<F32>::mapped(Arc::clone(&map), koff, plane)?);
+                    v.push(KvPlane::<F32>::mapped(Arc::clone(&map), voff, plane)?);
+                    layer += 1;
+                }
+                KvStorage::F32 { k, v }
+            }
+        };
+        Ok(KvState {
+            carrier: match carrier {
+                Carrier::Q32 => KvCarrier::Q32,
+                Carrier::F32 => KvCarrier::F32,
+            },
+            n_layer,
+            n_head,
+            n_head_kv,
+            head_dim,
+            cap,
+            scale,
+            occupied: vec![0usize; n_layer],
+            storage,
+            map: Some(map),
+            blocks: None,
+        })
+    }
+
+    /// A file-backed cache on a target without writable mappings refuses.
+    ///
+    /// # Errors
+    ///
+    /// Always [`KvInitError::File`] with [`KvFileError::Unsupported`].
+    #[cfg(not(target_os = "linux"))]
+    pub fn with_file(
+        _path: &str,
+        _n_layer: usize,
+        _n_head: usize,
+        _n_head_kv: usize,
+        _head_dim: usize,
+        _cap: usize,
+    ) -> Result<KvState, KvInitError> {
+        Err(KvInitError::File(KvFileError::Unsupported))
+    }
+
+    /// Write every dirty cache-file page back and wait for the writes; a no-op for an owned cache.
+    ///
+    /// # Errors
+    ///
+    /// The mapping's `msync` refusal.
+    ///
+    /// # Complexity
+    ///
+    /// `O(dirty pages)` I/O; one `msync` call.
+    pub fn sync_file(&self) -> Result<(), KvFileError> {
+        match &self.map {
+            Some(map) => map.sync(),
+            None => Ok(()),
+        }
+    }
+
+    /// The cache file's byte length, or `None` for an owned cache.
+    #[must_use]
+    pub fn file_bytes(&self) -> Option<usize> {
+        self.map.as_ref().map(|m| m.len())
+    }
+
+    /// The fewest occupied positions across the store's layers. A snapshot may be filed under a
+    /// prompt of this length or shorter; a longer prompt would resume at a layer's short offset.
+    pub(crate) fn min_occupied(&self) -> Result<usize, AttnError> {
+        let mut m = usize::MAX;
+        for l in 0..self.n_layer {
+            m = m.min(self.occupied(l)?);
+        }
+        Ok(m)
     }
 
     /// The numerical carrier for this key/value cache.
     #[must_use]
-    #[allow(
-        dead_code,
-        reason = "public-in-crate accessor for the resolved carrier"
-    )]
-    pub(crate) fn carrier(&self) -> Carrier {
+    pub(crate) fn carrier(&self) -> KvCarrier {
         self.carrier
+    }
+
+    /// The resident bytes of one position across every layer and both K and V planes, in this
+    /// state's carrier. `I8` adds its one `f32` scale per row per plane. The prefix cache charges
+    /// `bytes_per_position() × cap()` per snapshot, and `serve` uses it to decide whether a pinned
+    /// capacity fits a byte budget.
+    #[must_use]
+    pub fn bytes_per_position(&self) -> usize {
+        let values = 2 * self.n_head_kv * self.head_dim * self.n_layer;
+        match self.carrier() {
+            KvCarrier::Q32 => values * 8,
+            KvCarrier::F32 => values * 4,
+            KvCarrier::I8 => values + 2 * self.n_head_kv * self.n_layer * 4,
+        }
     }
 
     /// The configured layer count.
@@ -1010,9 +1395,151 @@ impl KvState {
                     return Err(AttnError::Overflow);
                 }
             }
+            // One quantisation per KV head and per K/V row: each row has its own scale, and the
+            // codes are written KV-head-major so the group read sees one contiguous run. The
+            // cursors advance by whole-head strides, so the loop body holds no checked index
+            // product and no early return.
+            KvStorage::I8 { k, v, ks, vs } => {
+                let hd = self.head_dim;
+                let cap = self.cap;
+                let kv = self.n_head_kv;
+                let head_stride = cap.checked_mul(hd).ok_or(AttnError::Overflow)?;
+                let mut at = pos.checked_mul(hd).ok_or(AttnError::Overflow)?;
+                let mut s_at = pos;
+                let (k_plane, v_plane) = (&mut k[layer], &mut v[layer]);
+                let (k_scales, v_scales) = (&mut ks[layer], &mut vs[layer]);
+                let mut row = 0usize;
+                let mut h = 0usize;
+                let mut err: Option<AttnError> = None;
+                while h < kv && err.is_none() {
+                    let row_end = row + hd;
+                    let at_end = at + hd;
+                    match i8::quantise_row(&k_rows[row..row_end], &mut k_plane[at..at_end]) {
+                        Ok(s) => k_scales[s_at] = s,
+                        Err(e) => err = Some(e),
+                    }
+                    if err.is_none() {
+                        match i8::quantise_row(&v_rows[row..row_end], &mut v_plane[at..at_end]) {
+                            Ok(s) => v_scales[s_at] = s,
+                            Err(e) => err = Some(e),
+                        }
+                    }
+                    row += hd;
+                    at += head_stride;
+                    s_at += cap;
+                    h += 1;
+                }
+                if let Some(e) = err {
+                    return Err(e);
+                }
+            }
         }
         self.occupied[layer] = pos.checked_add(1).ok_or(AttnError::Overflow)?;
+        let len = self.occupied[layer];
+        self.seal_completed_block(layer, len)?;
         Ok(pos)
+    }
+
+    /// Seal the block summary of `layer` when `len` positions complete one.
+    ///
+    /// Called by [`KvState::append`] after the position counter advances. A block is sealed once,
+    /// when its last position is written; the summary is a pure function of the key plane's
+    /// `0..len` rows, so a sealed block is never revisited unless a truncation drops it.
+    ///
+    /// # Complexity
+    ///
+    /// `O(1)` when no block completes. At a boundary, `O(n_head_kv · block · head_dim)` additions
+    /// and comparisons: one mean pass and one deviation pass over the completed block for each KV
+    /// head, so the amortised cost is `O(n_head_kv · head_dim)` per appended token.
+    fn seal_completed_block(&mut self, layer: usize, len: usize) -> Result<(), AttnError> {
+        let block = match &self.blocks {
+            Some(idx) => idx.block(),
+            None => return Ok(()),
+        };
+        if block == 0 || !len.is_multiple_of(block) {
+            return Ok(());
+        }
+        let index = len / block;
+        let kplane: &[i64] = match &self.storage {
+            KvStorage::Q32 { k, .. } => &k[layer],
+            // The block index is Q32-only (`enable_block_index` refuses the other carriers), so
+            // neither arm is reachable with `blocks` set.
+            KvStorage::F32 { .. } | KvStorage::I8 { .. } => return Ok(()),
+        };
+        if let Some(idx) = self.blocks.as_mut() {
+            idx.seal(
+                layer,
+                kplane,
+                index.checked_sub(1).ok_or(AttnError::Overflow)?,
+            );
+        }
+        Ok(())
+    }
+
+    /// Build the exact-on-certificate block index over the positions already appended, in blocks of
+    /// `block` positions, and use it for every later [`KvState::attn_head`].
+    ///
+    /// The index stores, for each `(layer, kv_head, block)`, the rounded component mean `μ` of the
+    /// block's keys and the largest `radius = Σ_i |k_{j,i} − μ_i|` over the block. For any query
+    /// `q`, `|q·k_j − q·μ| ≤ max_i |q_i| · radius`, which bounds the block's exact score in both
+    /// directions ([`KvState::attn_head_certified`]). The summaries are rebuilt for every completed
+    /// block; a partial trailing block is not summarised and is always scanned.
+    ///
+    /// # Errors
+    ///
+    /// [`AttnError::BadGeometry`] for `block == 0` or an `F32` carrier, and the geometry refusals
+    /// the state already passed.
+    ///
+    /// # Complexity
+    ///
+    /// `O(n_layer · n_head_kv · occupied · head_dim)` time to rebuild, and
+    /// `n_layer · n_head_kv · ⌈occupied/block⌉ · head_dim · 8` bytes plus the radii: one `head_dim`
+    /// mean per block. `block == 1` is the full index (never useful); `block >= occupied` is empty.
+    pub fn enable_block_index(&mut self, block: usize) -> Result<(), AttnError> {
+        if block == 0 || self.carrier != KvCarrier::Q32 {
+            return Err(AttnError::BadGeometry);
+        }
+        let mut index = cert::KvBlockIndex::new(self.n_layer, self.n_head_kv, self.head_dim, block);
+        match &self.storage {
+            KvStorage::Q32 { k, .. } => {
+                let mut layer = 0usize;
+                while layer < self.n_layer {
+                    index.rebuild_layer(layer, &k[layer], self.occupied[layer]);
+                    layer += 1;
+                }
+            }
+            KvStorage::F32 { .. } | KvStorage::I8 { .. } => return Err(AttnError::BadGeometry),
+        }
+        self.blocks = Some(index);
+        Ok(())
+    }
+
+    /// Drop the block index, restoring the full-scan read.
+    pub fn disable_block_index(&mut self) {
+        self.blocks = None;
+    }
+
+    /// Whether a block index is installed.
+    #[must_use]
+    pub fn has_block_index(&self) -> bool {
+        self.blocks.is_some()
+    }
+
+    /// The running [`CertStats`] of every certified read through the installed index, or `None`
+    /// when no index is installed.
+    ///
+    /// The counters accumulate over the state's lifetime; [`KvState::reset_cert_stats`] clears
+    /// them (for example at the start of one served request).
+    #[must_use]
+    pub fn cert_stats(&self) -> Option<CertStats> {
+        self.blocks.as_ref().map(cert::KvBlockIndex::totals)
+    }
+
+    /// Clear the running certificate counters, leaving the summaries in place.
+    pub fn reset_cert_stats(&mut self) {
+        if let Some(index) = self.blocks.as_mut() {
+            index.reset_totals();
+        }
     }
 
     /// Read one query head at position `pos` over the causal prefix `0..=pos`.
@@ -1058,8 +1585,13 @@ impl KvState {
         pos: usize,
         out: &mut [i64],
     ) -> Result<(), AttnError> {
-        if self.carrier == Carrier::F32 {
+        if self.carrier == KvCarrier::F32 {
             return self.attn_head_f32(layer, q_head, q, pos, out);
+        }
+        if self.blocks.is_some() {
+            // The certified read returns the same words as the full scan below (the skipped
+            // blocks' `fixed_exp` words are exactly zero), so the caller sees one read.
+            return self.attn_head_certified(layer, q_head, q, pos, out, &mut CertStats::default());
         }
         let hd = self.head_dim;
         if layer >= self.n_layer {
@@ -1090,12 +1622,17 @@ impl KvState {
         if pos >= len {
             return Err(AttnError::PositionOutOfRange { pos, len });
         }
-        let (kplane, vplane) = match &self.storage {
-            KvStorage::Q32 { k, v } => (&k[layer], &v[layer]),
-            KvStorage::F32 { .. } => return Err(AttnError::BadGeometry),
-        };
         let group = self.n_head / self.n_head_kv;
         let kvh = q_head / group;
+        if self.carrier == KvCarrier::I8 {
+            // The per-head read is the group read with one slot: the same codes, the same
+            // binary32 arithmetic and the same Q32.32 readout conversion.
+            return self.attn_head_group_i8(layer, kvh, q, pos, out, 1, hd);
+        }
+        let (kplane, vplane) = match &self.storage {
+            KvStorage::Q32 { k, v } => (&k[layer], &v[layer]),
+            KvStorage::F32 { .. } | KvStorage::I8 { .. } => return Err(AttnError::BadGeometry),
+        };
         let kv = self.n_head_kv;
         let slots = pos.checked_add(1).ok_or(AttnError::Overflow)?;
         // The position-major row `(s·kv + kvh)·hd` is the hoisted `first + s·stride`; the guards
@@ -1262,6 +1799,332 @@ impl KvState {
         Ok(())
     }
 
+    /// The exact-on-certificate read: [`KvState::attn_head`]'s words, with blocks whose score
+    /// upper bound is provably below the survivor maximum removed from every pass.
+    ///
+    /// Let `ub_b` be [`cert::KvBlockIndex::bounds`]' upper bound for block `b`, `mx_lb` the largest
+    /// lower bound over the summarised blocks, and `limit = mx_lb - 16·ONE`. A block with
+    /// `ub_b < limit` has every score below `limit`, and the block attaining `mx_lb` is never
+    /// skipped (`ub >= mx_lb > limit`), so the maximum over the scanned blocks is at least `mx_lb`
+    /// and every skipped score is more than `16·ONE` below it. [`exp_at`] therefore returns exactly
+    /// `0` for every skipped key, its weight is `0`, and every skipped term is exactly `0` in the
+    /// `i128` sums: the output is bit-identical to the full scan.
+    ///
+    /// # Errors
+    ///
+    /// The [`KvState::attn_head`] guard chain, [`AttnError::BadGeometry`] when no index is
+    /// installed, and the same overflow refusals. `stats` is filled on `Ok` and unspecified on
+    /// `Err`.
+    ///
+    /// # Complexity
+    ///
+    /// `O(n_blocks · head_dim)` to bound every block, then
+    /// `O(scanned_positions · head_dim)` for the scores, exponentials and value fold. With
+    /// `B`-position blocks the bound pass is `1/B` of the full score pass; a skipped block saves
+    /// its keys' and values' reads.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the three passes of the read, each with the fragment's flag loop; splitting them \
+                  would copy the block cursor and bounds into every pass"
+    )]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the `as i64` narrowing is range-checked against i128::from(i64::MAX)/i64::MIN \
+                  immediately before it; `i64::try_from` emits an unmodeled external the fail-closed \
+                  extraction audit rejects"
+    )]
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "`q`/`k`/`v` and the block cursor `b` are the names of the full scan this read \
+                  reproduces word for word"
+    )]
+    #[allow(
+        clippy::manual_let_else,
+        reason = "`src/engine/attn.rs` is extraction source: the pinned Charon frontend models the \
+                  `match ... None => return` form, not `let ... else`"
+    )]
+    pub fn attn_head_certified(
+        &self,
+        layer: usize,
+        q_head: usize,
+        q: &[i64],
+        pos: usize,
+        out: &mut [i64],
+        stats: &mut CertStats,
+    ) -> Result<(), AttnError> {
+        let hd = self.head_dim;
+        if layer >= self.n_layer {
+            return Err(AttnError::LayerOutOfRange {
+                layer,
+                n_layer: self.n_layer,
+            });
+        }
+        if q_head >= self.n_head {
+            return Err(AttnError::HeadOutOfRange {
+                head: q_head,
+                n_head: self.n_head,
+            });
+        }
+        if q.len() != hd {
+            return Err(AttnError::RowLength {
+                expected: hd,
+                got: q.len(),
+            });
+        }
+        if out.len() != hd {
+            return Err(AttnError::RowLength {
+                expected: hd,
+                got: out.len(),
+            });
+        }
+        let len = self.occupied[layer];
+        if pos >= len {
+            return Err(AttnError::PositionOutOfRange { pos, len });
+        }
+        let (kplane, vplane) = match &self.storage {
+            KvStorage::Q32 { k, v } => (&k[layer], &v[layer]),
+            KvStorage::F32 { .. } | KvStorage::I8 { .. } => return Err(AttnError::BadGeometry),
+        };
+        let index = match &self.blocks {
+            Some(i) => i,
+            None => return Err(AttnError::BadGeometry),
+        };
+        let group = self.n_head / self.n_head_kv;
+        let kvh = q_head / group;
+        let kv = self.n_head_kv;
+        let stride = kv.checked_mul(hd).ok_or(AttnError::Overflow)?;
+        let first = kvh.checked_mul(hd).ok_or(AttnError::Overflow)?;
+        let block = index.block();
+        if block == 0 {
+            return Err(AttnError::BadGeometry);
+        }
+        let slots = pos.checked_add(1).ok_or(AttnError::Overflow)?;
+        let nb = slots.div_ceil(block);
+
+        // The bound pass: one `head_dim` dot per block, not per position. `None` is a block with
+        // no summary (the partial tail) and is always scanned.
+        let mut bnds: Vec<Option<(i64, i64)>> = Vec::with_capacity(nb);
+        let mut mx_lb = i64::MIN;
+        let mut any = false;
+        let mut b = 0usize;
+        while b < nb {
+            let bound = index.bounds(layer, kvh, b, len, q, self.scale);
+            if let Some((lb, _)) = bound {
+                any = true;
+                if lb > mx_lb {
+                    mx_lb = lb;
+                }
+            }
+            bnds.push(bound);
+            b += 1;
+        }
+        let mut limit = i64::MIN;
+        if any {
+            if let Some(v) = mx_lb.checked_sub(16 * ONE) {
+                limit = v;
+            }
+        }
+        let mut skip_blocks = 0u64;
+        let mut scanned_blocks = 0u64;
+        let mut skipped_positions = 0u64;
+        let mut skip: Vec<bool> = Vec::with_capacity(nb);
+        b = 0usize;
+        while b < nb {
+            let s0 = block.checked_mul(b).ok_or(AttnError::Overflow)?;
+            let s1 = core::cmp::min(s0.checked_add(block).ok_or(AttnError::Overflow)?, slots);
+            let positions = u64::try_from(s1 - s0).map_err(|_| AttnError::Overflow)?;
+            let skippable = match bnds[b] {
+                Some((_, ub)) => ub < limit,
+                None => false,
+            };
+            skip.push(skippable);
+            if skippable {
+                skip_blocks = skip_blocks.checked_add(1).ok_or(AttnError::Overflow)?;
+                skipped_positions = skipped_positions
+                    .checked_add(positions)
+                    .ok_or(AttnError::Overflow)?;
+            } else {
+                scanned_blocks = scanned_blocks.checked_add(1).ok_or(AttnError::Overflow)?;
+            }
+            b += 1;
+        }
+
+        // Scores over the scanned blocks only, in ascending position order.
+        let mut scores: Vec<i64> = Vec::with_capacity(slots);
+        let mut mx = i64::MIN;
+        let mut ok = true;
+        let mut err: Option<AttnError> = None;
+        b = 0usize;
+        while b < nb && ok {
+            if skip[b] {
+                b += 1;
+            } else {
+                let s0 = block.checked_mul(b).ok_or(AttnError::Overflow)?;
+                let s1 = core::cmp::min(s0.checked_add(block).ok_or(AttnError::Overflow)?, slots);
+                let mut s = s0;
+                while s < s1 && ok {
+                    let base = first + s * stride;
+                    if base > kplane.len().saturating_sub(hd) {
+                        err = Some(AttnError::Overflow);
+                        ok = false;
+                    } else {
+                        let end = base + hd;
+                        if let Ok(raw) = row_dot_fixed(&kplane[base..end], q) {
+                            if let Some(prod) = i128::from(raw).checked_mul(i128::from(self.scale))
+                            {
+                                let rounded = round_shift_32(prod);
+                                if rounded > i128::from(i64::MAX) || rounded < i128::from(i64::MIN)
+                                {
+                                    err = Some(AttnError::Overflow);
+                                    ok = false;
+                                } else {
+                                    let score = rounded as i64;
+                                    if score > mx {
+                                        mx = score;
+                                    }
+                                    scores.push(score);
+                                }
+                            } else {
+                                err = Some(AttnError::Overflow);
+                                ok = false;
+                            }
+                        } else {
+                            err = Some(AttnError::Overflow);
+                            ok = false;
+                        }
+                    }
+                    s += 1;
+                }
+                b += 1;
+            }
+        }
+        if let Some(e) = err {
+            return Err(e);
+        }
+
+        // Softmax over the scanned blocks. A skipped block's shifted score is below `-16·ONE`,
+        // so its `exp_at` word is exactly zero and it adds nothing to the exact total.
+        let mut exps: Vec<i64> = Vec::with_capacity(scores.len());
+        let mut total: i128 = 0;
+        let mut cursor = 0usize;
+        b = 0usize;
+        while b < nb && ok {
+            if skip[b] {
+                b += 1;
+            } else {
+                let s0 = block.checked_mul(b).ok_or(AttnError::Overflow)?;
+                let s1 = core::cmp::min(s0.checked_add(block).ok_or(AttnError::Overflow)?, slots);
+                let mut s = s0;
+                while s < s1 && ok {
+                    match exp_at(scores[cursor], mx) {
+                        Ok(e) => {
+                            if let Some(t) = total.checked_add(i128::from(e)) {
+                                total = t;
+                                exps.push(e);
+                            } else {
+                                err = Some(AttnError::Overflow);
+                                ok = false;
+                            }
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            ok = false;
+                        }
+                    }
+                    s += 1;
+                    cursor += 1;
+                }
+                b += 1;
+            }
+        }
+        if let Some(e) = err {
+            return Err(e);
+        }
+        if total <= 0 {
+            return Err(AttnError::ZeroSum);
+        }
+
+        // Output over the scanned blocks: the same weight per surviving key and the same checked
+        // `i128` per-component sums, in the same ascending key order.
+        let recip = recip_u64(total);
+        let mut acc: Vec<i128> = vec![0i128; hd];
+        cursor = 0;
+        b = 0usize;
+        while b < nb && ok {
+            if skip[b] {
+                b += 1;
+            } else {
+                let s0 = block.checked_mul(b).ok_or(AttnError::Overflow)?;
+                let s1 = core::cmp::min(s0.checked_add(block).ok_or(AttnError::Overflow)?, slots);
+                let mut s = s0;
+                while s < s1 && ok {
+                    let w = match recip {
+                        Some(r) => weight_at_recip(exps[cursor], total, r),
+                        None => weight_at(exps[cursor], total),
+                    };
+                    match w {
+                        Ok(weight) => {
+                            let base = first + s * stride;
+                            if base > vplane.len().saturating_sub(hd) {
+                                err = Some(AttnError::Overflow);
+                                ok = false;
+                            } else {
+                                let end = base + hd;
+                                let row = &vplane[base..end];
+                                let w = i128::from(weight);
+                                let mut i = 0usize;
+                                while i < hd && ok {
+                                    if let Some(term) = w.checked_mul(i128::from(row[i])) {
+                                        if let Some(next) = acc[i].checked_add(term) {
+                                            acc[i] = next;
+                                        } else {
+                                            err = Some(AttnError::Overflow);
+                                            ok = false;
+                                        }
+                                    } else {
+                                        err = Some(AttnError::Overflow);
+                                        ok = false;
+                                    }
+                                    i += 1;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            ok = false;
+                        }
+                    }
+                    s += 1;
+                    cursor += 1;
+                }
+                b += 1;
+            }
+        }
+        if let Some(e) = err {
+            return Err(e);
+        }
+        let mut i = 0usize;
+        while i < hd && ok {
+            let rounded = round_shift_32(acc[i]);
+            if rounded > i128::from(i64::MAX) || rounded < i128::from(i64::MIN) {
+                err = Some(AttnError::Overflow);
+                ok = false;
+            } else {
+                out[i] = rounded as i64;
+            }
+            i += 1;
+        }
+        if let Some(e) = err {
+            return Err(e);
+        }
+        stats.blocks = u64::try_from(nb).map_err(|_| AttnError::Overflow)?;
+        stats.scanned = scanned_blocks;
+        stats.skipped = skip_blocks;
+        stats.skipped_positions = skipped_positions;
+        index.add_read(stats);
+        Ok(())
+    }
+
     /// Read one query head at position `pos` over the causal prefix `0..=pos` in binary32 (f32).
     ///
     /// Reads slices directly from the native binary32 KV cache with zero per-call float conversion,
@@ -1332,7 +2195,9 @@ impl KvState {
 
         let (kplane, vplane) = match &self.storage {
             KvStorage::F32 { k, v } => (&k[layer], &v[layer]),
-            KvStorage::Q32 { .. } => return Err(AttnError::BadGeometry),
+            KvStorage::Q32 { .. } | KvStorage::I8 { .. } => {
+                return Err(AttnError::BadGeometry);
+            }
         };
 
         let last_base = first + pos * stride;
@@ -1447,6 +2312,416 @@ impl KvState {
         Ok(())
     }
 
+    /// Attend every query head of one KV head over the causal prefix `0..=pos`.
+    ///
+    /// `queries` holds the `group = n_head / n_head_kv` query rows of KV head `kv_head`, each
+    /// `head_dim` Q32.32 words, query head `kv_head · group + g` in slot `g`; `outs` receives the
+    /// same layout. Under [`KvCarrier::Q32`] and [`KvCarrier::F32`] row `g` is read by
+    /// [`KvState::attn_head`] when `tile` is zero and by [`KvState::attn_head_fused`] otherwise,
+    /// with the arguments the per-query-head dispatch passed, in ascending `g`: the words are
+    /// bit-identical to that dispatch. Under [`KvCarrier::I8`] one call reads each K and V row
+    /// once and folds all `group` slots against it (`tile` is ignored: the int8 carrier has one
+    /// read and no certificate).
+    ///
+    /// # Errors
+    ///
+    /// [`AttnError::HeadOutOfRange`] when `kv_head >= n_head_kv` (its `n_head` field carries the
+    /// KV-head count at this level), [`AttnError::RowLength`] when either slice is not
+    /// `group · head_dim` wide, and the read's own refusals.
+    ///
+    /// # Complexity
+    ///
+    /// `O(group · head_dim · (pos + 1))` words read: the `group` per-head calls it replaces, or
+    /// one pass over the int8 rows with `O(group · head_dim)` scratch.
+    pub fn attn_head_group(
+        &self,
+        layer: usize,
+        kv_head: usize,
+        queries: &[i64],
+        pos: usize,
+        tile: usize,
+        outs: &mut [i64],
+    ) -> Result<(), AttnError> {
+        if kv_head >= self.n_head_kv {
+            return Err(AttnError::HeadOutOfRange {
+                head: kv_head,
+                n_head: self.n_head_kv,
+            });
+        }
+        let group = self.n_head / self.n_head_kv;
+        let width = group
+            .checked_mul(self.head_dim)
+            .ok_or(AttnError::Overflow)?;
+        if queries.len() != width {
+            return Err(AttnError::RowLength {
+                expected: width,
+                got: queries.len(),
+            });
+        }
+        if outs.len() != width {
+            return Err(AttnError::RowLength {
+                expected: width,
+                got: outs.len(),
+            });
+        }
+        if matches!(self.storage, KvStorage::I8 { .. }) {
+            return self.attn_head_group_i8(layer, kv_head, queries, pos, outs, group, width);
+        }
+        let first_head = kv_head.checked_mul(group).ok_or(AttnError::Overflow)?;
+        let mut g = 0usize;
+        while g < group {
+            let lo = g.checked_mul(self.head_dim).ok_or(AttnError::Overflow)?;
+            let hi = lo.checked_add(self.head_dim).ok_or(AttnError::Overflow)?;
+            let head = first_head.checked_add(g).ok_or(AttnError::Overflow)?;
+            let query = &queries[lo..hi];
+            let out = &mut outs[lo..hi];
+            if tile == 0 {
+                self.attn_head(layer, head, query, pos, out)?;
+            } else {
+                self.attn_head_fused(layer, head, query, pos, tile, out)?;
+            }
+            g += 1;
+        }
+        Ok(())
+    }
+
+    /// The [`KvCarrier::F32`] arm of [`KvState::attn_head_group`]: one K/V row read per tile of
+    /// consecutive causal columns instead of one per column.
+    ///
+    /// `queries` holds `nq · group · head_dim` Q32.32 words, column `j`'s `group` query rows in
+    /// slot `j`, and `outs` receives the same layout. Column `j`'s last position is `first + j`, so
+    /// the columns are consecutive and the tile's reads of K and V are shared. The same query
+    /// conversion, the same scale, [`f32_core::attn_core_f32_tile`]'s per-tile rescale and the
+    /// same readout conversion produce words within the per-tile-rescale bound of the per-column
+    /// [`KvState::attn_head_group`] call's; the tests assert that bound.
+    ///
+    /// # Errors
+    ///
+    /// [`AttnError::HeadOutOfRange`], [`AttnError::LayerOutOfRange`],
+    /// [`AttnError::PositionOutOfRange`] when `first + nq - 1` is not occupied,
+    /// [`AttnError::RowLength`] when the slices are not a whole number of `group · head_dim` rows,
+    /// [`AttnError::BadGeometry`] under another carrier, and the tile's own read refusals.
+    ///
+    /// # Complexity
+    ///
+    /// `O((first + nq) · nq · group · head_dim)` arithmetic, against `nq` per-column calls' sum;
+    /// the K and V rows are read once each (`O((first + nq) · head_dim)` words), not once per
+    /// column. Scratch `O(nq · group · head_dim)` words plus the tile's score stage.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the layer, KV head, query tile, first position and output are the call"
+    )]
+    pub fn attn_head_group_tile_f32(
+        &self,
+        layer: usize,
+        kv_head: usize,
+        queries: &[i64],
+        first: usize,
+        outs: &mut [i64],
+    ) -> Result<(), AttnError> {
+        let (hd, group, last) = self.tile_group_shape(layer, kv_head, queries, first, outs)?;
+        let (kplane, vplane) = match &self.storage {
+            KvStorage::F32 { k, v } => (&k[layer], &v[layer]),
+            KvStorage::Q32 { .. } | KvStorage::I8 { .. } => return Err(AttnError::BadGeometry),
+        };
+        let stride = self.n_head_kv.checked_mul(hd).ok_or(AttnError::Overflow)?;
+        let base = kv_head.checked_mul(hd).ok_or(AttnError::Overflow)?;
+        let last_base = base
+            .checked_add(last.checked_mul(stride).ok_or(AttnError::Overflow)?)
+            .ok_or(AttnError::Overflow)?;
+        if last_base > kplane.len().saturating_sub(hd)
+            || last_base > vplane.len().saturating_sub(hd)
+        {
+            return Err(AttnError::Overflow);
+        }
+        let mut qf = vec![F32::ZERO; queries.len()];
+        let mut bad = 0u32;
+        let mut i = 0usize;
+        while i < queries.len() {
+            let f = q32_to_f32(queries[i]);
+            bad += u32::from(!f.is_finite());
+            qf[i] = f;
+            i += 1;
+        }
+        if bad != 0 {
+            return Err(AttnError::Overflow);
+        }
+        let positions: Vec<usize> = (first..=last).collect();
+        let mut of = vec![F32::ZERO; outs.len()];
+        // `hd as i64` is exact: `hd` is a head width, far below 2^53.
+        #[allow(clippy::cast_possible_wrap, reason = "head width < 2^53")]
+        let scale = F32::ONE / F32::from_i64(hd as i64).sqrt();
+        f32_core::attn_core_f32_tile(
+            &qf,
+            &kplane[base..],
+            &vplane[base..],
+            hd,
+            group,
+            stride,
+            &positions,
+            scale,
+            &mut of,
+        )?;
+        let mut i = 0usize;
+        let mut ok = true;
+        let mut err: Option<AttnError> = None;
+        while i < outs.len() && ok {
+            match f32_core::f32_to_q32_checked(of[i]) {
+                Ok(v) => outs[i] = v,
+                Err(e) => {
+                    err = Some(e);
+                    ok = false;
+                }
+            }
+            i += 1;
+        }
+        if let Some(e) = err {
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// The geometry and occupancy checks shared by [`KvState::attn_head_group_tile_f32`] and
+    /// [`KvState::attn_head_group_tile_i8`]: returns `(head_dim, group, last)`.
+    ///
+    /// # Errors
+    ///
+    /// [`AttnError::LayerOutOfRange`], [`AttnError::HeadOutOfRange`],
+    /// [`AttnError::RowLength`] for a query block that is not whole `group · head_dim` rows,
+    /// [`AttnError::PositionOutOfRange`] when the block's last column is not occupied, and
+    /// [`AttnError::Overflow`] for a block whose last column does not fit `usize`.
+    fn tile_group_shape(
+        &self,
+        layer: usize,
+        kv_head: usize,
+        queries: &[i64],
+        first: usize,
+        outs: &[i64],
+    ) -> Result<(usize, usize, usize), AttnError> {
+        let hd = self.head_dim;
+        if layer >= self.n_layer {
+            return Err(AttnError::LayerOutOfRange {
+                layer,
+                n_layer: self.n_layer,
+            });
+        }
+        if kv_head >= self.n_head_kv {
+            return Err(AttnError::HeadOutOfRange {
+                head: kv_head,
+                n_head: self.n_head_kv,
+            });
+        }
+        let group = self.n_head / self.n_head_kv;
+        let width = group.checked_mul(hd).ok_or(AttnError::Overflow)?;
+        if width == 0 || queries.len() != outs.len() || !queries.len().is_multiple_of(width) {
+            return Err(AttnError::RowLength {
+                expected: width,
+                got: queries.len(),
+            });
+        }
+        let nq = queries.len() / width;
+        if nq == 0 {
+            return Err(AttnError::RowLength {
+                expected: width,
+                got: 0,
+            });
+        }
+        let last = first
+            .checked_add(nq)
+            .and_then(|v| v.checked_sub(1))
+            .ok_or(AttnError::Overflow)?;
+        let len = self.occupied[layer];
+        if last >= len {
+            return Err(AttnError::PositionOutOfRange { pos: last, len });
+        }
+        Ok((hd, group, last))
+    }
+
+    /// The [`KvCarrier::I8`] arm of [`KvState::attn_head_group_tile_f32`]: one K/V tile read per
+    /// tile of consecutive causal columns, over signed-8-bit code rows.
+    ///
+    /// The code planes are KV-head-major, so KV head `kv_head`'s rows start at
+    /// `kv_head · cap · head_dim` and row `s` is at `s · head_dim`; the scale planes hold row `s`
+    /// at `kv_head · cap + s`. The query conversion, the scale and the readout conversion match
+    /// the `f32` arm's, and [`f32_core::attn_core_i8_tile`] applies each row's scales in the
+    /// per-column int8 group core's order.
+    ///
+    /// # Errors
+    ///
+    /// As [`KvState::attn_head_group_tile_f32`], and [`AttnError::BadGeometry`] under another
+    /// carrier.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the caller's guards and geometry are the arguments; the arm is one call"
+    )]
+    pub fn attn_head_group_tile_i8(
+        &self,
+        layer: usize,
+        kv_head: usize,
+        queries: &[i64],
+        first: usize,
+        outs: &mut [i64],
+    ) -> Result<(), AttnError> {
+        let (hd, group, last) = self.tile_group_shape(layer, kv_head, queries, first, outs)?;
+        let (k, v, ks, vs) = match &self.storage {
+            KvStorage::I8 { k, v, ks, vs } => (&k[layer], &v[layer], &ks[layer], &vs[layer]),
+            KvStorage::Q32 { .. } | KvStorage::F32 { .. } => return Err(AttnError::BadGeometry),
+        };
+        let cap = self.cap;
+        let head_stride = cap.checked_mul(hd).ok_or(AttnError::Overflow)?;
+        let code_first = kv_head
+            .checked_mul(head_stride)
+            .ok_or(AttnError::Overflow)?;
+        let scale_first = kv_head.checked_mul(cap).ok_or(AttnError::Overflow)?;
+        let rows = last.checked_add(1).ok_or(AttnError::Overflow)?;
+        let count = rows.checked_mul(hd).ok_or(AttnError::Overflow)?;
+        let code_end = code_first.checked_add(count).ok_or(AttnError::Overflow)?;
+        let scale_end = scale_first.checked_add(rows).ok_or(AttnError::Overflow)?;
+        if code_end > k.len() || code_end > v.len() || scale_end > ks.len() || scale_end > vs.len()
+        {
+            return Err(AttnError::Overflow);
+        }
+        let mut qf = vec![F32::ZERO; queries.len()];
+        let mut bad = 0u32;
+        let mut i = 0usize;
+        while i < queries.len() {
+            let f = q32_to_f32(queries[i]);
+            bad += u32::from(!f.is_finite());
+            qf[i] = f;
+            i += 1;
+        }
+        if bad != 0 {
+            return Err(AttnError::Overflow);
+        }
+        let positions: Vec<usize> = (first..=last).collect();
+        let mut of = vec![F32::ZERO; outs.len()];
+        // `hd as i64` is exact: `hd` is a head width, far below 2^53.
+        #[allow(clippy::cast_possible_wrap, reason = "head width < 2^53")]
+        let scale = F32::ONE / F32::from_i64(hd as i64).sqrt();
+        f32_core::attn_core_i8_tile(
+            &qf,
+            &k[code_first..code_end],
+            &v[code_first..code_end],
+            &ks[scale_first..scale_end],
+            &vs[scale_first..scale_end],
+            hd,
+            group,
+            hd,
+            &positions,
+            scale,
+            &mut of,
+        )?;
+        let mut i = 0usize;
+        let mut ok = true;
+        let mut err: Option<AttnError> = None;
+        while i < outs.len() && ok {
+            match f32_core::f32_to_q32_checked(of[i]) {
+                Ok(v) => outs[i] = v,
+                Err(e) => {
+                    err = Some(e);
+                    ok = false;
+                }
+            }
+            i += 1;
+        }
+        if let Some(e) = err {
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// The [`KvCarrier::I8`] arm of [`KvState::attn_head_group`]: one pass over KV head
+    /// `kv_head`'s code rows, all `group` slots folded against each row.
+    ///
+    /// The query words convert to binary32 once, the read runs as binary32 arithmetic on
+    /// `code · scale`, and the result converts back to Q32.32 with the same round-to-nearest and
+    /// the same `Overflow` refusal as [`KvState::attn_head_f32`].
+    ///
+    /// # Complexity
+    ///
+    /// `O(group · head_dim · (pos + 1))` time; `O(group · head_dim)` scratch.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the caller's guards and geometry are the arguments; the arm is one call"
+    )]
+    fn attn_head_group_i8(
+        &self,
+        layer: usize,
+        kv_head: usize,
+        queries: &[i64],
+        pos: usize,
+        outs: &mut [i64],
+        group: usize,
+        width: usize,
+    ) -> Result<(), AttnError> {
+        if layer >= self.n_layer {
+            return Err(AttnError::LayerOutOfRange {
+                layer,
+                n_layer: self.n_layer,
+            });
+        }
+        let len = self.occupied[layer];
+        if pos >= len {
+            return Err(AttnError::PositionOutOfRange { pos, len });
+        }
+        let hd = self.head_dim;
+        let cap = self.cap;
+        let KvStorage::I8 { k, v, ks, vs } = &self.storage else {
+            return Err(AttnError::BadGeometry);
+        };
+        let head_stride = cap.checked_mul(hd).ok_or(AttnError::Overflow)?;
+        let code_first = kv_head
+            .checked_mul(head_stride)
+            .ok_or(AttnError::Overflow)?;
+        let rows = pos.checked_add(1).ok_or(AttnError::Overflow)?;
+        let count = rows.checked_mul(hd).ok_or(AttnError::Overflow)?;
+        let code_end = code_first.checked_add(count).ok_or(AttnError::Overflow)?;
+        let scale_first = kv_head.checked_mul(cap).ok_or(AttnError::Overflow)?;
+        let scale_end = scale_first.checked_add(rows).ok_or(AttnError::Overflow)?;
+
+        let mut qf = vec![F32::ZERO; width];
+        let mut bad = 0u32;
+        let mut i = 0usize;
+        while i < width {
+            let f = q32_to_f32(queries[i]);
+            bad += u32::from(!f.is_finite());
+            qf[i] = f;
+            i += 1;
+        }
+        if bad != 0 {
+            return Err(AttnError::Overflow);
+        }
+        let mut of = vec![F32::ZERO; width];
+        // `hd as i64` is exact: `hd` is a head width, far below 2^53.
+        #[allow(clippy::cast_possible_wrap, reason = "head width < 2^53")]
+        let scale = F32::ONE / F32::from_i64(hd as i64).sqrt();
+        i8::attn_core_i8_group(
+            &qf,
+            group,
+            &k[layer][code_first..code_end],
+            &v[layer][code_first..code_end],
+            &ks[layer][scale_first..scale_end],
+            &vs[layer][scale_first..scale_end],
+            hd,
+            rows,
+            scale,
+            &mut of,
+        )?;
+        let mut i = 0usize;
+        let mut err: Option<AttnError> = None;
+        while i < width && err.is_none() {
+            match f32_core::f32_to_q32_checked(of[i]) {
+                Ok(w) => outs[i] = w,
+                Err(e) => err = Some(e),
+            }
+            i += 1;
+        }
+        if let Some(e) = err {
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Rewind every layer to `m` positions. Causal attention makes the rows at `0..m` independent
     /// of later appends, so the rewound state equals one that stopped at `m`; rows at `m..` stay in
     /// the planes and the next [`KvState::append`] overwrites position `m`.
@@ -1473,6 +2748,11 @@ impl KvState {
             return Err(AttnError::PositionOutOfRange { pos: m, len });
         }
         self.occupied.fill(m);
+        if let Some(idx) = self.blocks.as_mut() {
+            // A block summary covers only a completed block; rewinding into one drops it so the
+            // next append re-seals the block from the rows actually stored.
+            idx.truncate(m);
+        }
         Ok(())
     }
 }
@@ -1510,7 +2790,9 @@ mod tests {
         let kvh = q_head / (kv.n_head / kv_n);
         let (kplane, vplane) = match &kv.storage {
             KvStorage::Q32 { k, v } => (&k[layer], &v[layer]),
-            KvStorage::F32 { .. } => return Err(AttnError::BadGeometry),
+            KvStorage::F32 { .. } | KvStorage::I8 { .. } => {
+                return Err(AttnError::BadGeometry);
+            }
         };
         let slots = pos + 1;
         let mut scores: Vec<i64> = Vec::with_capacity(slots);
@@ -1554,10 +2836,217 @@ mod tests {
     }
 
     #[test]
+    fn attn_head_group_matches_the_per_head_read() {
+        // n_head 4 over n_head_kv 2 is a group of 2; head_dim 8 exercises the vector width. The
+        // group read must return the per-head words for both numeric carriers and for both the
+        // plain and the fused tile read.
+        for carrier in [KvCarrier::Q32, KvCarrier::F32] {
+            let mut kv = KvState::with_carrier(1, 4, 2, 8, 6, carrier).expect("geometry");
+            let mut seed = 0xDEAD_BEEF_1234_5678_u64;
+            let mut s = 0usize;
+            while s < 6 {
+                let k: Vec<i64> = (0..16).map(|_| word(&mut seed)).collect();
+                let v: Vec<i64> = (0..16).map(|_| word(&mut seed)).collect();
+                assert_eq!(kv.append(0, &k, &v), Ok(s));
+                s += 1;
+            }
+            let query: Vec<i64> = (0..32).map(|_| word(&mut seed)).collect();
+            let mut kvh = 0usize;
+            while kvh < 2 {
+                let lo = kvh * 16;
+                let mut got = [0i64; 16];
+                kv.attn_head_group(0, kvh, &query[lo..lo + 16], 5, 0, &mut got)
+                    .expect("group read");
+                let mut g = 0usize;
+                while g < 2 {
+                    let (qlo, glo) = (lo + g * 8, g * 8);
+                    let mut want = [0i64; 8];
+                    kv.attn_head(0, kvh * 2 + g, &query[qlo..qlo + 8], 5, &mut want)
+                        .expect("per-head read");
+                    assert_eq!(
+                        &got[glo..glo + 8],
+                        &want[..],
+                        "carrier {carrier:?}, KV head {kvh}, group slot {g}"
+                    );
+                    g += 1;
+                }
+                // The group passes its tile to every head: the fused group read is the per-head
+                // fused read, which is the per-position path within its documented bound, not
+                // bit-identical to it.
+                if carrier == KvCarrier::Q32 {
+                    let mut fused = [0i64; 16];
+                    kv.attn_head_group(0, kvh, &query[lo..lo + 16], 5, 32, &mut fused)
+                        .expect("fused group read");
+                    let mut g = 0usize;
+                    while g < 2 {
+                        let (qlo, glo) = (lo + g * 8, g * 8);
+                        let mut want = [0i64; 8];
+                        kv.attn_head_fused(0, kvh * 2 + g, &query[qlo..qlo + 8], 5, 32, &mut want)
+                            .expect("fused per-head read");
+                        assert_eq!(
+                            &fused[glo..glo + 8],
+                            &want[..],
+                            "fused carrier Q32, KV head {kvh}, group slot {g}"
+                        );
+                        g += 1;
+                    }
+                }
+                kvh += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn attn_head_group_refuses_a_bad_group_slice() {
+        let kv = KvState::with_carrier(1, 4, 2, 4, 2, KvCarrier::Q32).expect("geometry");
+        let q = [0i64; 8];
+        assert_eq!(
+            kv.attn_head_group(0, 2, &q, 0, 0, &mut [0i64; 8]),
+            Err(AttnError::HeadOutOfRange { head: 2, n_head: 2 })
+        );
+        assert_eq!(
+            kv.attn_head_group(0, 0, &q[..4], 0, 0, &mut [0i64; 8]),
+            Err(AttnError::RowLength {
+                expected: 8,
+                got: 4,
+            })
+        );
+    }
+
+    /// The int8 group read is the per-head read of each of its slots, bit for bit, and the int8
+    /// carrier refuses the Q32-only certificate.
+    #[test]
+    fn i8_group_read_equals_the_per_head_reads() {
+        let (n_head, n_kv, hd) = (4usize, 2usize, 8usize);
+        let mut kv =
+            KvState::with_carrier(1, n_head, n_kv, hd, 6, KvCarrier::I8).expect("geometry");
+        let mut seed = 0xA5A5_5A5A_1234_5678u64;
+        let mut s = 0usize;
+        while s < 6 {
+            let k: Vec<i64> = (0..n_kv * hd).map(|_| word(&mut seed)).collect();
+            let v: Vec<i64> = (0..n_kv * hd).map(|_| word(&mut seed)).collect();
+            assert_eq!(kv.append(0, &k, &v), Ok(s));
+            s += 1;
+        }
+        let query: Vec<i64> = (0..n_head * hd).map(|_| word(&mut seed)).collect();
+        assert!(matches!(kv.storage, KvStorage::I8 { .. }));
+        let width = 2 * hd;
+        let mut kvh = 0usize;
+        while kvh < n_kv {
+            let lo = kvh * width;
+            let mut group = vec![0i64; width];
+            kv.attn_head_group(0, kvh, &query[lo..lo + width], 5, 0, &mut group)
+                .expect("group read");
+            let mut g = 0usize;
+            while g < 2 {
+                let (qlo, glo) = (lo + g * hd, g * hd);
+                let mut head = vec![0i64; hd];
+                kv.attn_head(0, kvh * 2 + g, &query[qlo..qlo + hd], 5, &mut head)
+                    .expect("per-head read");
+                assert_eq!(&group[glo..glo + hd], &head[..], "kv head {kvh} slot {g}");
+                g += 1;
+            }
+            kvh += 1;
+        }
+        assert_eq!(
+            kv.enable_block_index(4),
+            Err(AttnError::BadGeometry),
+            "the block certificate is Q32-only"
+        );
+    }
+
+    /// The int8 read is the causal softmax of the stored codes and scales, checked against an f64
+    /// oracle over the same rows.
+    #[test]
+    fn i8_group_read_matches_a_float_oracle() {
+        let (n_head, n_kv, hd, rows) = (4usize, 2usize, 8usize, 5usize);
+        let mut kv =
+            KvState::with_carrier(1, n_head, n_kv, hd, rows, KvCarrier::I8).expect("geometry");
+        let mut seed = 0x0F1E_2D3C_4B5A_6978u64;
+        let mut s = 0usize;
+        while s < rows {
+            let k: Vec<i64> = (0..n_kv * hd).map(|_| word(&mut seed)).collect();
+            let v: Vec<i64> = (0..n_kv * hd).map(|_| word(&mut seed)).collect();
+            assert_eq!(kv.append(0, &k, &v), Ok(s));
+            s += 1;
+        }
+        let query: Vec<i64> = (0..n_head * hd).map(|_| word(&mut seed)).collect();
+        let (kc, vc, ks, vs) = match &kv.storage {
+            KvStorage::I8 { k, v, ks, vs } => (&k[0], &v[0], &ks[0], &vs[0]),
+            _ => panic!("the state carries the int8 storage"),
+        };
+        let native = |x: &F32| f64::from(f32::from_bits(x.to_bits()));
+        let qf: Vec<f64> = query
+            .iter()
+            .map(|w| f64::from(f32::from_bits(q32_to_f32(*w).to_bits())))
+            .collect();
+        let scale = 1.0f64 / f64::from(u32::try_from(hd).expect("head_dim fits u32")).sqrt();
+        let group = n_head / n_kv;
+        let width = group * hd;
+        let cap = kv.cap;
+        let mut kvh = 0usize;
+        while kvh < n_kv {
+            let lo = kvh * width;
+            let mut got = vec![0i64; width];
+            kv.attn_head_group(0, kvh, &query[lo..lo + width], rows - 1, 0, &mut got)
+                .expect("group read");
+            let mut g = 0usize;
+            while g < group {
+                let qrow = &qf[lo + g * hd..lo + (g + 1) * hd];
+                let mut scores = vec![0.0f64; rows];
+                let mut mx = f64::NEG_INFINITY;
+                let mut s = 0usize;
+                while s < rows {
+                    let row = kvh * cap * hd + s * hd;
+                    let mut dot = 0.0f64;
+                    let mut i = 0usize;
+                    while i < hd {
+                        dot += qrow[i] * f64::from(kc[row + i]);
+                        i += 1;
+                    }
+                    scores[s] = dot * native(&ks[kvh * cap + s]) * scale;
+                    if scores[s] > mx {
+                        mx = scores[s];
+                    }
+                    s += 1;
+                }
+                let mut den = 0.0f64;
+                let mut acc = vec![0.0f64; hd];
+                let mut s = 0usize;
+                while s < rows {
+                    let w = (scores[s] - mx).exp();
+                    let v_scale = native(&vs[kvh * cap + s]);
+                    den += w;
+                    let row = kvh * cap * hd + s * hd;
+                    let mut i = 0usize;
+                    while i < hd {
+                        acc[i] += w * f64::from(vc[row + i]) * v_scale;
+                        i += 1;
+                    }
+                    s += 1;
+                }
+                let mut i = 0usize;
+                while i < hd {
+                    let want = acc[i] / den;
+                    let have = f64::from(f32::from_bits(q32_to_f32(got[g * hd + i]).to_bits()));
+                    let tol = 1e-4 * want.abs().max(1.0);
+                    assert!(
+                        (have - want).abs() <= tol,
+                        "kv head {kvh} slot {g} component {i}: have {have}, want {want}"
+                    );
+                    i += 1;
+                }
+                g += 1;
+            }
+            kvh += 1;
+        }
+    }
+
+    #[test]
     fn attn_head_key_outer_output_matches_component_oracle() {
         // n_head 4 over n_head_kv 2 gives a GQA group of 2; head_dim 3 is neither 1 nor a power of
         // two, so several query heads read distinct KV rows over non-trivial causal prefixes.
-        let mut kv = KvState::with_carrier(1, 4, 2, 3, 6, Carrier::Q32).expect("geometry");
+        let mut kv = KvState::with_carrier(1, 4, 2, 3, 6, KvCarrier::Q32).expect("geometry");
         let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
         let mut s = 0usize;
         while s < 6 {
@@ -1613,8 +3102,8 @@ mod tests {
 
     #[test]
     fn attn_head_f32_carrier_matches_oracle() {
-        let mut kv_q32 = KvState::with_carrier(1, 4, 2, 3, 6, Carrier::Q32).expect("geometry");
-        let mut kv_f32 = KvState::with_carrier(1, 4, 2, 3, 6, Carrier::F32).expect("geometry");
+        let mut kv_q32 = KvState::with_carrier(1, 4, 2, 3, 6, KvCarrier::Q32).expect("geometry");
+        let mut kv_f32 = KvState::with_carrier(1, 4, 2, 3, 6, KvCarrier::F32).expect("geometry");
         let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
         let mut s = 0usize;
         while s < 6 {
@@ -1961,10 +3450,10 @@ mod tests {
 
     #[test]
     fn carrier_explicit_selection() {
-        let kv_q32 = KvState::with_carrier(1, 2, 2, 8, 4, Carrier::Q32).expect("geometry q32");
-        let kv_f32 = KvState::with_carrier(1, 2, 2, 8, 4, Carrier::F32).expect("geometry f32");
-        assert_eq!(kv_q32.carrier(), Carrier::Q32);
-        assert_eq!(kv_f32.carrier(), Carrier::F32);
+        let kv_q32 = KvState::with_carrier(1, 2, 2, 8, 4, KvCarrier::Q32).expect("geometry q32");
+        let kv_f32 = KvState::with_carrier(1, 2, 2, 8, 4, KvCarrier::F32).expect("geometry f32");
+        assert_eq!(kv_q32.carrier(), KvCarrier::Q32);
+        assert_eq!(kv_f32.carrier(), KvCarrier::F32);
         assert!(matches!(kv_q32.storage, KvStorage::Q32 { .. }));
         assert!(matches!(kv_f32.storage, KvStorage::F32 { .. }));
 
@@ -1989,7 +3478,7 @@ mod tests {
 
     #[test]
     fn truncate_and_rollback_hold_for_both_carriers() {
-        for &carrier in &[Carrier::Q32, Carrier::F32] {
+        for &carrier in &[KvCarrier::Q32, KvCarrier::F32] {
             let mut kv = KvState::with_carrier(1, 2, 2, 4, 8, carrier).expect("geometry");
             let mut seed = 0x1234_5678_9ABC_DEF0_u64;
 
@@ -2109,5 +3598,508 @@ mod tests {
             );
             assert_eq!(kv.occupied(0), Ok(5));
         }
+    }
+
+    /// A unique path under the temp dir for a cache-file test.
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        std::env::temp_dir().join(format!(
+            "apeiron-kvstate-{tag}-{}-{nanos}.bin",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn certified_read_equals_full_scan_and_skips_distant_blocks() {
+        let (n_head, n_head_kv, hd, cap, block) = (2usize, 2usize, 4usize, 64usize, 8usize);
+        let mut kv =
+            KvState::with_carrier(1, n_head, n_head_kv, hd, cap, KvCarrier::Q32).expect("geometry");
+        let mut seed = 0x05EE_D0FA_11CE_u64;
+        let mut s = 0usize;
+        while s < cap {
+            // The first block is the maximum; the rest are 20 units below it, so every later
+            // block clears the 16·ONE floor by four units.
+            let base = if s < block { 2 * ONE } else { -3 * ONE };
+            let k = vec![base; n_head_kv * hd];
+            let mut v = vec![0i64; n_head_kv * hd];
+            let mut i = 0usize;
+            while i < v.len() {
+                v[i] = word(&mut seed);
+                i += 1;
+            }
+            assert_eq!(kv.append(0, &k, &v), Ok(s));
+            s += 1;
+        }
+        kv.enable_block_index(block).expect("index");
+        let mut full = kv.clone();
+        full.disable_block_index();
+        assert!(kv.has_block_index() && !full.has_block_index());
+
+        let q = [2 * ONE; 4];
+        let mut pos = 0usize;
+        while pos < cap {
+            let mut head = 0usize;
+            while head < n_head {
+                let mut got = [0i64; 4];
+                let mut want = [0i64; 4];
+                kv.attn_head(0, head, &q, pos, &mut got)
+                    .expect("certified read");
+                full.attn_head(0, head, &q, pos, &mut want)
+                    .expect("full scan");
+                assert_eq!(got, want, "pos {pos} head {head}");
+                head += 1;
+            }
+            pos += 1;
+        }
+
+        let mut out = [0i64; 4];
+        let mut stats = CertStats::default();
+        kv.attn_head_certified(0, 0, &q, cap - 1, &mut out, &mut stats)
+            .expect("certified read");
+        assert_eq!(stats.blocks, 8);
+        assert_eq!(stats.scanned + stats.skipped, stats.blocks);
+        assert_eq!(stats.skipped, 7, "every block but the maximum is certified");
+        assert_eq!(stats.skipped_positions, 56);
+    }
+
+    #[test]
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "the test lays out `k`/`v`/`q` exactly as the plane it checks"
+    )]
+    fn certified_read_after_truncate_and_reappend_equals_full_scan() {
+        let (n_head, n_head_kv, hd, cap, block) = (2usize, 2usize, 3usize, 48usize, 4usize);
+        let mut kv =
+            KvState::with_carrier(1, n_head, n_head_kv, hd, cap, KvCarrier::Q32).expect("geometry");
+        kv.enable_block_index(block).expect("index");
+        let mut seed = 0xC0FF_EE12_3456_789A_u64;
+        let mut s = 0usize;
+        while s < 24 {
+            let mut k = vec![0i64; n_head_kv * hd];
+            let mut v = vec![0i64; n_head_kv * hd];
+            let mut i = 0usize;
+            while i < k.len() {
+                k[i] = word(&mut seed);
+                v[i] = word(&mut seed);
+                i += 1;
+            }
+            assert_eq!(kv.append(0, &k, &v), Ok(s));
+            s += 1;
+        }
+        assert_eq!(kv.truncate(18), Ok(()));
+        // Re-append different rows over positions 18..23; blocks 4 and 5 must re-seal.
+        let mut s = 18usize;
+        while s < 24 {
+            let mut k = vec![0i64; n_head_kv * hd];
+            let mut v = vec![0i64; n_head_kv * hd];
+            let mut i = 0usize;
+            while i < k.len() {
+                k[i] = word(&mut seed);
+                v[i] = word(&mut seed);
+                i += 1;
+            }
+            assert_eq!(kv.append(0, &k, &v), Ok(s));
+            s += 1;
+        }
+        let mut full = kv.clone();
+        full.disable_block_index();
+        let q = vec![word(&mut seed); hd];
+        let mut pos = 0usize;
+        while pos < 24 {
+            let mut head = 0usize;
+            while head < n_head {
+                let mut got = [0i64; 3];
+                let mut want = [0i64; 3];
+                kv.attn_head(0, head, &q, pos, &mut got)
+                    .expect("certified read");
+                full.attn_head(0, head, &q, pos, &mut want)
+                    .expect("full scan");
+                assert_eq!(got, want, "pos {pos} head {head}");
+                head += 1;
+            }
+            pos += 1;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "the test lays out `k`/`v`/`q` exactly as the plane it checks"
+    )]
+    fn file_backed_state_matches_owned_state() {
+        let path = temp_path("q32");
+        let path_s = path.to_str().expect("utf-8 temp path");
+        let (n_layer, n_head, n_head_kv, hd, cap) = (1usize, 4usize, 2usize, 3usize, 6usize);
+        let mut owned = KvState::with_carrier(n_layer, n_head, n_head_kv, hd, cap, KvCarrier::Q32)
+            .expect("owned");
+        let mut file =
+            KvState::with_file_carrier(path_s, n_layer, n_head, n_head_kv, hd, cap, Carrier::Q32)
+                .expect("file");
+        assert_eq!(
+            file.file_bytes(),
+            Some(n_layer * 2 * n_head_kv * cap * hd * 8)
+        );
+        assert_eq!(owned.file_bytes(), None);
+
+        let mut seed = 0x0BAD_C0DE_DEAD_BEEF_u64;
+        let mut s = 0usize;
+        while s < cap {
+            let mut k = vec![0i64; n_head_kv * hd];
+            let mut v = vec![0i64; n_head_kv * hd];
+            let mut i = 0usize;
+            while i < k.len() {
+                k[i] = word(&mut seed);
+                v[i] = word(&mut seed);
+                i += 1;
+            }
+            assert_eq!(owned.append(0, &k, &v), Ok(s));
+            assert_eq!(file.append(0, &k, &v), Ok(s));
+            s += 1;
+        }
+        let mut pos = 0usize;
+        while pos < cap {
+            let q = [word(&mut seed), word(&mut seed), word(&mut seed)];
+            let mut head = 0usize;
+            while head < n_head {
+                let (mut a, mut b) = ([0i64; 3], [0i64; 3]);
+                owned
+                    .attn_head(0, head, &q, pos, &mut a)
+                    .expect("owned read");
+                file.attn_head(0, head, &q, pos, &mut b).expect("file read");
+                assert_eq!(a, b, "attn_head pos {pos} head {head}");
+                let (mut fa, mut fb) = ([0i64; 3], [0i64; 3]);
+                owned
+                    .attn_head_fused(0, head, &q, pos, 2, &mut fa)
+                    .expect("owned fused read");
+                file.attn_head_fused(0, head, &q, pos, 2, &mut fb)
+                    .expect("file fused read");
+                assert_eq!(fa, fb, "attn_head_fused pos {pos} head {head}");
+                assert_eq!(
+                    owned.attn_max(0, head, &q, pos),
+                    file.attn_max(0, head, &q, pos)
+                );
+                assert_eq!(
+                    owned.attn_fused_state(0, head, &q, pos, fa[0], 2),
+                    file.attn_fused_state(0, head, &q, pos, fa[0], 2)
+                );
+                head += 1;
+            }
+            pos += 1;
+        }
+        file.sync_file().expect("msync");
+
+        // A mapped state rewinds and re-appends exactly like an owned one.
+        assert_eq!(file.truncate(3), owned.truncate(3));
+        let mut k = vec![0i64; n_head_kv * hd];
+        let mut v = vec![0i64; n_head_kv * hd];
+        let mut i = 0usize;
+        while i < k.len() {
+            k[i] = word(&mut seed);
+            v[i] = word(&mut seed);
+            i += 1;
+        }
+        assert_eq!(owned.append(0, &k, &v), Ok(3));
+        assert_eq!(file.append(0, &k, &v), Ok(3));
+        let q = [word(&mut seed), word(&mut seed), word(&mut seed)];
+        let (mut a, mut b) = ([0i64; 3], [0i64; 3]);
+        owned.attn_head(0, 0, &q, 3, &mut a).expect("owned read");
+        file.attn_head(0, 0, &q, 3, &mut b).expect("file read");
+        assert_eq!(a, b);
+
+        drop(file);
+        std::fs::remove_file(&path).expect("remove q32 file");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_backed_f32_state_matches_owned_f32_state() {
+        let path = temp_path("f32");
+        let path_s = path.to_str().expect("utf-8 temp path");
+        let (n_layer, n_head, n_head_kv, hd, cap) = (1usize, 4usize, 2usize, 3usize, 6usize);
+        let mut owned = KvState::with_carrier(n_layer, n_head, n_head_kv, hd, cap, KvCarrier::F32)
+            .expect("owned");
+        let mut file =
+            KvState::with_file_carrier(path_s, n_layer, n_head, n_head_kv, hd, cap, Carrier::F32)
+                .expect("file");
+        assert_eq!(
+            file.file_bytes(),
+            Some(n_layer * 2 * n_head_kv * cap * hd * 4)
+        );
+        let mut seed = 0x1357_9BDF_2468_ACE0_u64;
+        let mut s = 0usize;
+        while s < cap {
+            let mut k = vec![0i64; n_head_kv * hd];
+            let mut v = vec![0i64; n_head_kv * hd];
+            let mut i = 0usize;
+            while i < k.len() {
+                k[i] = word(&mut seed);
+                v[i] = word(&mut seed);
+                i += 1;
+            }
+            assert_eq!(owned.append(0, &k, &v), Ok(s));
+            assert_eq!(file.append(0, &k, &v), Ok(s));
+            s += 1;
+        }
+        let q = [word(&mut seed), word(&mut seed), word(&mut seed)];
+        let mut pos = 0usize;
+        while pos < cap {
+            let mut head = 0usize;
+            while head < n_head {
+                let (mut a, mut b) = ([0i64; 3], [0i64; 3]);
+                owned.attn_head(0, head, &q, pos, &mut a).expect("owned");
+                file.attn_head(0, head, &q, pos, &mut b).expect("file");
+                assert_eq!(a, b, "pos {pos} head {head}");
+                head += 1;
+            }
+            pos += 1;
+        }
+        drop(file);
+        std::fs::remove_file(&path).expect("remove f32 file");
+    }
+
+    /// The resident and anonymous kilobytes of every `/proc/self/smaps` region backed by `path`.
+    ///
+    /// Kernels differ in the field names: older ones report `RssAnon:`/`RssFile:`, this one
+    /// reports `Anonymous:` and only `Rss:`. The file count is the reported `RssFile` when present,
+    /// else the region's resident pages less its anonymous ones.
+    #[cfg(target_os = "linux")]
+    fn smaps_rss(path: &str) -> (u64, u64) {
+        fn kb(v: &str) -> u64 {
+            v.split_whitespace()
+                .next()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(0)
+        }
+        fn flush(anon: &mut u64, file: &mut u64, cur: (u64, u64, u64)) {
+            *anon += cur.1;
+            *file += if cur.2 != 0 {
+                cur.2
+            } else {
+                cur.0.saturating_sub(cur.1)
+            };
+        }
+        let text = std::fs::read_to_string("/proc/self/smaps").unwrap_or_default();
+        let mut anon = 0u64;
+        let mut file = 0u64;
+        let mut ours = false;
+        let mut cur = (0u64, 0u64, 0u64);
+        for line in text.lines() {
+            let header =
+                line.as_bytes().first().is_some_and(u8::is_ascii_hexdigit) && line.contains(" rw");
+            if header {
+                flush(&mut anon, &mut file, cur);
+                cur = (0, 0, 0);
+                ours = line.trim_end().ends_with(path);
+                continue;
+            }
+            if !ours {
+                continue;
+            }
+            if let Some(v) = line.strip_prefix("Rss:") {
+                cur.0 += kb(v);
+            }
+            if let Some(v) = line.strip_prefix("RssAnon:") {
+                cur.1 += kb(v);
+            }
+            if let Some(v) = line.strip_prefix("Anonymous:") {
+                cur.1 += kb(v);
+            }
+            if let Some(v) = line.strip_prefix("RssFile:") {
+                cur.2 += kb(v);
+            }
+        }
+        flush(&mut anon, &mut file, cur);
+        (anon, file)
+    }
+
+    /// The tile read of `group` query heads agrees with the per-column read head for head, and
+    /// each word within the per-tile-rescale bound, across tile boundaries and the last partial
+    /// tile.
+    #[test]
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "fixture words are built from moduli below 1001, far inside i64"
+    )]
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "the test's geometry indices are the call's own (kvh, first, nq, i, m)"
+    )]
+    fn the_tile_group_read_agrees_with_the_per_column_read() {
+        let (n_head, n_head_kv, hd, cap) = (4usize, 2usize, 8usize, 300usize);
+        let mut kv =
+            KvState::with_carrier(1, n_head, n_head_kv, hd, cap, KvCarrier::F32).expect("geometry");
+        let kv_out = n_head_kv * hd;
+        let mut s = 0usize;
+        while s < cap {
+            let mut k = vec![0i64; kv_out];
+            let mut v = vec![0i64; kv_out];
+            let mut i = 0usize;
+            while i < kv_out {
+                // Small Q32.32 words: |value| < 2^31, so every sum and product stays in range.
+                k[i] = ((s * 131 + i * 17) % 257) as i64 - 128;
+                v[i] = ((s * 53 + i * 29) % 193) as i64 - 96;
+                k[i] <<= 23;
+                v[i] <<= 23;
+                i += 1;
+            }
+            assert_eq!(kv.append(0, &k, &v), Ok(s));
+            s += 1;
+        }
+        let group = n_head / n_head_kv;
+        let width = group * hd;
+        let mut kvh = 0usize;
+        while kvh < n_head_kv {
+            // `first` 250 with `nq` 50 crosses the 64-position key-tile boundary at 256.
+            for first in [0usize, 1, 7, 8, 9, 31, 250, 255] {
+                for nq in [1usize, 2, 3, 8, 9, 50] {
+                    if first + nq > cap {
+                        continue;
+                    }
+                    let q: Vec<i64> = (0..nq * width)
+                        .map(|i| (((i * 37 + kvh * 11) % 1001) as i64 - 500) << 24)
+                        .collect();
+                    let mut tiled = vec![0i64; nq * width];
+                    kv.attn_head_group_tile_f32(0, kvh, &q, first, &mut tiled)
+                        .expect("tile");
+                    for j in 0..nq {
+                        let mut one = vec![0i64; width];
+                        kv.attn_head_group(
+                            0,
+                            kvh,
+                            &q[j * width..(j + 1) * width],
+                            first + j,
+                            0,
+                            &mut one,
+                        )
+                        .expect("per column");
+                        for i in 0..width {
+                            let (x, y) = (tiled[j * width + i], one[i]);
+                            let m = i128::from(x.abs().max(y.abs()));
+                            let prefix = (first + j + 1) as i128;
+                            let tol = 64
+                                + i64::try_from((m * 512 * (prefix + 64)) >> 32)
+                                    .expect("the tile bound fits i64");
+                            assert!(
+                                (x - y).abs() <= tol,
+                                "kvh {kvh} first {first} nq {nq} column {j} word {i}: {x} vs {y} (tol {tol})"
+                            );
+                        }
+                    }
+                }
+            }
+            kvh += 1;
+        }
+    }
+
+    /// The int8 tile read agrees with the per-column int8 group read over the same quantised
+    /// rows, within the per-tile rescale bound plus the `head_dim` score-rounding difference; the
+    /// tile's `f32` and AVX2 cores are word-equal by the `f32_core` test.
+    #[test]
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "fixture words are built from moduli below 1001, far inside i64"
+    )]
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "the test's geometry indices are the call's own (kvh, first, nq, i, m)"
+    )]
+    fn the_i8_tile_group_read_agrees_with_the_per_column_read() {
+        let (n_head, n_head_kv, hd, cap) = (4usize, 2usize, 8usize, 300usize);
+        let mut kv =
+            KvState::with_carrier(1, n_head, n_head_kv, hd, cap, KvCarrier::I8).expect("geometry");
+        let kv_out = n_head_kv * hd;
+        let mut s = 0usize;
+        while s < cap {
+            let mut k = vec![0i64; kv_out];
+            let mut v = vec![0i64; kv_out];
+            let mut i = 0usize;
+            while i < kv_out {
+                k[i] = ((s * 137 + i * 19) % 263) as i64 - 131;
+                v[i] = ((s * 59 + i * 31) % 197) as i64 - 98;
+                k[i] <<= 23;
+                v[i] <<= 23;
+                i += 1;
+            }
+            assert_eq!(kv.append(0, &k, &v), Ok(s));
+            s += 1;
+        }
+        let group = n_head / n_head_kv;
+        let width = group * hd;
+        let mut kvh = 0usize;
+        while kvh < n_head_kv {
+            for first in [0usize, 1, 7, 8, 9, 31, 250, 255] {
+                for nq in [1usize, 2, 3, 8, 9, 50] {
+                    if first + nq > cap {
+                        continue;
+                    }
+                    let q: Vec<i64> = (0..nq * width)
+                        .map(|i| (((i * 37 + kvh * 11) % 1001) as i64 - 500) << 24)
+                        .collect();
+                    let mut tiled = vec![0i64; nq * width];
+                    kv.attn_head_group_tile_i8(0, kvh, &q, first, &mut tiled)
+                        .expect("tile");
+                    for j in 0..nq {
+                        let mut one = vec![0i64; width];
+                        kv.attn_head_group(
+                            0,
+                            kvh,
+                            &q[j * width..(j + 1) * width],
+                            first + j,
+                            0,
+                            &mut one,
+                        )
+                        .expect("per column");
+                        for i in 0..width {
+                            let (x, y) = (tiled[j * width + i], one[i]);
+                            let m = i128::from(x.abs().max(y.abs()));
+                            let prefix = (first + j + 1) as i128 + hd as i128;
+                            // The per-tile rescale adds `(prefix + hd)` roundings; the per-column
+                            // core's eight-lane dot adds a 2e-3 relative term the sequential GEMM
+                            // does not share (see the f32_core i8 test).
+                            let tol = 64
+                                + i64::try_from((m * 512 * (prefix + 64)) >> 32)
+                                    .expect("the tile bound fits i64")
+                                + i64::try_from(m / 500).expect("the tile bound fits i64");
+                            assert!(
+                                (x - y).abs() <= tol,
+                                "i8 kvh {kvh} first {first} nq {nq} column {j} word {i}: {x} vs {y} (tol {tol})"
+                            );
+                        }
+                    }
+                }
+            }
+            kvh += 1;
+        }
+    }
+
+    /// The KV pages of a file-backed state are file-backed: they appear as `RssFile`, never
+    /// `RssAnon`, and the kernel may evict them without swapping.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapped_cache_pages_are_file_backed() {
+        let path = temp_path("smaps");
+        let path_s = path.to_str().expect("utf-8 temp path");
+        let (n_layer, n_head, n_head_kv, hd, cap) = (1usize, 1usize, 1usize, 128usize, 64usize);
+        let mut kv =
+            KvState::with_file_carrier(path_s, n_layer, n_head, n_head_kv, hd, cap, Carrier::Q32)
+                .expect("file");
+        let k = vec![ONE; hd];
+        let v = vec![ONE; hd];
+        let mut s = 0usize;
+        while s < cap {
+            assert_eq!(kv.append(0, &k, &v), Ok(s));
+            s += 1;
+        }
+        let (anon_kb, file_kb) = smaps_rss(path_s);
+        drop(kv);
+        std::fs::remove_file(&path).expect("remove");
+        assert_eq!(anon_kb, 0, "mapped KV must not be anonymous");
+        assert!(
+            file_kb >= 64,
+            "the touched 128 KiB cache file shows {file_kb} KiB of file-backed pages"
+        );
     }
 }

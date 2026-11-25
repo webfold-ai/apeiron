@@ -547,7 +547,7 @@ fn attn_head_distinct_scores_pin_the_scale() {
     // p1 = round(ONE*2^32 / (1.5*ONE)) = round(2^32/3*2) = 2863311531, and out[0] = p1.
     const LN2_Q32: i64 = 2_977_044_472;
     let mut kv =
-        KvState::with_carrier(1, 1, 1, 4, 4, super::mixer::Carrier::Q32).expect("geometry");
+        KvState::with_carrier(1, 1, 1, 4, 4, super::attn::KvCarrier::Q32).expect("geometry");
     assert_eq!(kv.append(0, &[0, 0, 0, 0], &[0, 0, 0, 0]), Ok(0));
     assert_eq!(
         kv.append(0, &[2 * LN2_Q32, 0, 0, 0], &[ONE, 0, 0, 0]),
@@ -663,7 +663,7 @@ fn attn_saturates_out_of_window_exp_and_refuses_dot_overflow() {
     // 0 and -8192*ONE; the second saturates its numerator to 0, so the query attends the first
     // key exactly.
     let mut kv =
-        KvState::with_carrier(1, 1, 1, 1, 2, super::mixer::Carrier::Q32).expect("geometry");
+        KvState::with_carrier(1, 1, 1, 1, 2, super::attn::KvCarrier::Q32).expect("geometry");
     assert_eq!(kv.append(0, &[64 * ONE], &[ONE]), Ok(0));
     assert_eq!(kv.append(0, &[-64 * ONE], &[ONE]), Ok(1));
     let q = [64 * ONE];
@@ -675,7 +675,7 @@ fn attn_saturates_out_of_window_exp_and_refuses_dot_overflow() {
 
     // A dot whose i128 accumulation leaves range refuses rather than wrapping.
     let mut big =
-        KvState::with_carrier(1, 1, 1, 3, 1, super::mixer::Carrier::Q32).expect("geometry");
+        KvState::with_carrier(1, 1, 1, 3, 1, super::attn::KvCarrier::Q32).expect("geometry");
     assert_eq!(big.append(0, &[i64::MAX; 3], &[0, 0, 0]), Ok(0));
     assert_eq!(
         big.attn_head(0, 0, &[i64::MAX; 3], 0, &mut [0i64; 3]),
@@ -731,7 +731,7 @@ fn attn_word(state: &mut u64) -> i64 {
 #[test]
 fn attn_fused_den_num_are_independent_of_tile_count() {
     let mut kv =
-        KvState::with_carrier(1, 2, 1, 4, 8, super::mixer::Carrier::Q32).expect("geometry");
+        KvState::with_carrier(1, 2, 1, 4, 8, super::attn::KvCarrier::Q32).expect("geometry");
     let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
     let mut s = 0usize;
     while s < 8 {
@@ -855,7 +855,7 @@ fn attn_head_fused_uses_the_global_max_across_tiles() {
 #[test]
 fn attn_fused_refuses_zero_sum_and_zero_tile() {
     let mut kv =
-        KvState::with_carrier(1, 1, 1, 1, 2, super::mixer::Carrier::Q32).expect("geometry");
+        KvState::with_carrier(1, 1, 1, 1, 2, super::attn::KvCarrier::Q32).expect("geometry");
     assert_eq!(kv.append(0, &[ONE], &[ONE]), Ok(0));
     assert_eq!(kv.append(0, &[ONE], &[ONE]), Ok(1));
     let q = [ONE];
@@ -1088,9 +1088,11 @@ fn lm_head_and_argmax_through_the_real_tensor_table() {
         return;
     };
     let engine = Engine::open(&path).expect("load qwen05b");
-    // The model has no `output.weight`; the head is tied to the embedding.
+    // This fixture is the untied Qwen2.5-0.5B-Instruct export (sha256
+    // 74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db), so the loader
+    // prefers `output.weight` over the embedding. The tied fallback is the loader's other branch.
     let head = engine.lm_head();
-    assert_eq!(head.name, "token_embd.weight");
+    assert_eq!(head.name, "output.weight");
 
     let x = engine.token_embedding(0).expect("token 0 embedding");
     let logits = engine.lm_head_fixed(&x).expect("token 0 logits");
@@ -1099,7 +1101,7 @@ fn lm_head_and_argmax_through_the_real_tensor_table() {
     let c0 = fixed_vector_checksum(&logits);
     // Recorded from this model/source identity: token 0's own embedding row is the argmax.
     assert_eq!(a0, 0, "recorded argmax for token 0");
-    assert_eq!(c0, 0x4b39_186d_63e8_1773, "recorded token 0 logit checksum");
+    assert_eq!(c0, 0xa8cd_ee90_a4e2_faad, "recorded token 0 logit checksum");
 
     // A short activation is refused before any read.
     assert_eq!(
@@ -1484,8 +1486,9 @@ fn engine_step_greedy_decode_is_deterministic() {
     assert_eq!(
         checksums[0],
         match ka.carrier() {
-            super::mixer::Carrier::Q32 => 0x483c_6d3e_ce96_8247,
-            super::mixer::Carrier::F32 => 12_301_219_398_411_439_768,
+            super::attn::KvCarrier::Q32 => 0x483c_6d3e_ce96_8247,
+            super::attn::KvCarrier::F32 => 12_301_219_398_411_439_768,
+            super::attn::KvCarrier::I8 => panic!("this test builds an F32 or Q32 cache"),
         },
         "recorded first-step logits checksum"
     );
@@ -2010,7 +2013,7 @@ fn f32_append_index_loop_pins_plane_values_and_writes_nothing_on_err() {
     // the `i64` domain `q32_to_f32(x) = (x as f32) / 2^32` is finite for every `x`, since
     // `|x as f32| <= 2^63 < f32::MAX` and the divisor is normal, so that `Err` is unreachable
     // from `append` and the doc clause "contents unspecified on `Err`" has no witness here.
-    let carrier = super::mixer::Carrier::F32;
+    let carrier = super::attn::KvCarrier::F32;
     let mut kv = KvState::with_carrier(1, 1, 1, 2, 4, carrier).expect("geometry");
     // One attended position makes the softmax denominator exactly 1, so `out` is the stored
     // value row bit for bit. This pins value-plane slots 0 and 1 exactly.

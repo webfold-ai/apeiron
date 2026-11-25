@@ -479,7 +479,7 @@ pub fn chol_factor(a: &[i64], n: usize) -> Result<Vec<i64>, SolveError> {
     for i in 0..n {
         for j in 0..=i {
             let prod = i128::from(d[i]) * i128::from(l_hat[i * n + j]);
-            l[i * n + j] = narrow(rshift_rne(prod, 32).ok_or(SolveError::Overflow)?)
+            l[i * n + j] = narrow(crate::learn::solve::q32::rshift_rne(prod, 32).ok_or(SolveError::Overflow)?)
                 .ok_or(SolveError::Overflow)?;
         }
     }
@@ -934,7 +934,7 @@ mod chol_factor_tests {
                 for k in 0..n {
                     acc += i128::from(l[i * n + k]) * i128::from(l[j * n + k]);
                 }
-                let got = narrow(rshift_rne(acc, 32).expect("shift")).expect("narrow");
+                let got = narrow(crate::learn::solve::q32::rshift_rne(acc, 32).expect("shift")).expect("narrow");
                 let want = a[i * n + j];
                 let tol = one / 1024; // a few LSB of Q32.32 against an entry of order 6
                 assert!(

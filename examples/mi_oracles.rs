@@ -1898,6 +1898,29 @@ fn assoc() -> bool {
         .count() as f64
         / 48.0;
 
+    // POST-HOC A6b: A6's threshold (0.12) was about one standard deviation above chance for 48 pairs, so a
+    // single shuffle fails by luck. Chance is 1/16 plus the permutation's fixed points (about 1/48),
+    // ≈ 0.082, with standard deviation ≈ 0.04 per draw. Average 200 shuffles instead.
+    let shuf_mean = {
+        let mut acc = 0f64;
+        for _ in 0..200 {
+            let mut perm: Vec<usize> = (0..48).collect();
+            shuffle(&mut perm, &mut rng);
+            let mut bs = vec![0i64; d * v];
+            for (pos, &i) in ids48.iter().enumerate() {
+                for j in 0..d {
+                    bs[j * v + vals[perm[pos]]] += i64::from(keys[i][j]) * 127;
+                }
+            }
+            let ws = to_f(&solve_q(&g48, &bs, d, v, s40, lam));
+            acc += ids48
+                .iter()
+                .filter(|&&i| argmax(&predict(&ws, d, v, &tilde(&keys[i]))) == vals[i])
+                .count() as f64
+                / 48.0;
+        }
+        acc / 200.0
+    };
     let get = |m: &std::collections::BTreeMap<usize, f64>, n: usize| *m.get(&n).unwrap();
     let a1 = ns
         .iter()
@@ -1915,6 +1938,7 @@ fn assoc() -> bool {
         Check { name: "A4 leverage separates stored from unseen keys, weaker near capacity", pass: a4, detail: format!("AUROC by n: {}", auroc_by_n.iter().map(|(n, a)| format!("{n}:{a:.3}")).collect::<Vec<_>>().join(", ")) },
         Check { name: "A5 forgetting is exact subtraction", pass: exact && rm_after <= 0.20 && kp_after >= 0.99, detail: format!("state bit-identical {exact}; removed {rm_before:.3} -> {rm_after:.3}; retained {kp_after:.3}") },
         Check { name: "A6 control: shuffled pairing reads at chance", pass: shuf_recall <= 0.12, detail: format!("recall on the true pairing {shuf_recall:.3} (chance {:.4})", 1.0 / v as f64) },
+        Check { name: "POST-HOC A6b control averaged over 200 shuffles reads at chance (+ fixed points)", pass: shuf_mean <= 0.10, detail: format!("mean recall {shuf_mean:.4}; expected about {:.4} = 1/16 + 1/48", 1.0 / 16.0 + 1.0 / 48.0) },
     ];
     report("E-ASSOC", &checks)
 }

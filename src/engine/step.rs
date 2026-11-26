@@ -1237,7 +1237,19 @@ impl Engine {
     /// [`RopeError`] for a malformed head geometry, a non-positive or non-finite `rope_theta`, or a
     /// frequency that does not fit Q32.32.
     pub fn rope_table(&self) -> Result<RopeTable, RopeError> {
-        RopeTable::new(self.config.rope_theta, self.config.rot_dims)
+        let mut table = RopeTable::new(self.config.rope_theta, self.config.rot_dims)?;
+        // A `llama` GGUF stores Q and K in the permuted layout ggml rotates as adjacent pairs.
+        if self.config.architecture == "llama" {
+            table = table.with_adjacent_pairs();
+        }
+        // Llama-3.1 ships `rope_freqs.weight` (one `F32` factor per rotary pair): the llama3 RoPE
+        // scaling. `ggml_rope_ext` divides each pair's angle by its factor, so without it the
+        // low-frequency pairs rotate too fast and the model degrades as position grows.
+        match self.rope_freq_factors() {
+            Ok(Some(factors)) => table.divided_by_q32(&factors[..]),
+            Ok(None) => Ok(table),
+            Err(_) => Err(RopeError::TableLength),
+        }
     }
 
     /// The output (LM-head) tensor entry (port-map row 7): `output.weight` when the directory

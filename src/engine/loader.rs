@@ -1124,6 +1124,11 @@ impl Engine {
         self.hadamard.as_ref()
     }
 
+    /// The llama3 `rope_freqs.weight` factors (one Q32.32 word per rotary pair), or `None`.
+    pub(crate) fn rope_freq_factors(&self) -> Result<Option<Vec<i64>>, EngineError> {
+        self.read_f32_vector("rope_freqs.weight", self.config.rot_dims / 2)
+    }
+
     /// Read the `F32` vector `name` of length `len` into Q32.32, or `None` when absent.
     ///
     /// A present tensor must be rank-1 with `dims == [len]` and ggml type `F32`; otherwise it

@@ -314,3 +314,257 @@ pub fn gram_fold_i8_kern(
     }
     gram_fold_i8(g, x, rows, d)
 }
+
+/// A shard of the sufficient statistic `(G, B, rows)`: `G = XᵀX` and `B = XᵀY` over the integer grid
+/// `[-nmax, nmax]`, accumulated exactly in `i64`.
+///
+/// This is the collectable half of the fold. It merges with componentwise `i64` addition
+/// ([`GramShard::merge`]), which is associative, commutative, and has the empty shard as identity, so
+/// the accumulate is order-free across peers and shards; [`GramShard::unfold`] is its exact group
+/// inverse. It lived in `webtrainer-core` while the core kept its own fold - one state, two homes -
+/// and this is the one home.
+///
+/// The fold itself is [`gram_fold_i8`] over the concatenated `[X | Y]` design, so the cross-moment
+/// `B = XᵀY` is a block of the same Gram rather than a second loop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GramShard {
+    /// Feature dimension `d`.
+    pub d: usize,
+    /// Target dimension `k`.
+    pub out_dim: usize,
+    /// Rows accumulated.
+    pub rows: u64,
+    /// Grid bound the codes were quantised to.
+    pub nmax: u32,
+    /// `G = XᵀX`, row-major `[d, d]`.
+    pub g: Vec<i64>,
+    /// `B = XᵀY`, row-major `[d, k]`.
+    pub b: Vec<i64>,
+}
+
+impl GramShard {
+    /// The empty shard for `(d, k)` at grid `nmax` - the monoid identity.
+    #[must_use]
+    pub fn zeros(d: usize, out_dim: usize, nmax: u32) -> Self {
+        Self {
+            d,
+            out_dim,
+            rows: 0,
+            nmax,
+            g: vec![0; d * d],
+            b: vec![0; d * out_dim],
+        }
+    }
+
+    /// Fold `rows` codes of `x` (`[rows, d]`) and `y` (`[rows, k]`), each in `[-nmax, nmax]`.
+    ///
+    /// # Errors
+    /// [`GramError::ShapeMismatch`] on a wrong length; [`GramError::Overflow`] if the codes leave
+    /// `i8` (i.e. `nmax > 127`, the grid the core's fold is defined on).
+    pub fn from_codes(
+        xq: &[i64],
+        yq: &[i64],
+        rows: usize,
+        d: usize,
+        out_dim: usize,
+        nmax: u32,
+    ) -> Result<Self, GramError> {
+        if xq.len() != rows * d || yq.len() != rows * out_dim {
+            return Err(GramError::ShapeMismatch);
+        }
+        if nmax > 127 {
+            return Err(GramError::Overflow);
+        }
+        let wz = d + out_dim;
+        let mut design = vec![0i8; rows * wz];
+        for r in 0..rows {
+            for i in 0..d {
+                design[r * wz + i] = xq[r * d + i] as i8;
+            }
+            for c in 0..out_dim {
+                design[r * wz + d + c] = yq[r * out_dim + c] as i8;
+            }
+        }
+        let all = gram_fold_i8(vec![0i64; wz * wz], &design, rows, wz)?;
+        let mut shard = Self::zeros(d, out_dim, nmax);
+        shard.rows = rows as u64;
+        for i in 0..d {
+            shard.g[i * d..i * d + d].copy_from_slice(&all[i * wz..i * wz + d]);
+            for c in 0..out_dim {
+                shard.b[i * out_dim + c] = all[i * wz + d + c];
+            }
+        }
+        Ok(shard)
+    }
+
+    /// `self += other` - componentwise `i64`, order-free, the monoid operation.
+    ///
+    /// # Errors
+    /// [`GramError::ShapeMismatch`] if the shapes differ.
+    pub fn merge(&mut self, other: &Self) -> Result<(), GramError> {
+        if (self.d, self.out_dim) != (other.d, other.out_dim) || self.g.len() != other.g.len() {
+            return Err(GramError::ShapeMismatch);
+        }
+        self.rows += other.rows;
+        for (a, &x) in self.g.iter_mut().zip(&other.g) {
+            *a = a.checked_add(x).ok_or(GramError::Overflow)?;
+        }
+        for (a, &x) in self.b.iter_mut().zip(&other.b) {
+            *a = a.checked_add(x).ok_or(GramError::Overflow)?;
+        }
+        Ok(())
+    }
+
+    /// `self -= other` - the exact group inverse of [`Self::merge`].
+    ///
+    /// # Errors
+    /// [`GramError::ShapeMismatch`] if the shapes differ; [`GramError::Overflow`] on subtraction.
+    pub fn unfold(&mut self, other: &Self) -> Result<(), GramError> {
+        self.merge(&Self {
+            g: other.g.iter().map(|v| -v).collect(),
+            b: other.b.iter().map(|v| -v).collect(),
+            rows: 0,
+            ..other.clone()
+        })?;
+        self.rows -= other.rows;
+        Ok(())
+    }
+
+    /// The spectrum concentration of the folded Gram over its `r` largest modes:
+    /// `Σλ² / ‖G‖_F²`, in `[0, 1]` (`REG-3`). `1.0` means the statistic lives in a rank-`r`
+    /// subspace; a flat cone means the lift has nothing to read.
+    ///
+    /// # Errors
+    /// [`crate::learn::solve::eig::EigError`] from the core's eigensolver.
+    pub fn cone_fraction(
+        &self,
+        r: usize,
+    ) -> Result<f64, crate::learn::solve::eig::EigError> {
+        let d = self.d;
+        if d == 0 {
+            return Ok(0.0);
+        }
+        let top = crate::learn::solve::eig::top_eigh(&self.g, d, r.min(d))?;
+        let mut num: i128 = 0;
+        for l in &top.evals {
+            num += i128::from(*l) * i128::from(*l);
+        }
+        let mut den: i128 = 0;
+        for v in &self.g {
+            den += i128::from(*v) * i128::from(*v);
+        }
+        Ok(if den == 0 {
+            0.0
+        } else {
+            num as f64 / den as f64
+        })
+    }
+
+    /// The read: `(G/n + ridge * mean(diag(G/n)))⁻¹ (B/n)` over the centred, real-space Gram, solved by
+    /// the core's Cholesky. Weights are Q32.32, row-major `[d, k]`.
+    ///
+    /// The ridge is **relative to the matrix's own scale** - `ridge * mean(diag(H))`, exactly as the
+    /// transfer fit does it - never an absolute lambda handed in from outside.
+    ///
+    /// # Errors
+    /// [`SolveError`] from the Cholesky.
+    pub fn solve(&self, ridge_ratio: f64) -> Result<Vec<i64>, crate::learn::solve::chol::SolveError> {
+        let d = self.d;
+        let k = self.out_dim;
+        let n = i128::from(self.rows.max(1));
+        let denom = n * i128::from(self.nmax.max(1)).pow(2);
+        let one: i128 = 1 << 32;
+        let mut a = vec![0i64; d * d];
+        let mut b = vec![0i64; d * k];
+        for (idx, &v) in self.g.iter().enumerate() {
+            a[idx] = (i128::from(v) * one / denom) as i64;
+        }
+        for (idx, &v) in self.b.iter().enumerate() {
+            b[idx] = (i128::from(v) * one / denom) as i64;
+        }
+        let mut diag_sum: i128 = 0;
+        for i in 0..d {
+            diag_sum += i128::from(a[i * d + i]);
+        }
+        let mean_diag = if d == 0 { 0 } else { diag_sum / d as i128 };
+        let ridge = (ridge_ratio.max(0.0) * 4_294_967_296.0) as i128 * mean_diag / one;
+        for i in 0..d {
+            a[i * d + i] += ridge as i64;
+        }
+        Ok(crate::learn::solve::chol::chol_solve(&a, &b, d, k)?.x)
+    }
+}
+
+#[cfg(test)]
+mod shard_tests {
+    use super::*;
+
+    fn codes(n: usize, bound: i64) -> Vec<i64> {
+        let mut s: i64 = 0x2545F4914F6CDD1D;
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 33) % (2 * bound + 1)) - bound
+            })
+            .collect()
+    }
+
+    /// The accumulate is order-free and the retraction is exact: two shards merged either way give
+    /// the same state as one shard over all the rows, and unfolding one gives the other back.
+    #[test]
+    fn merge_is_order_free_and_unfold_is_exact() {
+        let (rows, d, k) = (64usize, 5usize, 3usize);
+        let xq = codes(rows * d, 127);
+        let yq = codes(rows * k, 127);
+        let whole = GramShard::from_codes(&xq, &yq, rows, d, k, 127).expect("whole");
+
+        let (a, b) = (32usize, 32usize);
+        let s1 = GramShard::from_codes(&xq[..a * d], &yq[..a * k], a, d, k, 127).expect("s1");
+        let s2 =
+            GramShard::from_codes(&xq[a * d..], &yq[a * k..], b, d, k, 127).expect("s2");
+
+        let mut forward = s1.clone();
+        forward.merge(&s2).expect("merge");
+        let mut backward = s2.clone();
+        backward.merge(&s1).expect("merge");
+        assert_eq!(forward, backward, "merge is not order-free");
+        assert_eq!(forward.g, whole.g, "merged G is not the whole G");
+        assert_eq!(forward.b, whole.b, "merged B is not the whole B");
+
+        let mut retracted = forward.clone();
+        retracted.unfold(&s2).expect("unfold");
+        assert_eq!(retracted, s1, "unfold is not exact");
+    }
+
+    /// The read solves the ridge normal equations on the folded state.
+    #[test]
+    fn the_read_solves_the_normal_equations() {
+        let (rows, d, k, nmax, ridge) = (64usize, 5usize, 3usize, 127u32, 1e-3f64);
+        let xq = codes(rows * d, 127);
+        let yq = codes(rows * k, 127);
+        let shard = GramShard::from_codes(&xq, &yq, rows, d, k, nmax).expect("shard");
+        let w = shard.solve(ridge).expect("solve");
+        assert_eq!(w.len(), d * k);
+
+        let one = 4_294_967_296.0f64;
+        let denom = (rows as f64) * f64::from(nmax).powi(2);
+        let mut diag = 0.0;
+        for i in 0..d {
+            diag += (shard.g[i * d + i] as f64) / denom;
+        }
+        let lam = ridge * diag / d as f64;
+        for i in 0..d {
+            for c in 0..k {
+                let mut acc = 0.0;
+                for t in 0..d {
+                    acc += (shard.g[i * d + t] as f64) / denom * ((w[t * k + c] as f64) / one);
+                }
+                acc += lam * ((w[i * k + c] as f64) / one);
+                let rhs = (shard.b[i * k + c] as f64) / denom;
+                assert!((acc - rhs).abs() <= 1e-9 + 1e-6 * rhs.abs(), "row {i} col {c}");
+            }
+        }
+    }
+}

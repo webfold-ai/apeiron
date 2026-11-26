@@ -31,11 +31,12 @@
 //! every placement and is refused as [`LimbError::Range`].
 //!
 //! **Refusals.** [`LimbError::Shape`]: a zero or mismatched dimension, a slice whose length is not
-//! `rows·n`, `limbs == 0`, or `n > 16384` (the kernel's 512-block `MAX_BLOCKS`). [`LimbError::Range`]:
+//! `rows·n`, `limbs == 0`, or `n > MAX_INNER`; [`LimbError::Range`]:
 //! a block exponent pair whose product the scale placement cannot carry, or a group partial sum
-//! that leaves `i64`. [`LimbError::NoKernel`] is never returned: a host without AVX-VNNI makes
-//! [`gemm_q8_0`] return `None` and the same planes go to [`matmat_q8act`], which is the `Q8_0`
-//! contract itself; only a `MatvecError` refusal survives, and that is `Range`.
+//! that leaves `i64`. [`LimbError::NoKernel`] is never returned: a host without AVX-VNNI, or a
+//! width past [`gemm_q8_0`]'s 512 blocks, makes that kernel return `None` and the same planes go to
+//! [`matmat_q8act`], which is the `Q8_0` contract itself; only a `MatvecError` refusal survives, and
+//! that is `Range`.
 //!
 //! **Trust boundary.** The AVX2/AVX-VNNI cores of `gemm_q8_0` and `matmat_q8act` are not
 //! extracted; their equality with the scalar contract is `tested` in `gemm.rs` and `matmat.rs`.
@@ -78,8 +79,11 @@ fn pool_chunk(len: usize) -> usize {
 /// Lanes of one limb block, the kernel's activation block width.
 const ACT_QK: usize = Q8_0_QK;
 
-/// The widest contraction `gemm_q8_0` takes: its `MAX_BLOCKS` (512) blocks of 32.
-pub(crate) const MAX_INNER: usize = 512 * Q8_0_QK;
+/// The widest contraction the limb products take, in blocks of 32. Above `gemm_q8_0`'s own
+/// `MAX_BLOCKS` (512) the product falls back to [`matmat_q8act`] on the same planes — the same
+/// `Q8_0` contract, slower — so the accepted width is not the kernel's stack-array bound. A 7B
+/// `ffn_down` contracts over `n_ff = 18944 > 512·32` (Qwen2.5-7B), which is why it is 1024.
+pub(crate) const MAX_INNER: usize = 1024 * Q8_0_QK;
 
 /// The most limbs one block may be split into; the digit shift `e + 7(limbs − 1)` must stay
 /// inside the `i128` digit accumulator.
@@ -139,7 +143,7 @@ pub(crate) enum LimbError {
 ///
 /// # Errors
 ///
-/// [`LimbError::Shape`] on a zero or mismatched dimension, `limbs == 0` or `n > 16384`;
+/// [`LimbError::Shape`] on a zero or mismatched dimension, `limbs == 0` or `n > MAX_INNER`;
 /// [`LimbError::Range`] on a block pair the scale placement cannot carry, a group partial sum
 /// that leaves `i64`, or an entry that leaves `i64`. A group partial is refused as `Range` even
 /// when the exact total would cancel back into range: the refusal is conservative, never a wrong
@@ -1502,7 +1506,7 @@ impl Plane {
     /// # Complexity
     ///
     /// Temporal `O(ra·n·limbs)` plane-to-payload packing plus `O(P·ra·rb·n)` byte multiply-adds
-    /// over `⌈P/g⌉` kernel calls, `g = ⌊16384/padded⌋` pairs per call; spatial `O(ra·g·n)` payload
+    /// over `⌈P/g⌉` kernel calls, `g = ⌊MAX_INNER/padded⌋` pairs per call; spatial `O(ra·g·n)` payload
     /// bytes plus `O(ra·rb)` output words (`i128` only when the call spans several groups).
     fn product_rows(
         &self,
@@ -1577,9 +1581,10 @@ impl Plane {
         while i < ra && err2.is_none() {
             let mut j = 0usize;
             while j < rb && err2.is_none() {
-                match i64::try_from(acc[j * ra + i]) {
-                    Ok(v) => out[i * rb + j] = v,
-                    Err(_) => err2 = Some(LimbError::Range),
+                if let Ok(v) = i64::try_from(acc[j * ra + i]) {
+                    out[i * rb + j] = v;
+                } else {
+                    err2 = Some(LimbError::Range);
                 }
                 j += 1;
             }
@@ -2128,6 +2133,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A contraction past the old 512-block bound runs: Qwen2.5-7B's `ffn_down` contracts over
+    /// `n_ff = 18944 > 512·32`, and the 7B fit refused at `Plane::build` before this bound moved.
+    #[test]
+    fn inner_past_512_blocks_products() {
+        let n = 18_944usize;
+        let a = vec![1i64 << 32; 2 * n];
+        let b = vec![1i64 << 32; 3 * n];
+        let want = i64::try_from(n).expect("n fits i64") << 32;
+        let g = gemm_q32(&a, 2, &b, 3, n, 3).expect("wide contraction");
+        assert!(g.iter().all(|&x| x == want), "gemm {g:?}");
+        let s = syrk_q32(&a, 2, n, 3).expect("wide half Gram");
+        assert!(s.iter().all(|&x| x == want), "syrk {s:?}");
+        let d = rowdot_q32(&a, &a, 2, n, 3).expect("wide row dot");
+        assert!(d.iter().all(|&x| x == want), "rowdot {d:?}");
     }
 
     /// (d) Shape refusal: a mismatched slice, a zero dimension, no limbs, an over-wide

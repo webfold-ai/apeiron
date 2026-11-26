@@ -115,6 +115,11 @@ impl ColdStore {
         if layer > KEY_FIELD_MASK || kv_head > KEY_FIELD_MASK || block > KEY_FIELD_MASK {
             return Err(ColdStoreError::BadGeometry);
         }
+        // The 63-bit packed key does not fit a 32-bit `usize`; widen the fields before shifting so
+        // the wasm32 build computes the same word as the 64-bit one.
+        let layer = u64::try_from(layer).map_err(|_| ColdStoreError::BadGeometry)?;
+        let kv_head = u64::try_from(kv_head).map_err(|_| ColdStoreError::BadGeometry)?;
+        let block = u64::try_from(block).map_err(|_| ColdStoreError::BadGeometry)?;
         let word = (layer << (2 * KEY_FIELD_BITS)) | (kv_head << KEY_FIELD_BITS) | block;
         match i64::try_from(word) {
             Ok(k) => Ok(k),

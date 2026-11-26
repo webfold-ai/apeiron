@@ -210,8 +210,8 @@ mod tests;
 
 pub use self::attn::f32_core::attn_core_f32_strided;
 pub use self::attn::{AttnError, KvState};
-pub use self::error::EngineError;
-pub use self::kern::fold::{matvec_fold, quant_act_fold, FoldFace};
+pub use self::error::{EngineError, TensorKey};
+pub use self::kern::nq::NqError;
 pub use self::loader::{AffineGeom, AffineVectors, Engine, MixerKind, TensorEntry};
 pub use self::mixer::AffineState;
 pub use self::num::dequant::{dequant_row_fixed, f16_to_fixed};
@@ -229,23 +229,3 @@ pub use self::ops::rope::{rope_rotate_fixed, RopeError, RopeTable};
 pub use self::ops::sampler::{argmax_fixed, top_p_fixed, SamplerError};
 pub use self::step::cold_store::{ColdStore, ColdStoreError};
 pub use self::step::{DecodeState, KernelMode, MtpState, SpecStats, StepError, StepResult};
-
-/// The fold-packed serving entry, kept here rather than beside [`Engine::from_bytes_with_fold`]
-/// because the extraction unit (`proof/extract/lib.rs`) mirrors `src/engine/loader.rs` and not this
-/// module, and the pack reader belongs to `crate::learn`, which the extraction fragment does not
-/// carry. `O(file bytes)` for the GGUF plus `O(file bytes)` for the pack.
-impl Engine {
-    /// Open a GGUF and the fold pack of its fitted linears; [`Engine::from_bytes_with_fold`] with
-    /// both files read once.
-    ///
-    /// # Errors
-    ///
-    /// [`EngineError::Io`] on either read, [`EngineError::ConfigMismatch`] on a pack the reader or
-    /// the map refuses, and every refusal of [`Engine::from_bytes`] otherwise.
-    pub fn open_fold(gguf_path: &str, fold_path: &str) -> Result<Engine, EngineError> {
-        let planes = crate::learn::fold::run::pack::fold_pack_read(fold_path)
-            .map_err(|e| EngineError::ConfigMismatch(format!("fold pack {fold_path}: {e:?}")))?;
-        let data = crate::format::gguf::host_read_all(gguf_path).map_err(EngineError::Io)?;
-        Engine::from_bytes_with_fold(gguf_path, data, &planes)
-    }
-}

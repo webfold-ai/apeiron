@@ -5,27 +5,17 @@
 //! row is `tested`, not extracted (trust boundary).
 #![allow(
     dead_code,
-    reason = "the multi-column K-quant row kernels land here; their matmat/step caller is the next  task, and the tests below call them under cfg(test)"
+    reason = "`matmat` is the caller for the packed lanes; the single-column folds below are called \
+              by the equality tests under cfg(test)"
 )]
 
 use crate::format::quant::{Q4_K_BLOCK_BYTES, Q4_K_SCALE_SIZE, Q6_K_BLOCK_BYTES};
 
-use super::pool::{run_global, set_written_lens, Flag};
 use super::portable::f16_to_fixed_fast;
 use super::round_to_i64;
-use super::task::IndexTask;
 use super::x86;
 use super::x86::{q4_k_scale_min_at, q4_k_window_dot_ptr, q6_k_half_dots, scale_word};
 use super::{QuantAct, ACT_QK};
-use std::mem::MaybeUninit;
-
-/// The `n_in`-independent magnitude `$top$` of `q8act_plan`'s `Q4_K` fast bound (a weight term per
-/// input is at most `d_max·sc_max·q_max = 1·63·16`).
-const Q4_K_FAST_TOP: i128 = 1008;
-/// The same for `Q6_K`: `d_max·sc_max·q_max = 1·127·32 = 4064`, and `q8act_plan` takes `4096`.
-const Q6_K_FAST_TOP: i128 = 4096;
-/// Weight rows per pool task of a [`gemm_q4_k`] / [`gemm_q6_k`] call with `n_out > 1024`.
-const ROWS_PER_TASK: usize = 16;
 
 /// Activation columns per pass of the block loop.
 ///
@@ -434,12 +424,13 @@ pub(crate) unsafe fn q6_k_row_kcols_avx2(
 
 // ── the packed-lane kernel ───────────────────────────────────────────────────────────────────────
 //
-// [`gemm_q4_k`] and [`gemm_q6_k`] subsume `kern::gemm::gemm_q8_0`: the same activation pack (8
-// columns per group as `x + 128` bytes, four consecutive inputs of column `c` in 32-bit lane `c`, one
-// `vpdpbusd` per weight word against a broadcast), the same per-(row, column-group) shift grid in
-// `i64` lanes, and the same `i128` fallback past the [`lane_spread_limit`] bound. Every sub-block
-// term is an integer coefficient times `2^{k + e}` (`d = m_d·2^k_d`, `dmin = m_m·2^k_m` from
-// `f16_split`, `S_s = 2^{e_s}` from `act_scale`), so the lane holds the exact `i128` sum of
+// The shared `matmat` carrier's `Q4_K` and `Q6_K` lanes share this kernel: the same activation
+// pack (8 columns per group as `x + 128` bytes, four consecutive inputs of column `c` in 32-bit
+// lane `c`, one `vpdpbusd` per weight word against a broadcast), the same per-(row, column-group)
+// shift grid in `i64` lanes, and the same `i128` fallback past the [`lane_spread_limit`] bound.
+// Every sub-block term is an integer coefficient times `2^{k + e}` (`d = m_d·2^k_d`,
+// `dmin = m_m·2^k_m` from `f16_split`, `S_s = 2^{e_s}` from `act_scale`), so the lane holds the
+// exact `i128` sum of
 // [`super::q8act_q4_k_row_fast`] / [`super::q8act_q6_k_row_fast`] divided by `2^{k_min + e_min(c)}`,
 // and [`finish`] applies that power once: [`super::round_to_i64`] of the same sum.
 //
@@ -455,7 +446,7 @@ pub(crate) unsafe fn q6_k_row_kcols_avx2(
 const LANES: usize = 8;
 
 /// `34 + ⌈log₂ groups⌉ + spread ≤ 62`: the largest shift spread an `i64` lane admits. `O(1)`.
-pub(super) fn lane_spread_limit(groups: usize) -> u32 {
+pub(crate) fn lane_spread_limit(groups: usize) -> u32 {
     let log = usize::BITS - groups.saturating_sub(1).leading_zeros();
     62u32.saturating_sub(34 + log)
 }
@@ -476,7 +467,7 @@ pub(crate) fn reset_i128_groups() {
 /// quads `[group][block][quad][lane]`, `ke_e`/`ke_o` the per-column `e_b − e_min(c)` in the order
 /// `_mm256_mul_epi32` leaves the columns in, `xs`/`xs_col` the `Q4_K` block sums (packed and
 /// `[column][block]`), `emin` per column and `spread` per group.
-struct PackedCols {
+pub(crate) struct PackedCols {
     /// Column groups, `⌈k / LANES⌉`.
     groups: usize,
     /// `[group][block][quad][lane]`: four `x + 128` bytes of column `8·group + lane`.
@@ -502,7 +493,7 @@ struct PackedCols {
     clippy::cast_sign_loss,
     reason = "c, b, g index the lane-by-block grid; the codes are signed bytes widened to a lane word;  the pack is one grid walk"
 )]
-fn pack_cols(qs: &[QuantAct], blocks: usize, need_xs: bool) -> Option<PackedCols> {
+pub(crate) fn pack_cols(qs: &[QuantAct], blocks: usize, need_xs: bool) -> Option<PackedCols> {
     let k = qs.len();
     let groups = k.div_ceil(LANES);
     let mut words = vec![u32::MAX; groups * blocks * 8 * LANES];
@@ -686,7 +677,7 @@ unsafe fn sum_bytes(v: __m256i) -> [i32; 3] {
 /// One row's decoded `Q4_K` block data, refilled per row and reused across the column groups: the
 /// 32 weight bytes of every 32-input group, its `128·Σ q` bias, `m_d·sc_g`, `m_m·m_g`, and the row's
 /// `k_d`/`k_m` per block.
-struct Q4KRow {
+pub(crate) struct Q4KRow {
     /// `[block][group][lane]`: the 32 weight bytes of each 32-input group.
     bytes: Vec<u8>,
     /// `[block][group]`: `128·Σ q`, the bias the packed `x + 128` codes carry.
@@ -706,7 +697,7 @@ impl Q4KRow {
     /// # Complexity
     ///
     /// `O(blocks)` time and six allocations; `blocks·256` bytes and `blocks·26` words.
-    fn new(blocks: usize) -> Self {
+    pub(crate) fn new(blocks: usize) -> Self {
         Q4KRow {
             bytes: vec![0u8; blocks * 256],
             bias: vec![0i32; blocks * 8],
@@ -733,7 +724,7 @@ impl Q4KRow {
         clippy::many_single_char_names,
         reason = "d, dmin, sc, m, k are the standard GGML/llama.cpp names of these fields"
     )]
-    unsafe fn fill(&mut self, row: &[u8], blocks: usize) -> Option<(u32, u32)> {
+    pub(crate) unsafe fn fill(&mut self, row: &[u8], blocks: usize) -> Option<(u32, u32)> {
         let mut kmin = u32::MAX;
         let mut kmax = 0u32;
         let nib = _mm256_set1_epi8(0x0F);
@@ -797,7 +788,7 @@ impl Q4KRow {
     clippy::cast_ptr_alignment,
     reason = "the row's decoded scales and the pack travel as one argument each, so the group loop  keeps them in registers; g, b, s, d, x, kd, km name the kernel's grid; every load is  the unaligned load the packed buffers require"
 )]
-unsafe fn q4_k_row_lanes_avx2(
+pub(crate) unsafe fn q4_k_row_lanes_avx2(
     row: &[u8],
     blocks: usize,
     qs: &[QuantAct],
@@ -961,7 +952,7 @@ unsafe fn q6_group_raw(ql: __m256i, qh: __m256i, j: usize) -> __m256i {
 
 /// One row's decoded `Q6_K` block data, refilled per row: the 32 signed weight bytes of every 32-input
 /// group, its `128·Σ w` bias and `m_d·sc` per 16-lane half, and the row's `k_d` per block.
-struct Q6KRow {
+pub(crate) struct Q6KRow {
     /// `[block][group][lane]`: the 32 signed weight bytes of each 32-input group.
     bytes: Vec<u8>,
     /// `[block][group]`: `128·Σ w` over the group's first and second 16 lanes.
@@ -980,7 +971,7 @@ impl Q6KRow {
     /// # Complexity
     ///
     /// `O(blocks)` time and six allocations; `blocks·256` bytes and `blocks·33` words.
-    fn new(blocks: usize) -> Self {
+    pub(crate) fn new(blocks: usize) -> Self {
         Q6KRow {
             bytes: vec![0u8; blocks * 256],
             bias_lo: vec![0i32; blocks * 8],
@@ -1007,7 +998,7 @@ impl Q6KRow {
         clippy::many_single_char_names,
         reason = "n, j, k are the standard GGML block-half and window names"
     )]
-    unsafe fn fill(&mut self, row: &[u8], blocks: usize) -> Option<(u32, u32)> {
+    pub(crate) unsafe fn fill(&mut self, row: &[u8], blocks: usize) -> Option<(u32, u32)> {
         let mut kmin = u32::MAX;
         let mut kmax = 0u32;
         let mut b = 0usize;
@@ -1071,7 +1062,7 @@ impl Q6KRow {
     clippy::cast_ptr_alignment,
     reason = "the row's decoded scales and the pack travel as one argument each, so the group loop  keeps them in registers; g, b, s, d_lo, d_hi, kd name the kernel's grid; every load  is the unaligned load the packed buffers require"
 )]
-unsafe fn q6_k_row_lanes_avx2(
+pub(crate) unsafe fn q6_k_row_lanes_avx2(
     row: &[u8],
     blocks: usize,
     qs: &[QuantAct],
@@ -1193,326 +1184,4 @@ unsafe fn q6_k_row_lanes_avx2(
         g += 1;
     }
     true
-}
-
-/// Weight rows per pool task of a call with `n_out ≤ `[`NARROW_ROWS`]: small projections keep the
-/// pool's participant shares closer to its weighted split.
-const NARROW_ROWS_PER_TASK: usize = 4;
-/// Widest projection that takes [`NARROW_ROWS_PER_TASK`] (the `1024`-row down / `attn_output` /
-/// `ssm_out` shapes of the prefill).
-const NARROW_ROWS: usize = 1024;
-
-/// Weight rows per pool task for `n_out` rows of one call; each task's rows are independent, so the
-/// partition changes no word. `O(1)`.
-#[inline]
-fn task_rows(n_out: usize) -> usize {
-    if n_out <= NARROW_ROWS {
-        NARROW_ROWS_PER_TASK
-    } else {
-        ROWS_PER_TASK
-    }
-}
-
-/// The write pointers of a call's `k` output columns, each into that column's own `Vec<i64>`
-/// reserved to `n_out`.
-///
-/// Task `t` writes rows `[t·rpt, min((t+1)·rpt, n_out))` of every column; the row ranges partition
-/// `0..n_out`, so no two tasks write the same element and no two tasks alias.
-struct ColWrites {
-    ptrs: Vec<*mut MaybeUninit<i64>>,
-}
-
-// SAFETY: [`ColWrites`] holds one pointer into each column's own allocation, and every task stores
-// only its own disjoint row range of each column, so no two tasks alias an element.
-unsafe impl Send for ColWrites {}
-// SAFETY: as above.
-unsafe impl Sync for ColWrites {}
-
-impl ColWrites {
-    /// The columns' spare-capacity pointers, one per column.
-    ///
-    /// # Complexity
-    ///
-    /// `O(k)` time, one allocation of `k` pointers.
-    fn of(cols: &mut [Vec<i64>]) -> Self {
-        let mut ptrs = Vec::with_capacity(cols.len());
-        let mut c = 0usize;
-        while c < cols.len() {
-            ptrs.push(cols[c].spare_capacity_mut().as_mut_ptr());
-            c += 1;
-        }
-        ColWrites { ptrs }
-    }
-
-    /// Stores `v` at column `c`, row `row`.
-    ///
-    /// # Safety
-    ///
-    /// `c < k`, `row < n_out`, and no other task writes the same `(c, row)`.
-    #[inline]
-    unsafe fn put(&self, c: usize, row: usize, v: i64) {
-        // SAFETY: the caller guarantees the index is reserved and unaliased.
-        unsafe { self.ptrs[c].add(row).write(MaybeUninit::new(v)) };
-    }
-}
-
-/// `k` output columns reserved to `cap` rows.
-///
-/// # Complexity
-///
-/// `O(k)` time and allocations (`k + 1`), `O(k·cap)` words reserved.
-fn empty_columns(k: usize, cap: usize) -> Vec<Vec<i64>> {
-    let mut cols = Vec::with_capacity(k);
-    let mut c = 0usize;
-    while c < k {
-        cols.push(Vec::with_capacity(cap));
-        c += 1;
-    }
-    cols
-}
-
-/// The [`gemm_q4_k`] row-task context.
-struct Q4KRows<'a> {
-    raw: &'a [u8],
-    row_bytes: usize,
-    sb: usize,
-    n_out: usize,
-    rpt: usize,
-    qs: &'a [QuantAct],
-    packed: &'a PackedCols,
-    limit: u32,
-    out: &'a ColWrites,
-    bad: &'a Flag,
-}
-
-impl IndexTask for Q4KRows<'_> {
-    fn run(&self, t: usize) {
-        let r0 = t * self.rpt;
-        let r1 = (r0 + self.rpt).min(self.n_out);
-        let k = self.qs.len();
-        let mut sc = Q4KRow::new(self.sb);
-        let mut out = vec![0i64; k];
-        let mut ok = true;
-        let mut r = r0;
-        while r < r1 && ok {
-            let row = &self.raw[r * self.row_bytes..(r + 1) * self.row_bytes];
-            // SAFETY: AVX2 was detected by the caller and `row` holds `sb` blocks of this geometry.
-            let Some((kmin, kmax)) = (unsafe { sc.fill(row, self.sb) }) else {
-                ok = false;
-                break;
-            };
-            // SAFETY: as `fill`, and `packed` covers every column with `out.len() == k`.
-            let done = unsafe {
-                q4_k_row_lanes_avx2(
-                    row,
-                    self.sb,
-                    self.qs,
-                    self.packed,
-                    &sc,
-                    kmin,
-                    kmax - kmin,
-                    self.limit,
-                    &mut out,
-                )
-            };
-            if !done {
-                ok = false;
-                break;
-            }
-            let mut c = 0usize;
-            while c < k {
-                // SAFETY: `(c, r)` is inside every column's reserved extent and this task owns row
-                // `r` of every column.
-                unsafe { self.out.put(c, r, out[c]) };
-                c += 1;
-            }
-            r += 1;
-        }
-        if !ok {
-            self.bad.set();
-        }
-    }
-}
-
-/// The [`gemm_q6_k`] row-task context.
-struct Q6KRows<'a> {
-    raw: &'a [u8],
-    row_bytes: usize,
-    blocks: usize,
-    n_out: usize,
-    rpt: usize,
-    qs: &'a [QuantAct],
-    packed: &'a PackedCols,
-    limit: u32,
-    out: &'a ColWrites,
-    bad: &'a Flag,
-}
-
-impl IndexTask for Q6KRows<'_> {
-    fn run(&self, t: usize) {
-        let r0 = t * self.rpt;
-        let r1 = (r0 + self.rpt).min(self.n_out);
-        let k = self.qs.len();
-        let mut sc = Q6KRow::new(self.blocks);
-        let mut out = vec![0i64; k];
-        let mut ok = true;
-        let mut r = r0;
-        while r < r1 && ok {
-            let row = &self.raw[r * self.row_bytes..(r + 1) * self.row_bytes];
-            // SAFETY: AVX2 was detected by the caller and `row` holds `blocks` `Q6_K` blocks.
-            let Some((kmin, kmax)) = (unsafe { sc.fill(row, self.blocks) }) else {
-                ok = false;
-                break;
-            };
-            // SAFETY: as `fill`, and `packed` covers every column with `out.len() == k`.
-            let done = unsafe {
-                q6_k_row_lanes_avx2(
-                    row,
-                    self.blocks,
-                    self.qs,
-                    self.packed,
-                    &sc,
-                    kmin,
-                    kmax - kmin,
-                    self.limit,
-                    &mut out,
-                )
-            };
-            if !done {
-                ok = false;
-                break;
-            }
-            let mut c = 0usize;
-            while c < k {
-                // SAFETY: as in the `Q4_K` task: the index is reserved and this task owns it.
-                unsafe { self.out.put(c, r, out[c]) };
-                c += 1;
-            }
-            r += 1;
-        }
-        if !ok {
-            self.bad.set();
-        }
-    }
-}
-
-/// The k-column `Q4_K` projection: column `c` is `matvec_q8act(Q4_K, raw, n_out, n_in, &qs[c])` word
-/// for word, or `None` when the caller must run the contract path. Admission is the contract's own:
-/// every column on its `fast` row (`len`, scales, `q8act_fast_bound_ok(n_in, 1008, q, narrow)`), plus
-/// `n_in % 256`, a full payload, AVX2 and a power-of-two activation scale ([`pack_cols`]).
-/// Temporal `O(n_out·n_in·k)`, split over `⌈n_out/task_rows(n_out)⌉` pool tasks.
-/// Spatial `O(n_out·k)` output plus the `O(k·n_in)` pack.
-#[must_use]
-pub(crate) fn gemm_q4_k(
-    raw: &[u8],
-    n_out: usize,
-    n_in: usize,
-    qs: &[QuantAct],
-) -> Option<Vec<Vec<i64>>> {
-    if n_out == 0 || qs.is_empty() || n_in == 0 || !n_in.is_multiple_of(256) || !x86::avx2() {
-        return None;
-    }
-    let sb = n_in / 256;
-    let n32 = sb * 8;
-    let row_bytes = sb.checked_mul(Q4_K_BLOCK_BYTES)?;
-    if raw.len() < n_out.checked_mul(row_bytes)? {
-        return None;
-    }
-    let k = qs.len();
-    let mut c = 0usize;
-    while c < k {
-        let q = &qs[c];
-        if q.len() != n_in
-            || q.scales().len() != n32
-            || !super::q8act_fast_bound_ok(n_in, Q4_K_FAST_TOP, q, true)
-        {
-            return None;
-        }
-        c += 1;
-    }
-    n_out.checked_mul(k)?;
-    let packed = pack_cols(qs, n32, true)?;
-    let limit = lane_spread_limit(n32);
-    let mut cols = empty_columns(k, n_out);
-    let out = ColWrites::of(&mut cols);
-    let bad = Flag::new();
-    let rpt = task_rows(n_out);
-    let ctx = Q4KRows {
-        raw,
-        row_bytes,
-        sb,
-        n_out,
-        rpt,
-        qs,
-        packed: &packed,
-        limit,
-        out: &out,
-        bad: &bad,
-    };
-    run_global(n_out.div_ceil(rpt), &ctx);
-    if bad.get() {
-        return None;
-    }
-    // SAFETY: every index `0..n_out` of every column was written exactly once above.
-    unsafe { set_written_lens(&mut cols, n_out) };
-    Some(cols)
-}
-
-/// The k-column `Q6_K` projection: column `c` is `matvec_q8act(Q6_K, raw, n_out, n_in, &qs[c])` word
-/// for word, or `None` when the caller must run the contract path. Admission is [`gemm_q4_k`]'s with
-/// `Q6_K`'s 256-wide geometry and `q8act_fast_bound_ok(n_in, 4096, q, narrow)`.
-/// Temporal `O(n_out·n_in·k)` over the same pool split; spatial `O(n_out·k)` output.
-#[must_use]
-pub(crate) fn gemm_q6_k(
-    raw: &[u8],
-    n_out: usize,
-    n_in: usize,
-    qs: &[QuantAct],
-) -> Option<Vec<Vec<i64>>> {
-    if n_out == 0 || qs.is_empty() || n_in == 0 || !n_in.is_multiple_of(256) || !x86::avx2() {
-        return None;
-    }
-    let blocks = n_in / 256;
-    let row_bytes = blocks.checked_mul(Q6_K_BLOCK_BYTES)?;
-    if raw.len() < n_out.checked_mul(row_bytes)? {
-        return None;
-    }
-    let k = qs.len();
-    let mut c = 0usize;
-    while c < k {
-        let q = &qs[c];
-        if q.len() != n_in
-            || q.scales().len() != blocks * 8
-            || !super::q8act_fast_bound_ok(n_in, Q6_K_FAST_TOP, q, true)
-        {
-            return None;
-        }
-        c += 1;
-    }
-    n_out.checked_mul(k)?;
-    let packed = pack_cols(qs, blocks * 8, false)?;
-    let limit = lane_spread_limit(n_in / 16);
-    let mut cols = empty_columns(k, n_out);
-    let out = ColWrites::of(&mut cols);
-    let bad = Flag::new();
-    let rpt = task_rows(n_out);
-    let ctx = Q6KRows {
-        raw,
-        row_bytes,
-        blocks,
-        n_out,
-        rpt,
-        qs,
-        packed: &packed,
-        limit,
-        out: &out,
-        bad: &bad,
-    };
-    run_global(n_out.div_ceil(rpt), &ctx);
-    if bad.get() {
-        return None;
-    }
-    // SAFETY: every index `0..n_out` of every column was written exactly once above.
-    unsafe { set_written_lens(&mut cols, n_out) };
-    Some(cols)
 }

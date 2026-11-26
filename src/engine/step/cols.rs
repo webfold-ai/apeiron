@@ -227,7 +227,9 @@ impl Engine {
         drop(t_embed);
         // The resident `Q8Act` composition resolves the per-layer directory entries once per
         // pass (`LayerIndex`); every other schedule keeps the name-based lookups.
-        let layers = if matches!(sched, Sched::Resident) && mode == KernelMode::Q8Act {
+        let layers = if matches!(sched, Sched::Resident)
+            && matches!(mode, KernelMode::Q8Act | KernelMode::Ternary)
+        {
             self.resolve_layers()
         } else {
             Vec::new()
@@ -338,7 +340,7 @@ impl Engine {
                 block,
                 Sched::Resident,
                 mode,
-                mode == KernelMode::Q8Act,
+                matches!(mode, KernelMode::Q8Act | KernelMode::Ternary),
                 None,
                 record,
             )?;
@@ -471,8 +473,9 @@ impl Engine {
 
     /// Layer part `part`'s projection of every column: the single-column helpers for one column;
     /// for more, the pooled `matmat_q8act` kernel on a resident `Q8_0`, `Q4_K` or `Q6_K` tensor
-    /// (weights read once per column group), else one single-column projection per column. Every
-    /// column equals the single path's.
+    /// (weights read once per column group), the pooled sign-rank product for a packed `NanoQuant`
+    /// linear, else one single-column projection per column. Every column equals the single
+    /// path's.
     ///
     /// # Complexity
     ///
@@ -494,22 +497,19 @@ impl Engine {
         mode: KernelMode,
         pre: Option<&[QuantAct]>,
     ) -> Result<Vec<Vec<i64>>, StepError> {
-        // A fitted linear's operand is its fold face, not its payload: this stands ahead of every
-        // branch below, so no arm reads the bytes of a linear a pack replaces.
         let key = super::part_key(layer, part);
-        if self.fold_linear(key).is_some() {
-            let mut out = Vec::with_capacity(xs.len());
-            let mut i = 0usize;
-            while i < xs.len() {
-                let y = self.fold_proj(key, n_out, n_in, &xs[i])?.ok_or_else(|| {
-                    StepError::BadConfig(format!("fold linear {key} left the pack"))
-                })?;
-                out.push(y);
-                i += 1;
+        // A packed linear carries no GGUF payload, so it takes the sign-rank entry, not the pooled
+        // payload kernels below. For more than one column the pooled sign-rank product reads each
+        // `V` and `U` row once per group; a refusal reruns the group per column, where each
+        // column keeps the single entry's own reader fallback.
+        let Some(li) = li.filter(|_| self.nq_linear(key).is_none()) else {
+            if xs.len() > 1 {
+                match self.nq_proj_pooled(key, n_out, n_in, xs, mode) {
+                    Ok(Some(out)) => return Ok(out),
+                    Ok(None) | Err(StepError::Nq(crate::engine::NqError::Overflow)) => {}
+                    Err(e) => return Err(e),
+                }
             }
-            return Ok(out);
-        }
-        let Some(li) = li else {
             let mut out = Vec::with_capacity(xs.len());
             let mut i = 0usize;
             while i < xs.len() {
@@ -523,6 +523,7 @@ impl Engine {
         if xs.len() > 1 && self.hadamard().is_none() {
             let (ggml_type, at) = self.payload_at(idx, n_out, n_in, Sched::Resident)?;
             if ggml_type == quant::GGML_TYPE_Q8_0
+                || ggml_type == quant::GGML_TYPE_Q5_0
                 || ggml_type == quant::GGML_TYPE_Q4_K
                 || ggml_type == quant::GGML_TYPE_Q6_K
                 || ggml_type == quant::GGML_TYPE_F16
@@ -538,6 +539,7 @@ impl Engine {
                 // row kernels when it admits every column and the per-column oracle otherwise, so
                 // a refusal here is the single-column call's own value.
                 if ggml_type == quant::GGML_TYPE_Q8_0
+                    || ggml_type == quant::GGML_TYPE_Q5_0
                     || ggml_type == quant::GGML_TYPE_Q4_K
                     || ggml_type == quant::GGML_TYPE_Q6_K
                 {
@@ -561,14 +563,7 @@ impl Engine {
         let mut out = Vec::with_capacity(xs.len());
         let mut i = 0usize;
         while i < xs.len() {
-            out.push(self.proj_q8act_at(
-                idx,
-                super::part_key(layer, part),
-                n_out,
-                n_in,
-                &xs[i],
-                budget,
-            )?);
+            out.push(self.proj_q8act_at(idx, key, n_out, n_in, &xs[i], budget)?);
             i += 1;
         }
         Ok(out)
@@ -647,7 +642,12 @@ impl Engine {
         sched: Sched,
         mode: KernelMode,
     ) -> Result<Vec<Vec<Vec<i64>>>, StepError> {
-        if xs.len() == 1 {
+        // A packed member has no payload, so the fused group kernel does not apply; the per-part
+        // loop below takes `proj_cols`' sign-rank face for it.
+        let nq = parts
+            .iter()
+            .any(|&part| self.nq_linear(super::part_key(layer, part)).is_some());
+        if xs.len() == 1 && !nq {
             if let Some(li) = li {
                 let mut got = self.group_q8act_at(
                     li,
@@ -675,7 +675,7 @@ impl Engine {
             Some(_) => true,
             None => false,
         };
-        let packed = has_index && xs.len() > 1;
+        let packed = has_index && xs.len() > 1 && !nq;
         let qs = if packed { quant_cols(xs)? } else { Vec::new() };
         // The parts of a resident `Q8_0` group share `n_in`, so one activation pack and one row
         // dispatch serve them all. The group defers (`None`) to the per-part loop below, which owns
@@ -989,12 +989,12 @@ impl Engine {
             3 * trace::q8_bytes(n_ff, n_embd),
             3 * trace::macs(n_ff, n_embd, xs.len()),
         );
-        // A fitted `gate`, `up` or `down` is a fold face, so the payload-index branches below
-        // would read the `GGUF` bytes instead of it; the `proj_cols` route serves them.
-        let folded = (4..=6).any(|p| self.fold_linear(super::part_key(layer, p)).is_some());
+        // A fitted FFN has no GGUF payload for the fused or exact-tapped kernels; its three
+        // projections take the separate path below through `proj_cols`' sign-rank face.
+        let nq_ffn = self.nq_linear(super::part_key(layer, 4)).is_some();
         // The `Exact` schedule resolves no layer index, so the single-column entry below has no
         // tap; run the tapped exact body per column here and record the gate, up and product.
-        if li.is_none() && mode == KernelMode::Exact && tap.is_some() && !folded {
+        if !nq_ffn && li.is_none() && mode == KernelMode::Exact && tap.is_some() {
             let mut out: Vec<Vec<i64>> = Vec::with_capacity(xs.len());
             let mut gate_rows: Vec<Vec<i64>> = Vec::with_capacity(xs.len());
             let mut up_rows: Vec<Vec<i64>> = Vec::with_capacity(xs.len());
@@ -1013,7 +1013,7 @@ impl Engine {
             }
             return Ok(out);
         }
-        if (xs.len() == 1 || li.is_none()) && !folded {
+        if !nq_ffn && (xs.len() == 1 || li.is_none()) {
             let mut out = Vec::with_capacity(xs.len());
             for x in xs {
                 out.push(match li {
@@ -1023,7 +1023,7 @@ impl Engine {
             }
             return Ok(out);
         }
-        let qs = quant_cols(xs)?;
+        let qs = if nq_ffn { None } else { Some(quant_cols(xs)?) };
         // The tap's gate/up buffers, `k·n_ff` column-major words each, exist only when recording:
         // the fused epilogue stores into them and the separate path's gate/up projections are
         // recorded directly. Nothing is allocated on the off path.
@@ -1039,7 +1039,13 @@ impl Engine {
         // One pooled `[W_gate; W_up]` GEMM with the `SwiGLU` epilogue when both weights are `Q8_0`
         // and the fused kernel applies; `None` keeps the separate gate/up/`SwiGLU` path, which is
         // also the refusal owner for any gate/up value the fused kernel cannot produce exactly.
-        let hs = match self.ffn_fused_swiglu(li, layer, n_ff, n_embd, &qs, tape) {
+        // A fitted FFN takes that separate path with no activation pack: `proj_cols` dispatches
+        // each projection's sign-rank face from the same call.
+        let fused = match qs.as_deref() {
+            Some(q) if !nq_ffn => self.ffn_fused_swiglu(li, layer, n_ff, n_embd, q, tape),
+            _ => None,
+        };
+        let hs = match fused {
             Some(Ok(hs)) => {
                 record_flat_tap(tap, layer, &gate_flat, &up_flat, n_ff);
                 hs
@@ -1047,8 +1053,9 @@ impl Engine {
             Some(Err(e)) => return Err(StepError::Ffn(e)),
             None => {
                 let gate =
-                    self.proj_cols(li, layer, 4, n_ff, n_embd, xs, sched, mode, Some(&qs))?;
-                let up = self.proj_cols(li, layer, 5, n_ff, n_embd, xs, sched, mode, Some(&qs))?;
+                    self.proj_cols(li, layer, 4, n_ff, n_embd, xs, sched, mode, qs.as_deref())?;
+                let up =
+                    self.proj_cols(li, layer, 5, n_ff, n_embd, xs, sched, mode, qs.as_deref())?;
                 // The separate path holds the same pre-activations as its two projection
                 // outputs, so the tap takes them there.
                 record_tap(tap, layer, STAGE_GATE, &gate);
@@ -1197,7 +1204,7 @@ impl Engine {
                     x,
                 )
             }
-            KernelMode::Q8Act => {
+            KernelMode::Q8Act | KernelMode::Ternary => {
                 self.ffn_q8act_step([gi, ui, di], [(gt, gat), (ut, uat), (dt, dat)], n_ff, x)
             }
         }

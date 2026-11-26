@@ -687,19 +687,43 @@ fn vnni_and_avx2_cores_match_the_portable_twins() {
         let qh_k: Vec<u8> = (0..32)
             .map(|_| (next_rand(&mut state) & 0xff) as u8)
             .collect();
-        let xq_k: Vec<i8> = (0..128)
+        let second_low: Vec<u8> = (0..64)
+            .map(|_| (next_rand(&mut state) & 0xff) as u8)
+            .collect();
+        let second_high: Vec<u8> = (0..32)
+            .map(|_| (next_rand(&mut state) & 0xff) as u8)
+            .collect();
+        let xq_k: Vec<i8> = (0..256)
             .map(|_| ((next_rand(&mut state) % 255) as i64 - 127) as i8)
             .collect();
-        // SAFETY: AVX2 was detected; `ql` holds 64 bytes, `qh_k` 32 bytes and `xq_k` 128 lanes.
+        // SAFETY: AVX2 was detected; `ql` holds 64 bytes, `qh_k` 32 bytes and each 128-lane
+        // `xq_k` half is in bounds.
         let half_dots = unsafe { x86::q6_k_half_dots(ql.as_ptr(), qh_k.as_ptr(), xq_k.as_ptr()) };
+        // SAFETY: as above; the second half reads its own 64 `ql` bytes and 32 `qh` bytes at the
+        // block's `+64`/`+32` offsets, as `q6_k_row_kcols_avx2` calls it, and lanes 128..256 of
+        // `xq_k`.
+        let half_dots_hi = unsafe {
+            x86::q6_k_half_dots(
+                second_low.as_ptr(),
+                second_high.as_ptr(),
+                xq_k.as_ptr().add(128),
+            )
+        };
         let mut blk = vec![0u8; quant::Q6_K_BLOCK_BYTES];
         blk[..64].copy_from_slice(&ql);
+        blk[64..128].copy_from_slice(&second_low);
         blk[128..160].copy_from_slice(&qh_k);
+        blk[160..192].copy_from_slice(&second_high);
         let codes256 = quant::q6_k_codes(&blk).expect("q6_k_codes");
-        let port_dot0 = portable_i8_dot(&codes256[0..16], &xq_k[0..16]);
-        let port_dot1 = portable_i8_dot(&codes256[16..32], &xq_k[16..32]);
-        assert_eq!(half_dots[0], port_dot0, "q6_k group 0 low diverged");
-        assert_eq!(half_dots[1], port_dot1, "q6_k group 0 high diverged");
+        for g in 0..16 {
+            let got = if g < 8 {
+                half_dots[g]
+            } else {
+                half_dots_hi[g - 8]
+            };
+            let want = portable_i8_dot(&codes256[16 * g..16 * g + 16], &xq_k[16 * g..16 * g + 16]);
+            assert_eq!(got, want, "q6_k group {g} diverged from the portable twin");
+        }
 
         round += 1;
     }
@@ -1109,13 +1133,13 @@ fn spread_columns(n_in: usize, k: usize, seed: u64) -> Vec<QuantAct> {
     acts
 }
 
-/// `gemm_q4_k` column `c` is `matvec_q8act(Q4_K, …)`'s value for column `c`, word for word, at
-/// `n_out = 7`, `n_in ∈ {256, 1024}` and `k ∈ {1, 3, 8, 9, 33}`, on random codes and scales and on
-/// [`spread_columns`]; a non-finite block scale, a column past the fast bound and a ragged width
-/// refuse with `None` (the contract path owns those values).
+/// `matmat_q8act(Q4_K, …)` column `c` is `matvec_q8act(Q4_K, …)`'s value for column `c`, word for
+/// word, at `n_out = 7`, `n_in ∈ {256, 1024}` and `k ∈ {1, 3, 8, 9, 33}`, on random codes and scales
+/// and on [`spread_columns`]; a non-finite block scale, a column past the fast bound and a ragged
+/// width refuse (the contract path owns those values).
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn gemm_q4_k_equals_the_per_column_contract() {
+fn q4_k_matmat_equals_the_per_column_contract() {
     const N_OUT: usize = 7;
     const GEOMS: [usize; 2] = [256, 1024];
     const KS: [usize; 5] = [1, 3, 8, 9, 33];
@@ -1140,9 +1164,17 @@ fn gemm_q4_k_equals_the_per_column_contract() {
                     kcols_columns(n_in, k, seed ^ k as u64).0
                 };
                 super::kcols::reset_i128_groups();
-                let got = gemm_q4_k(&raw, N_OUT, n_in, &acts).unwrap_or_else(|| {
+                let got = crate::engine::kern::matmat::matmat_q8act(
+                    quant::GGML_TYPE_Q4_K,
+                    &raw,
+                    N_OUT,
+                    n_in,
+                    &acts,
+                )
+                .unwrap_or_else(|e| {
                     panic!(
-                        "gemm_q4_k refused a contract-fast call (n_in {n_in}, k {k}, wide {wide})"
+                        "matmat_q8act refused a contract-fast call (n_in {n_in}, k {k}, \
+                             wide {wide}): {e:?}"
                     )
                 });
                 assert_eq!(got.len(), k, "column count (n_in {n_in}, k {k})");
@@ -1157,29 +1189,47 @@ fn gemm_q4_k_equals_the_per_column_contract() {
                         .expect("the contract computes every random column");
                     assert_eq!(
                         got[c], want,
-                        "gemm_q4_k geometry (n_in {n_in}, k {k}, wide {wide}) column {c} diverged \
-                         from matvec_q8act"
+                        "matmat_q8act geometry (n_in {n_in}, k {k}, wide {wide}) column {c} \
+                         diverged from matvec_q8act"
                     );
                     c += 1;
                 }
                 let folds = super::kcols::I128_GROUPS.load(std::sync::atomic::Ordering::Relaxed);
-                assert_eq!(
-                    folds == 0,
-                    !wide,
-                    "gemm_q4_k n_in {n_in} k {k} wide {wide}: {folds} groups folded in i128"
-                );
+                if k > 1 {
+                    // The counter belongs to the pooled packed lane; `k = 1` takes the contract
+                    // path, which has no lane grid to fold.
+                    assert_eq!(
+                        folds == 0,
+                        !wide,
+                        "matmat_q8act n_in {n_in} k {k} wide {wide}: {folds} groups folded in i128"
+                    );
+                }
                 if !wide {
                     assert!(
-                        gemm_q4_k(&inf, N_OUT, n_in, &acts).is_none(),
-                        "gemm_q4_k must refuse a non-finite block scale (n_in {n_in}, k {k})"
+                        crate::engine::kern::matmat::matmat_q8act(
+                            quant::GGML_TYPE_Q4_K,
+                            &inf,
+                            N_OUT,
+                            n_in,
+                            &acts,
+                        )
+                        .is_err(),
+                        "matmat_q8act must refuse a non-finite block scale (n_in {n_in}, k {k})"
                     );
                     let over = [QuantAct {
                         scales: vec![i64::MAX / 2; n_in / ACT_QK],
                         codes: vec![127; n_in],
                     }];
                     assert!(
-                        gemm_q4_k(&raw, N_OUT, n_in, &over).is_none(),
-                        "gemm_q4_k must refuse a column past the fast bound (n_in {n_in}, k {k})"
+                        crate::engine::kern::matmat::matmat_q8act(
+                            quant::GGML_TYPE_Q4_K,
+                            &raw,
+                            N_OUT,
+                            n_in,
+                            &over,
+                        )
+                        .is_err(),
+                        "matmat_q8act must refuse a column past the fast bound (n_in {n_in}, k {k})"
                     );
                     assert!(
                         matvec_q8act(quant::GGML_TYPE_Q4_K, &raw, N_OUT, n_in, &over[0]).is_err(),
@@ -1188,11 +1238,28 @@ fn gemm_q4_k_equals_the_per_column_contract() {
                 }
             }
         }
-        // A width that is not a multiple of 64 is not a `Q4_K` fast row: refused at admission.
+        // A width that is not a multiple of 256 is not a `Q4_K` fast row: the call takes the
+        // per-column contract, which still computes the partial last super-block.
         let ragged = kcols_columns(n_in - ACT_QK, 1, seed).0;
-        assert!(
-            gemm_q4_k(&raw, N_OUT, n_in - ACT_QK, &ragged).is_none(),
-            "gemm_q4_k must refuse a width that is not a multiple of 64"
+        let want = matvec_q8act(
+            quant::GGML_TYPE_Q4_K,
+            &raw,
+            N_OUT,
+            n_in - ACT_QK,
+            &ragged[0],
+        )
+        .expect("the contract computes the ragged width");
+        let got = crate::engine::kern::matmat::matmat_q8act(
+            quant::GGML_TYPE_Q4_K,
+            &raw,
+            N_OUT,
+            n_in - ACT_QK,
+            &ragged,
+        )
+        .expect("the ragged width falls through to the contract path");
+        assert_eq!(
+            got[0], want,
+            "matmat_q8act diverged from the contract on a width that is not a multiple of 256"
         );
     }
 }
@@ -1229,7 +1296,7 @@ fn spread_span_columns(n_in: usize, k: usize, seed: u64, span: u32) -> Vec<Quant
 /// limit`) and the exact `i128` fold one past it; both agree with the per-column contract.
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn gemm_q4_k_switches_to_the_i128_fold_past_the_lane_bound() {
+fn q4_k_matmat_switches_to_the_i128_fold_past_the_lane_bound() {
     const N_OUT: usize = 4;
     const N_IN: usize = 1024;
     const K: usize = 3;
@@ -1253,7 +1320,14 @@ fn gemm_q4_k_switches_to_the_i128_fold_past_the_lane_bound() {
     for (span, lane_wanted) in [(base, true), (base + 1, false)] {
         let acts = spread_span_columns(N_IN, K, 0x9e37_1234, span);
         super::kcols::reset_i128_groups();
-        let got = gemm_q4_k(&raw, N_OUT, N_IN, &acts).expect("the edge call is admitted");
+        let got = crate::engine::kern::matmat::matmat_q8act(
+            quant::GGML_TYPE_Q4_K,
+            &raw,
+            N_OUT,
+            N_IN,
+            &acts,
+        )
+        .expect("the edge call is admitted");
         let folds = super::kcols::I128_GROUPS.load(Ordering::Relaxed);
         assert_eq!(
             folds == 0,
@@ -1266,10 +1340,10 @@ fn gemm_q4_k_switches_to_the_i128_fold_past_the_lane_bound() {
     }
 }
 
-/// As [`gemm_q4_k_equals_the_per_column_contract`] for `Q6_K`, with its 256-wide alignment.
+/// As [`q4_k_matmat_equals_the_per_column_contract`] for `Q6_K`, with its 256-wide alignment.
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn gemm_q6_k_equals_the_per_column_contract() {
+fn q6_k_matmat_equals_the_per_column_contract() {
     const N_OUT: usize = 7;
     const GEOMS: [usize; 2] = [256, 1024];
     const KS: [usize; 5] = [1, 3, 8, 9, 33];
@@ -1293,9 +1367,17 @@ fn gemm_q6_k_equals_the_per_column_contract() {
                     kcols_columns(n_in, k, seed ^ k as u64).0
                 };
                 super::kcols::reset_i128_groups();
-                let got = gemm_q6_k(&raw, N_OUT, n_in, &acts).unwrap_or_else(|| {
+                let got = crate::engine::kern::matmat::matmat_q8act(
+                    quant::GGML_TYPE_Q6_K,
+                    &raw,
+                    N_OUT,
+                    n_in,
+                    &acts,
+                )
+                .unwrap_or_else(|e| {
                     panic!(
-                        "gemm_q6_k refused a contract-fast call (n_in {n_in}, k {k}, wide {wide})"
+                        "matmat_q8act refused a contract-fast call (n_in {n_in}, k {k}, \
+                             wide {wide}): {e:?}"
                     )
                 });
                 assert_eq!(got.len(), k, "column count (n_in {n_in}, k {k})");
@@ -1310,29 +1392,47 @@ fn gemm_q6_k_equals_the_per_column_contract() {
                         .expect("the contract computes every random column");
                     assert_eq!(
                         got[c], want,
-                        "gemm_q6_k geometry (n_in {n_in}, k {k}, wide {wide}) column {c} diverged \
-                         from matvec_q8act"
+                        "matmat_q8act geometry (n_in {n_in}, k {k}, wide {wide}) column {c} \
+                         diverged from matvec_q8act"
                     );
                     c += 1;
                 }
                 let folds = super::kcols::I128_GROUPS.load(std::sync::atomic::Ordering::Relaxed);
-                assert_eq!(
-                    folds == 0,
-                    !wide,
-                    "gemm_q6_k n_in {n_in} k {k} wide {wide}: {folds} groups folded in i128"
-                );
+                if k > 1 {
+                    // The counter belongs to the pooled packed lane; `k = 1` takes the contract
+                    // path, which has no lane grid to fold.
+                    assert_eq!(
+                        folds == 0,
+                        !wide,
+                        "matmat_q8act n_in {n_in} k {k} wide {wide}: {folds} groups folded in i128"
+                    );
+                }
                 if !wide {
                     assert!(
-                        gemm_q6_k(&inf, N_OUT, n_in, &acts).is_none(),
-                        "gemm_q6_k must refuse a non-finite block scale (n_in {n_in}, k {k})"
+                        crate::engine::kern::matmat::matmat_q8act(
+                            quant::GGML_TYPE_Q6_K,
+                            &inf,
+                            N_OUT,
+                            n_in,
+                            &acts,
+                        )
+                        .is_err(),
+                        "matmat_q8act must refuse a non-finite block scale (n_in {n_in}, k {k})"
                     );
                     let over = [QuantAct {
                         scales: vec![i64::MAX / 2; n_in / ACT_QK],
                         codes: vec![127; n_in],
                     }];
                     assert!(
-                        gemm_q6_k(&raw, N_OUT, n_in, &over).is_none(),
-                        "gemm_q6_k must refuse a column past the fast bound (n_in {n_in}, k {k})"
+                        crate::engine::kern::matmat::matmat_q8act(
+                            quant::GGML_TYPE_Q6_K,
+                            &raw,
+                            N_OUT,
+                            n_in,
+                            &over,
+                        )
+                        .is_err(),
+                        "matmat_q8act must refuse a column past the fast bound (n_in {n_in}, k {k})"
                     );
                     assert!(
                         matvec_q8act(quant::GGML_TYPE_Q6_K, &raw, N_OUT, n_in, &over[0]).is_err(),
@@ -1341,16 +1441,35 @@ fn gemm_q6_k_equals_the_per_column_contract() {
                 }
             }
         }
+        // A width that is not a multiple of 256 is not a `Q6_K` fast row: the call takes the
+        // per-column contract, which still computes the partial last super-block.
         let ragged = kcols_columns(n_in - ACT_QK, 1, seed).0;
-        assert!(
-            gemm_q6_k(&raw, N_OUT, n_in - ACT_QK, &ragged).is_none(),
-            "gemm_q6_k must refuse a width that is not a multiple of 256"
+        let want = matvec_q8act(
+            quant::GGML_TYPE_Q6_K,
+            &raw,
+            N_OUT,
+            n_in - ACT_QK,
+            &ragged[0],
+        )
+        .expect("the contract computes the ragged width");
+        let got = crate::engine::kern::matmat::matmat_q8act(
+            quant::GGML_TYPE_Q6_K,
+            &raw,
+            N_OUT,
+            n_in - ACT_QK,
+            &ragged,
+        )
+        .expect("the ragged width falls through to the contract path");
+        assert_eq!(
+            got[0], want,
+            "matmat_q8act diverged from the contract on a width that is not a multiple of 256"
         );
     }
 }
 
 /// The call-level arms of [`bench_q4_k_kcols`] as ns per row-column over five calls each, sharing
-/// the pool, the row geometry and the columns; `gemm_q8_0` is the subsumed reference rate.
+/// the pool, the row geometry and the columns; `gemm_q8_0` is the subsumed reference rate. The
+/// `Q4_K` arm is the shared `matmat_q8act` carrier, the route production takes.
 #[cfg(target_arch = "x86_64")]
 #[allow(
     clippy::cast_precision_loss,
@@ -1367,13 +1486,19 @@ fn bench_call_arms(
     use std::time::Instant;
     let raw8 = random_payload(quant::GGML_TYPE_Q8_0, n_out, n_in, 0x3c00, 0x3c00, 0xbeef);
     let raw6 = random_payload(quant::GGML_TYPE_Q6_K, n_out, n_in, 0x3800, 0x3800, 0xbeef);
-    let mut gemm_secs = 0.0f64;
+    let mut q4k_secs = 0.0f64;
     for _ in 0..RUNS {
         let start = Instant::now();
-        let got = gemm_q4_k(raw, n_out, n_in, acts);
-        assert!(got.is_some(), "gemm_q4_k refused the microbench geometry");
-        std::hint::black_box(got);
-        gemm_secs += start.elapsed().as_secs_f64();
+        let got = crate::engine::kern::matmat::matmat_q8act(
+            quant::GGML_TYPE_Q4_K,
+            raw,
+            n_out,
+            n_in,
+            acts,
+        );
+        assert!(got.is_ok(), "matmat_q8act refused the microbench geometry");
+        let _ = std::hint::black_box(got);
+        q4k_secs += start.elapsed().as_secs_f64();
     }
     let mut q8_secs = 0.0f64;
     for _ in 0..RUNS {
@@ -1387,13 +1512,22 @@ fn bench_call_arms(
     let mut q6_secs = 0.0f64;
     for _ in 0..RUNS {
         let start = Instant::now();
-        let got = gemm_q6_k(&raw6, n_out, n_in, acts);
-        assert!(got.is_some(), "gemm_q6_k refused the microbench geometry");
-        std::hint::black_box(got);
+        let got = crate::engine::kern::matmat::matmat_q8act(
+            quant::GGML_TYPE_Q6_K,
+            &raw6,
+            n_out,
+            n_in,
+            acts,
+        );
+        assert!(
+            got.is_ok(),
+            "matmat_q8act refused the Q6_K microbench geometry"
+        );
+        let _ = std::hint::black_box(got);
         q6_secs += start.elapsed().as_secs_f64();
     }
     (
-        gemm_secs / RUNS as f64 / cells * 1e9,
+        q4k_secs / RUNS as f64 / cells * 1e9,
         q6_secs / RUNS as f64 / cells * 1e9,
         q8_secs / RUNS as f64 / cells * 1e9,
     )
@@ -1480,18 +1614,48 @@ fn bench_q4_k_kcols() {
     let kcols_ns = kcols_secs / RUNS as f64 / cells * 1e9;
     let single_ns = single_secs / RUNS as f64 / cells * 1e9;
 
-    let (gemm_ns, q6_ns, q8_ns) = bench_call_arms(&raw, &acts, N_OUT, N_IN, cells);
+    let (q4k_ns, q6_ns, q8_ns) = bench_call_arms(&raw, &acts, N_OUT, N_IN, cells);
     println!(
         "q4_k n_in {N_IN} k {K} n_out {N_OUT}: kcols {kcols_ns:.2} ns/row-column, single-column \
          {single_ns:.2} ns/row-column, ratio {:.2}x ({K} row reads per row in the single-column arm)",
         single_ns / kcols_ns
     );
     println!(
-        "call n_in {N_IN} k {K} n_out {N_OUT}: gemm_q4_k {gemm_ns:.2} ns/row-column, gemm_q6_k \
+        "call n_in {N_IN} k {K} n_out {N_OUT}: matmat_q4_k {q4k_ns:.2} ns/row-column, matmat_q6_k \
          {q6_ns:.2} ns/row-column, gemm_q8_0 {q8_ns:.2} ns/row-column (reference rate), \
-         gemm_q4_k/gemm_q8_0 {:.2}x, gemm_q6_k/gemm_q8_0 {:.2}x, single-column/gemm_q4_k {:.2}x",
-        gemm_ns / q8_ns,
+         matmat_q4_k/gemm_q8_0 {:.2}x, matmat_q6_k/gemm_q8_0 {:.2}x, single-column/matmat_q4_k {:.2}x",
+        q4k_ns / q8_ns,
         q6_ns / q8_ns,
-        single_ns / gemm_ns
+        single_ns / q4k_ns
+    );
+}
+
+/// `quant_act`'s cost on one token's pre-scaled `t` array: the packed 0.6B model's 196 linears sum
+/// 286,720 in-features per token (28 layers × 10,240: 1,024 each for q, k, v, gate and up, 2,048 for
+/// o, 3,072 for down). The projection also quantizes each linear's `z` (124,544 rank words per
+/// token); both sums are read from the pack header by the command in
+/// `bench/cpu/1795573862-prefill-block-and-group.md`. When the pack carries dense residuals the
+/// projection quantizes `x` too; this probe covers `t` only. Timed with `perf stat -e instructions`
+/// when the instruction side is wanted; ignored because it is a probe, not an equality.
+#[test]
+#[ignore = "timing probe: run with --ignored --exact --nocapture"]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "`reps` and `n` are far below 2^53, so both to-`f64` casts are exact"
+)]
+fn probe_quant_act_rate() {
+    let n = 286_720usize;
+    let x: Vec<i64> = (0..n).map(|i| ((i % 101) as i64 - 50) << 22).collect();
+    let reps = 5usize;
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        let q = quant_act(&x).expect("quantizes");
+        std::hint::black_box(&q);
+    }
+    let secs = t0.elapsed().as_secs_f64() / reps as f64;
+    println!(
+        "quant_act {:.3} ms for {n} elements, {:.2} ns/elem",
+        secs * 1e3,
+        secs * 1e9 / n as f64
     );
 }

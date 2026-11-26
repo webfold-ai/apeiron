@@ -430,6 +430,36 @@ impl GramShard {
         Ok(())
     }
 
+    /// The spectrum concentration of the folded Gram over its `r` largest modes:
+    /// `Σλ² / ‖G‖_F²`, in `[0, 1]` (`REG-3`). `1.0` means the statistic lives in a rank-`r`
+    /// subspace; a flat cone means the lift has nothing to read.
+    ///
+    /// # Errors
+    /// [`crate::learn::solve::eig::EigError`] from the core's eigensolver.
+    pub fn cone_fraction(
+        &self,
+        r: usize,
+    ) -> Result<f64, crate::learn::solve::eig::EigError> {
+        let d = self.d;
+        if d == 0 {
+            return Ok(0.0);
+        }
+        let top = crate::learn::solve::eig::top_eigh(&self.g, d, r.min(d))?;
+        let mut num: i128 = 0;
+        for l in &top.evals {
+            num += i128::from(*l) * i128::from(*l);
+        }
+        let mut den: i128 = 0;
+        for v in &self.g {
+            den += i128::from(*v) * i128::from(*v);
+        }
+        Ok(if den == 0 {
+            0.0
+        } else {
+            num as f64 / den as f64
+        })
+    }
+
     /// The read: `(G/n + ridge * mean(diag(G/n)))⁻¹ (B/n)` over the centred, real-space Gram, solved by
     /// the core's Cholesky. Weights are Q32.32, row-major `[d, k]`.
     ///

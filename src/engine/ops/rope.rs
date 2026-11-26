@@ -36,6 +36,9 @@ pub enum RopeError {
 pub struct RopeTable {
     head_dim: usize,
     turns: Vec<u64>,
+    /// Rotate the adjacent pair `(2j, 2j+1)` (ggml `NORM`, the `llama` GGUF layout) instead of the
+    /// split pair `(j, j + head_dim/2)` (ggml `NEOX`, the `qwen2` layout).
+    adjacent: bool,
 }
 
 impl RopeTable {
@@ -72,7 +75,7 @@ impl RopeTable {
             }
             j += 1;
         }
-        Ok(RopeTable { head_dim, turns })
+        Ok(RopeTable { head_dim, turns, adjacent: false })
     }
 
     /// Build the table from an explicit turn vector.
@@ -92,7 +95,48 @@ impl RopeTable {
         if turns.len() != head_dim / 2 {
             return Err(RopeError::TableLength);
         }
-        Ok(RopeTable { head_dim, turns })
+        Ok(RopeTable { head_dim, turns, adjacent: false })
+    }
+
+    /// Divide each pair's turn frequency by a per-pair factor given as a Q32.32 word
+    /// (`factor = word / 2^32`): the llama3 `rope_freqs.weight` scaling, `ggml_rope_ext`'s
+    /// `freq_factors`. Load-time float boundary like [`RopeTable::new`]: one `f64` division and one
+    /// rounding per pair; every per-token operation stays integer.
+    ///
+    /// # Errors
+    ///
+    /// [`RopeError::TableLength`] when `factors.len() != head_dim / 2`;
+    /// [`RopeError::OutOfRange`] for a non-positive factor or a turn that does not fit `u64`.
+    ///
+    /// # Complexity
+    ///
+    /// `O(head_dim)`.
+    pub fn divided_by_q32(&self, factors: &[i64]) -> Result<RopeTable, RopeError> {
+        if factors.len() != self.turns.len() {
+            return Err(RopeError::TableLength);
+        }
+        let mut turns: Vec<u64> = Vec::with_capacity(self.turns.len());
+        for (t, w) in self.turns.iter().zip(factors) {
+            if *w <= 0 {
+                return Err(RopeError::OutOfRange);
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let q = (*t as f64) / ((*w as f64) / 4_294_967_296.0);
+            if !q.is_finite() || q < 0.0 || q >= 18_446_744_073_709_551_616.0 {
+                return Err(RopeError::OutOfRange);
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            turns.push(q.round() as u64);
+        }
+        Ok(RopeTable { head_dim: self.head_dim, turns, adjacent: self.adjacent })
+    }
+
+    /// The same table rotating adjacent pairs `(2j, 2j+1)`: the ggml `NORM` rope of a `llama` GGUF,
+    /// whose converter permutes Q and K into that layout.
+    #[must_use]
+    pub fn with_adjacent_pairs(mut self) -> RopeTable {
+        self.adjacent = true;
+        self
     }
 
     /// The rotary head width this table is built for.
@@ -211,8 +255,9 @@ impl RopeTable {
             let phase = ((self.turns[j] as u128 * pos as u128) & u64::MAX as u128) as u64;
             match fixed_sin_cos(turn_to_radians(phase)) {
                 Ok(sc) => {
-                    let x0 = x[j];
-                    let x1 = x[j + d2];
+                    let (i0, i1) = if self.adjacent { (2 * j, 2 * j + 1) } else { (j, j + d2) };
+                    let x0 = x[i0];
+                    let x1 = x[i1];
                     let p00 = i128::from(x0) * i128::from(sc.cos);
                     let p01 = i128::from(x1) * i128::from(sc.sin);
                     let p10 = i128::from(x1) * i128::from(sc.cos);
@@ -229,8 +274,8 @@ impl RopeTable {
                                 {
                                     ok = false;
                                 } else {
-                                    x[j] = out0 as i64;
-                                    x[j + d2] = out1 as i64;
+                                    x[i0] = out0 as i64;
+                                    x[i1] = out1 as i64;
                                 }
                             }
                             None => ok = false,
@@ -263,4 +308,49 @@ pub fn rope_rotate_fixed(
     table: &RopeTable,
 ) -> Result<(), RopeError> {
     table.rotate(q, k, pos)
+}
+
+#[cfg(test)]
+mod freq_factor_tests {
+    use super::*;
+    use crate::engine::num::fp::F64;
+
+    const ONE: i64 = 1 << 32;
+
+    #[test]
+    fn unit_factors_are_identity_and_a_factor_divides_the_turn() {
+        let t = RopeTable::new(F64::from_f64(500_000.0), 8).unwrap();
+        let same = t.divided_by_q32(&[ONE; 4]).unwrap();
+        assert_eq!(same, t, "factor 1.0 must not move a turn");
+        let half = t.divided_by_q32(&[2 * ONE, ONE, ONE, ONE]).unwrap();
+        let want = (t.turns()[0] as f64 / 2.0).round() as u64;
+        assert_eq!(half.turns()[0], want);
+        assert_eq!(&half.turns()[1..], &t.turns()[1..]);
+        // controls: wrong length and a non-positive factor are refused
+        assert_eq!(t.divided_by_q32(&[ONE; 3]), Err(RopeError::TableLength));
+        assert_eq!(t.divided_by_q32(&[0, ONE, ONE, ONE]), Err(RopeError::OutOfRange));
+    }
+}
+
+#[cfg(test)]
+mod adjacent_pair_tests {
+    use super::*;
+    use crate::engine::num::fp::F64;
+
+    /// Adjacent mode rotates `(2j, 2j+1)` by the same angle split mode gives `(j, j+d2)`: one pair
+    /// carries a value, the other stays zero, so each mode moves only its own two slots.
+    #[test]
+    fn adjacent_and_split_pairs_touch_different_slots() {
+        let t = RopeTable::new(F64::from_f64(10_000.0), 8).unwrap();
+        let one = 1i64 << 32;
+        let mut split = vec![0i64; 8];
+        split[1] = one;
+        let mut adj = split.clone();
+        t.rotate_one(&mut split, 3).unwrap();
+        t.with_adjacent_pairs().rotate_one(&mut adj, 3).unwrap();
+        assert_ne!(split[1], one, "split mode must rotate slot 1 with slot 5");
+        assert_ne!(split[5], 0);
+        assert_eq!(adj[5], 0, "adjacent mode must leave slot 5 alone");
+        assert_ne!(adj[0], 0, "adjacent mode pairs slot 1 with slot 0");
+    }
 }

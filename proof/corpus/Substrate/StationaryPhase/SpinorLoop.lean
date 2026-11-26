@@ -122,7 +122,7 @@ matrix multiplication.
 * **Anchor:** §9's operational cost claims. That a 24-round power iteration's round
   count "is not a physical requirement", and that real PageRank's multi-mode error makes
   `aitken_exact` only approximately applicable, are argued in the prose; the catastrophic overshoot
-  after convergence is an empirical finding recorded in `BENCHMARK.md` (sangdb), not a theorem.
+  after convergence is an empirical finding recorded in `BENCHMARK.md` (iotadb), not a theorem.
   The prose already scopes this honestly, and `safe_error_bound` is the theorem that answers it.
 * **Anchor:** "a loop IS a spinor" — the identification of a control-flow construct
   with the affine monoid; that `cayley_isometry` is the discrete unitarity of Schrödinger time
@@ -1271,7 +1271,7 @@ theorem aitken_exact (step : AffineStep) (hA0 : step.rotor_decay ≠ 0) (hA1 : s
 
 -- ── THE SAFE ALTERNATIVE: an a-posteriori bound with no division-by-near-zero risk ────────────────
 -- `aitken_exact` recovers x* exactly from three iterates, but the empirical test against real
--- PageRank data (BENCHMARK.md, sangdb) found it can catastrophically overshoot once the sequence
+-- PageRank data (BENCHMARK.md, iotadb) found it can catastrophically overshoot once the sequence
 -- has actually converged — the second difference it divides by is then near/exactly zero. This is
 -- the alternative a real `authority`-style early-stop should actually use: a bound on the TRUE
 -- error from ONE observed step and a KNOWN constant (PageRank's damping factor `d` bounds the

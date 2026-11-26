@@ -31,13 +31,14 @@
 //! - If `m < entry.tokens.len()`, a clone of the prompt's state is truncated in-place to `m`
 //!   positions via [`truncate_kv_state`], which sets the layer occupied counters to `m`.
 //!
-//! Snapshot memory is dominated by the key and value matrices. For a prompt at `n` positions:
-//! - Per position, the KV footprint is `2 · kv_out · 8 · n_layer` bytes, where
-//!   `kv_out = n_head_kv · head_dim`.
-//! - For Qwen2.5-0.5B (`n_layer = 24`, `n_head_kv = 2`, `head_dim = 64`, `kv_out = 128`):
-//!   `2 · 128 · 8 · 24 = 49,152` bytes/position (~49 KB/position).
-//! - For Bonsai-8B (`n_layer = 32`, `n_head_kv = 8`, `head_dim = 128`, `kv_out = 1024`):
-//!   `2 · 1024 · 8 · 32 = 524,288` bytes/position (~512 KB/position, or ~458 KB/position with non-padded layout).
+//! Snapshot memory is dominated by the key and value planes, at the state's carrier width:
+//! - Per position, the footprint is `2 · n_head_kv · head_dim · n_layer` values times the carrier
+//!   width: 4 B for `F32`, 8 B for `Q32`, and 1 B plus one `f32` scale per row per plane for `I8`.
+//! - The charge is that times `cap`, because a clone carries whole planes, not the occupied prefix.
+//! - Qwen3-0.6B (28 layers, 8 kv heads × 128): 57,344 values/position, 229,376 B at `F32`, so
+//!   405 MiB at capacity 1,851.
+//! - The 8B (36 layers, 8 kv heads × 128): 73,728 values/position, 294,912 B at `F32`, so
+//!   580 MiB at capacity 2,064.
 //!
 //! # Eviction
 //!
@@ -63,12 +64,14 @@
 //! - `PrefixCache::insert`: `O(m)` hashing and token cloning, `O(m / B)` boundary insertions, plus
 //!   eviction: one `O(entries)` LRU scan per evicted entry, so `O(entries²)` when the whole cache is
 //!   recycled.
-//! - `prefill_with_cache`: resumes from prefix `m` (saving `m` steps of `O(n_layer · ...)` compute),
-//!   then steps the remaining `n - m` tokens. Overall speedup is proportional to `m / n`.
+//! - `prefill_with_cache`: resumes from prefix `m` (saving `m` positions of `O(n_layer · ...)`
+//!   compute), then solves the remaining `n - m - 1` positions in block passes and steps only the
+//!   last token. Overall speedup is proportional to `m / n`.
 
 use crate::engine::attn::KvState;
 use crate::engine::loader::Engine;
 use crate::engine::step::{StepError, StepResult};
+use crate::engine::{argmax_fixed, fixed_vector_checksum, KernelMode};
 use crate::map::coord::locator::ExactIdentity;
 use crate::map::freq::{Coord, Table};
 
@@ -284,15 +287,12 @@ impl<H: PrefixHasher> PrefixCache<H> {
         self.arena.iter().filter(|e| e.is_some()).count()
     }
 
-    /// Estimates the byte size of a [`KvState`] snapshot at `m` positions.
-    ///
-    /// Per position: `2 · (n_head_kv · head_dim) · 8 · n_layer` bytes.
+    /// The resident bytes of a [`KvState`] snapshot: the clone carries whole planes at `cap`, so
+    /// the charge is the carrier's bytes per position times the capacity, not the occupied prefix.
     /// Temporal: O(1); spatial: O(1).
     #[must_use]
-    pub fn estimate_snapshot_bytes(kv: &KvState, m: usize) -> usize {
-        let kv_out = kv.n_head_kv() * kv.head_dim();
-        // 2 (k and v) * kv_out elements * 8 bytes (i64) * n_layer * m positions
-        2 * kv_out * 8 * kv.n_layer() * m
+    pub fn estimate_snapshot_bytes(kv: &KvState) -> usize {
+        kv.bytes_per_position().saturating_mul(kv.cap())
     }
 
     /// Probes for the longest cached prefix matching `tokens`.
@@ -386,6 +386,8 @@ impl<H: PrefixHasher> PrefixCache<H> {
     ///
     /// - Returns [`PrefixCacheError::BudgetExceeded`] when the snapshot alone exceeds `byte_budget`,
     ///   leaving the cache completely unchanged.
+    /// - Returns [`PrefixCacheError::Step`] with [`StepError::BadConfig`] when `kv` holds fewer
+    ///   positions than `tokens`.
     /// - Returns [`PrefixCacheError::CapacityExceeded`] if boundary length exceeds `u32::MAX`.
     ///
     /// # Complexity
@@ -399,7 +401,18 @@ impl<H: PrefixHasher> PrefixCache<H> {
             return Ok(());
         }
 
-        let needed = Self::estimate_snapshot_bytes(kv, m);
+        // The snapshot must hold the prompt it is filed under; a shorter state would resume at
+        // the wrong offset.
+        let occ = kv
+            .min_occupied()
+            .map_err(|e| PrefixCacheError::Step(StepError::Kv(e)))?;
+        if occ < m {
+            return Err(PrefixCacheError::Step(StepError::BadConfig(format!(
+                "the snapshot holds {occ} positions for a {m}-token prompt"
+            ))));
+        }
+
+        let needed = Self::estimate_snapshot_bytes(kv);
 
         // A snapshot that cannot fit even in an empty cache is refused before any mutation.
         if needed > self.byte_budget {
@@ -476,27 +489,59 @@ pub fn truncate_kv_state(kv: &mut KvState, m: usize) -> bool {
 /// 2. If a prefix of length `m` is found, clones its `KvState` as the starting state,
 ///    and truncates it in-place to `m` positions via [`truncate_kv_state`].
 ///    Otherwise, creates a fresh cold `KvState` with capacity `tokens.len() + extra_capacity`.
-/// 3. Steps through the remaining tokens `tokens[m..]`, advancing the KV state.
+/// 3. Solves the remaining tokens `tokens[m..n-1]` in block passes over the weights, then steps
+///    only the last token for its [`StepResult`].
 /// 4. If `insert_boundaries` is true, stores the completed prompt snapshot into the cache.
 /// 5. Returns the final `KvState` and the last `StepResult`.
+///
+/// This wrapper runs [`KernelMode::Exact`]; [`prefill_with_cache_mode`] selects the reader.
 ///
 /// # Errors
 ///
 /// - Returns [`PrefixCacheError::EmptyPrompt`] if `tokens` is empty.
 /// - Returns [`PrefixCacheError::CapacityExceeded`] if cache snapshot capacity is smaller
 ///   than needed.
-/// - Returns [`PrefixCacheError::Step`] on decode step failure.
+/// - Returns [`PrefixCacheError::Step`] on a projection or decode refusal.
 ///
 /// # Complexity
 ///
-/// `O(n / B)` lookup time + `O((n - m) · cost_per_step)`. When `m == n - 1`, only 1 decode step
-/// is executed.
+/// `O(n / B)` lookup time + `O(⌈(n − m) / w⌉)` block passes over the weights, `w` the engine's
+/// prefill block width, and one single-token step. When `m == n - 1`, only the step runs.
 pub fn prefill_with_cache<H: PrefixHasher>(
     engine: &Engine,
     cache: &mut PrefixCache<H>,
     tokens: &[u32],
     extra_capacity: usize,
     insert_boundaries: bool,
+) -> Result<(KvState, StepResult), PrefixCacheError> {
+    prefill_with_cache_mode(
+        engine,
+        cache,
+        tokens,
+        extra_capacity,
+        insert_boundaries,
+        KernelMode::Exact,
+    )
+}
+
+/// [`prefill_with_cache`] under a projection kernel: the cached prefix is the solved part, and the
+/// missed tail is one block pass, not one step per token.
+///
+/// # Errors
+///
+/// As [`prefill_with_cache`], plus [`PrefixCacheError::Step`] with [`StepError::BadConfig`] when
+/// the model carries affine layer state, which a [`KvState`] snapshot does not represent.
+///
+/// # Complexity
+///
+/// As [`prefill_with_cache`].
+pub fn prefill_with_cache_mode<H: PrefixHasher>(
+    engine: &Engine,
+    cache: &mut PrefixCache<H>,
+    tokens: &[u32],
+    extra_capacity: usize,
+    insert_boundaries: bool,
+    mode: KernelMode,
 ) -> Result<(KvState, StepResult), PrefixCacheError> {
     let n = tokens.len();
     if n == 0 {
@@ -507,18 +552,24 @@ pub fn prefill_with_cache<H: PrefixHasher>(
         .checked_add(extra_capacity)
         .ok_or(PrefixCacheError::Step(StepError::LengthOverflow))?;
 
-    // Step 1: probe cache for longest prefix strictly less than n tokens so that at least
-    // the last token tokens[n - 1] is stepped to produce the step result (logits / prediction).
+    // Probe for a prefix strictly less than `n` so at least the last token is stepped to produce
+    // the step result.
     let prefix_bound = &tokens[..n.saturating_sub(1)];
-    let (start_pos, mut kv) = if let Some((m, cached_state)) = cache.longest_prefix(prefix_bound) {
+    let (start_pos, kv) = if let Some((m, cached_state)) = cache.longest_prefix(prefix_bound) {
         if cached_state.cap() < total_cap {
             return Err(PrefixCacheError::CapacityExceeded);
         }
         let mut kv = cached_state.clone();
-        if let Ok(occ) = kv.occupied(0) {
-            if occ > m && !truncate_kv_state(&mut kv, m) {
-                return Err(PrefixCacheError::CapacityExceeded);
-            }
+        let occ = kv
+            .min_occupied()
+            .map_err(|e| PrefixCacheError::Step(StepError::Kv(e)))?;
+        if occ < m {
+            return Err(PrefixCacheError::Step(StepError::BadConfig(format!(
+                "the cached state holds {occ} positions, its boundary claims {m}"
+            ))));
+        }
+        if occ > m && !truncate_kv_state(&mut kv, m) {
+            return Err(PrefixCacheError::CapacityExceeded);
         }
         (m, kv)
     } else {
@@ -530,29 +581,41 @@ pub fn prefill_with_cache<H: PrefixHasher>(
         )
     };
 
-    // Step 2: prefill remaining tokens
-    let mut last_result = None;
-    let mut pos = start_pos;
+    let mut st = engine.state_with_kv(kv);
+    if st.affine.is_some() {
+        return Err(PrefixCacheError::Step(StepError::BadConfig(String::from(
+            "the prefix cache stores softmax KV only; the model has affine layer state",
+        ))));
+    }
 
-    while pos < n {
-        let token_id = tokens[pos];
-        let step_res = engine
-            .step_with_kv(&mut kv, token_id)
+    // The missed tail is one closed pass of the layer stack at the engine's prefill width; only
+    // the last token is a single step, because its logits are the caller's result.
+    if start_pos < n - 1 {
+        engine
+            .prefill_state_with_width(
+                &mut st,
+                &tokens[start_pos..n - 1],
+                mode,
+                crate::engine::step::prefill_block(),
+            )
             .map_err(PrefixCacheError::Step)?;
-        last_result = Some(step_res);
-        pos += 1;
     }
-
-    // Step 3: if insert_boundaries is true, insert the prompt snapshot into cache
-    if insert_boundaries && n >= cache.block_size() && start_pos < n {
-        let _ = cache.insert(tokens, &kv);
-    }
-
-    let Some(result) = last_result else {
-        return Err(PrefixCacheError::EmptyPrompt);
+    let logits = engine
+        .step_logits_with_mode(&mut st.kv, tokens[n - 1], mode)
+        .map_err(PrefixCacheError::Step)?;
+    let token = argmax_fixed(&logits)
+        .map_err(StepError::Sampler)
+        .map_err(PrefixCacheError::Step)?;
+    let result = StepResult {
+        token,
+        logits_checksum: fixed_vector_checksum(&logits),
     };
 
-    Ok((kv, result))
+    if insert_boundaries && n >= cache.block_size() && start_pos < n {
+        let _ = cache.insert(tokens, &st.kv);
+    }
+
+    Ok((st.kv, result))
 }
 
 #[cfg(test)]

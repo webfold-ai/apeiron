@@ -3,31 +3,39 @@
 //!
 //! For `Q8_0` and `Q5_0` each weight block is decoded once and dotted against all `k` activation
 //! blocks while its bytes are in registers, so the weight payload is read once per call instead of
-//! once per column; for `Q4_K` and `Q6_K` the packed-lane kernels of `chart::kcols` do the same.
-//! The additive decomposition is the one [`matvec_q8act`]'s fast row uses —
+//! once per column. `Q4_K` and `Q6_K` walk the same rows through the packed eight-column lane of
+//! `chart::kcols`, with the exact `i128` carrier as the lane's past-limit fallback. The exact
+//! carriers use the additive decomposition of [`matvec_q8act`]'s fast row —
 //! `Σ_b S_b·(d_b·Σ_l q_l·xq_{c,l})` in exact `i128` — so the integers are equal, the single
-//! [`round_shift_32`] epilogue is equal, and the `i64` range check is equal. The fast kernel runs
-//! only when [`matvec_q8act`] itself would take its fast row for every column (`Q8_0`/`Q5_0`, a
-//! whole number of 32-wide activation blocks, an exact activation magnitude and a call-level bound
-//! that rules out its `i64`/`i128` overflow); otherwise, and for every other family, the call is
+//! [`round_shift_32`] epilogue is equal, and the `i64` range check is equal. A fast kernel runs
+//! only when [`matvec_q8act`] itself would take its fast row for every column and the call-level
+//! bound rules out its `i64`/`i128` overflow; otherwise, and for every other family, the call is
 //! the per-column [`matvec_q8act`], which is the contract itself.
 //!
 //! The AVX2 cores are reached only behind `is_x86_feature_detected!("avx2")` and are the only
-//! unsafe code here; the portable twin is the fallback and the test oracle. Their equality with
-//! the portable twin is `tested`, not extracted (trust boundary).
+//! unsafe code here. `Q8_0`/`Q5_0` have a portable twin; every carrier is compared with the
+//! per-column oracle by the equality tests. That comparison is `tested`, not extracted (trust
+//! boundary).
 #![allow(
     dead_code,
     reason = "the L1 entry point and its cores land in this wave; their W2 consumers (spec_greedy, \
               batched prefill) are still to be wired, and the tests call them under cfg(test)"
 )]
 
-use crate::engine::chart::task::Task1;
+use crate::engine::chart::pool::PBand;
+use crate::engine::chart::task::BandTask;
+#[cfg(target_arch = "x86_64")]
+use crate::engine::chart::{
+    lane_spread_limit, pack_cols, q4_k_row_lanes_avx2, q6_k_row_lanes_avx2, PackedCols, Q4KRow,
+    Q6KRow,
+};
 use crate::engine::chart::{matvec_q8act, ActMagnitude, QuantAct};
 use crate::engine::f16_to_fixed;
 use crate::engine::num::value::round_shift_32;
 use crate::engine::MatvecError;
 use crate::format::quant::{
-    GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, Q5_0_BLOCK_BYTES, Q5_0_QK, Q8_0_BLOCK_BYTES, Q8_0_QK,
+    GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, Q4_K_BLOCK_BYTES,
+    Q5_0_BLOCK_BYTES, Q5_0_QK, Q6_K_BLOCK_BYTES, Q8_0_BLOCK_BYTES, Q8_0_QK, QK_K,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -43,25 +51,46 @@ use std::arch::x86_64::{
 /// Lanes of one activation quantization block.
 const ACT_QK: usize = 32;
 
-/// The largest column count the fast kernel handles; larger `k` takes the per-column reference.
+/// The largest column count the portable row kernel handles: its per-row accumulators are a
+/// `MAX_K`-wide `i128` array on the stack. Larger `k` takes the per-column reference unless the
+/// pooled `AVX2` kernel takes the call.
 const MAX_K: usize = 16;
+
+/// The largest column count the pooled `AVX2` kernel handles. It keeps its accumulators on the
+/// heap, so the bound is a placement budget rather than a register or stack width; `16` is
+/// the portable kernel's, not this one's. A factorisation's `X`-update projects with one column
+/// per rank (`k = r`, 576–1024 here), which is exactly the call the portable bound rejects.
+const MAX_POOLED_K: usize = 4096;
 
 /// The largest finite `f16` magnitude in Q32.32: `65504 · 2^32`, as in the chart's bound.
 const F16_MAX_FIXED: i128 = 65504i128 << 32;
 
-/// The two families with a shared weight-block decode.
+/// The four families with a shared weight-block decode.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Family {
     /// `Q8_0`: `d` at 0, 32 signed code bytes at 2.
     Q8_0,
     /// `Q5_0`: `d` at 0, `qh` at 2, 16 packed `qs` bytes at 6.
     Q5_0,
+    /// `Q4_K`: 256 weights per 144-byte super-block, an affine `d·sc·dot − dmin·m·xsum` group.
+    #[allow(
+        non_camel_case_types,
+        reason = "`Q4_K` is the format's GGML name, as in the carrier tables"
+    )]
+    Q4_K,
+    /// `Q6_K`: 256 weights per 210-byte super-block, an offset-free `d·sc·dot` group.
+    #[allow(
+        non_camel_case_types,
+        reason = "`Q6_K` is the format's GGML name, as in the carrier tables"
+    )]
+    Q6_K,
 }
 
 /// The weight payload geometry of one call: `n_in` is a whole number of 32-wide activation blocks.
 #[derive(Clone, Copy)]
 struct Geom {
-    /// The activation blocks per weight row, `n_in / 32`.
+    /// The carrier's weight blocks per row: `n_in / 32` for `Q8_0`/`Q5_0`, `n_in / 256` for
+    /// `Q4_K`/`Q6_K`.
     blocks: usize,
     /// The raw bytes per weight block.
     block_bytes: usize,
@@ -100,12 +129,13 @@ enum RowOutcome {
 /// The k-column int8-activation projection: `out[c] = matvec_q8act(ggml_type, raw, n_out, n_in,
 /// &qs[c])` for every `c`, including the same `Err`.
 ///
-/// `Q8_0` and `Q5_0` with a whole-block width, `k ≤ 16`, exact activation magnitudes and a
-/// call-level overflow bound run the shared-decode kernel; a wider `k` is split into runs of
-/// `MAX_K` columns, each the same call; `Q4_K` and `Q6_K` run the pooled
-/// multi-column kernel of `chart::kcols` under the same exactness conditions; every other input is
-/// the per-column [`matvec_q8act`]. Either way column `c` equals the per-column call bit for bit, so
-/// a caller may read the k columns as k independent projections.
+/// `Q8_0`, `Q5_0`, `Q4_K` and `Q6_K` with a whole-block width, exact activation magnitudes and a
+/// call-level overflow bound run the pooled carrier row kernel (`q8_0_row_kcols_avx2`,
+/// `q5_0_row_kcols_avx2`, or `q4_k_row_lanes_avx2`/`q6_k_row_lanes_avx2` on its packed panel)
+/// under AVX2 over any `k` within [`MAX_POOLED_K`] and the output budget; without AVX2 only the
+/// portable shared-decode kernel runs, over `k ≤ MAX_K`, for `Q8_0`/`Q5_0`; every other input is
+/// the per-column [`matvec_q8act`]. Either way column `c` equals the per-column call bit for bit,
+/// so a caller may read the k columns as k independent projections.
 ///
 /// # Errors
 ///
@@ -116,9 +146,10 @@ enum RowOutcome {
 /// # Complexity
 ///
 /// Temporal `O(n_out·n_in·k)` exact integer multiply-adds — the same count as `k` separate calls,
-/// with the weight payload's `O(n_out·n_in)` bytes read `⌈k/MAX_K⌉` times (once for `k ≤ MAX_K`)
-/// instead of `k` times and the `k·n_out·n_in` activation code bytes read per column. Spatial `O(n_out·k)` for the output plus
-/// `O(k)` column state; the kernel keeps no `O(n_in)` scratch.
+/// with the weight payload's `O(n_out·n_in)` bytes read once per call instead of `k` times and the
+/// `k·n_out·n_in` activation code bytes read per column. Spatial `O(n_out·k)` for the output plus
+/// `O(k)` column state, and `O(k·n_in)` bytes of `Q4_K`/`Q6_K` pack; no other carrier keeps
+/// `O(n_in)` scratch.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "the one `rounded as i64` narrowing is immediately preceded by an explicit \
@@ -144,42 +175,15 @@ pub(crate) fn matmat_q8act(
         return Ok(cols);
     }
     let k = qs.len();
-    // Past `MAX_K` columns the shared-decode kernel is refused and the whole call would fall to
-    // `k` separate matvecs (one serial pass over the weights per column). Columns are independent,
-    // so each run of `MAX_K` is the same call on fewer columns; a refusal in run `i` is returned
-    // only after runs `< i` succeed, which keeps the lowest-indexed column's refusal.
-    if k > MAX_K && matches!(ggml_type, GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0) {
-        let mut cols: Vec<Vec<i64>> = Vec::with_capacity(k);
-        for run in qs.chunks(MAX_K) {
-            cols.extend(matmat_q8act(ggml_type, raw, n_out, n_in, run)?);
-        }
-        return Ok(cols);
-    }
-    // `Q4_K`/`Q6_K`: the packed-lane kernels of `chart::kcols` read each weight row once per call
-    // and defer every refusal to the per-column path below, so `None` only costs this attempt.
-    #[cfg(target_arch = "x86_64")]
-    {
-        let kq = match ggml_type {
-            crate::format::quant::GGML_TYPE_Q4_K => {
-                crate::engine::chart::gemm_q4_k(raw, n_out, n_in, qs)
-            }
-            crate::format::quant::GGML_TYPE_Q6_K => {
-                crate::engine::chart::gemm_q6_k(raw, n_out, n_in, qs)
-            }
-            _ => None,
-        };
-        if let Some(cols) = kq {
-            return Ok(cols);
-        }
-    }
     let Some(family) = fast_family(ggml_type, n_in, qs) else {
         return per_column(ggml_type, raw, n_out, n_in, qs);
     };
-    let block_bytes = match family {
-        Family::Q8_0 => Q8_0_BLOCK_BYTES,
-        Family::Q5_0 => Q5_0_BLOCK_BYTES,
+    let (blocks, block_bytes) = match family {
+        Family::Q8_0 => (n_in / ACT_QK, Q8_0_BLOCK_BYTES),
+        Family::Q5_0 => (n_in / ACT_QK, Q5_0_BLOCK_BYTES),
+        Family::Q4_K => (n_in / QK_K, Q4_K_BLOCK_BYTES),
+        Family::Q6_K => (n_in / QK_K, Q6_K_BLOCK_BYTES),
     };
-    let blocks = n_in / ACT_QK;
     let row_bytes = blocks
         .checked_mul(block_bytes)
         .ok_or(MatvecError::LengthOverflow)?;
@@ -199,10 +203,21 @@ pub(crate) fn matmat_q8act(
     };
     let avx = avx2_available();
     #[cfg(target_arch = "x86_64")]
-    if avx && family == Family::Q8_0 {
-        if let Some(cols) = pooled_q8_0(raw, n_out, geom, qs) {
+    if avx && k > 1 {
+        if let Some(cols) = pooled(family, raw, n_out, geom, qs) {
             return Ok(cols);
         }
+    }
+    // The serial row loop has no `Q4_K`/`Q6_K` packed-lane carrier; a declined call, and decode
+    // `k = 1`, take the per-column reference, which is the contract itself.
+    if matches!(family, Family::Q4_K | Family::Q6_K) {
+        return per_column(ggml_type, raw, n_out, n_in, qs);
+    }
+    // The portable row kernel's accumulators are a `MAX_K`-wide array on the stack; a larger `k`
+    // that the pooled kernel declined (a non-finite scale, an `i64` word out of range, a budget
+    // overrun) takes the per-column reference, which carries the same refusals.
+    if k > MAX_K {
+        return per_column(ggml_type, raw, n_out, n_in, qs);
     }
     let mut columns: Vec<Vec<i64>> = Vec::with_capacity(k);
     let mut c = 0usize;
@@ -270,42 +285,124 @@ pub(crate) fn matmat_q8act(
     Ok(result)
 }
 
-/// Rows `r0..r0 + dst.len() / k` of the interleaved `n_out × k` output, or `Err` when a row hits a
-/// non-finite scale or an output leaves `i64`.
+/// Rows `r0..r0 + band.rows()` of the `k` output columns, writing each column's value through the
+/// band, or `Err` when a row hits a non-finite scale or an output leaves `i64`.
 ///
 /// # Complexity
 ///
-/// `O(rows·n_in·k)` multiply-adds; `MAX_K` `i128` words of scratch.
+/// `O(rows·n_in·k)` multiply-adds; `k` `i128` words of scratch per task, one `k`-word row for the
+/// `Q4_K` lane, and the packed row decoder's `O(n_in)` words per task.
 #[cfg(target_arch = "x86_64")]
 #[allow(
     clippy::many_single_char_names,
-    reason = "k columns, r rows, o and c indices are the kernel's standard symbols"
+    clippy::too_many_arguments,
+    reason = "k columns, r rows, o and c indices are the kernel's standard symbols; the context, \
+              packed panel, limit and band are the task's disjoint inputs"
 )]
 fn pooled_rows(
+    family: Family,
     raw: &[u8],
     geom: Geom,
     qs: &[QuantAct],
+    packed: Option<&PackedCols>,
+    limit: u32,
     r0: usize,
-    dst: &mut [i64],
+    band: &mut PBand<i64>,
 ) -> Result<(), ()> {
     let k = qs.len();
-    let mut acc = [0i128; MAX_K];
+    // `Q4_K`/`Q6_K` take their packed lane: one row decode per row, reused by every column group,
+    // eight columns per `i64` lane, one rounding per output. The exact `i128` carrier is the
+    // lane's own past-`limit` fallback inside the lane kernel, not a second row loop here. The
+    // lane fills one contiguous row, so the band receives it column by column afterwards.
+    if matches!(family, Family::Q4_K | Family::Q6_K) {
+        let Some(packed) = packed else {
+            return Err(());
+        };
+        let mut q4 = (family == Family::Q4_K).then(|| Q4KRow::new(geom.blocks));
+        let mut q6 = (family == Family::Q6_K).then(|| Q6KRow::new(geom.blocks));
+        let mut out = vec![0i64; k];
+        let mut r = 0usize;
+        while r < band.rows() {
+            let o = r0 + r;
+            let row = &raw[o * geom.row_bytes..(o + 1) * geom.row_bytes];
+            let bounds = match family {
+                // SAFETY: the caller established AVX2 and the row's `geom.blocks` blocks.
+                Family::Q4_K => unsafe { q4.as_mut().unwrap().fill(row, geom.blocks) },
+                Family::Q6_K => unsafe { q6.as_mut().unwrap().fill(row, geom.blocks) },
+                _ => unreachable!("only the lane carriers reach this branch"),
+            };
+            let Some((kmin, kmax)) = bounds else {
+                return Err(());
+            };
+            // SAFETY: as `fill`, and `packed` covers every column with `out.len() == k`.
+            let done = match family {
+                Family::Q4_K => unsafe {
+                    q4_k_row_lanes_avx2(
+                        row,
+                        geom.blocks,
+                        qs,
+                        packed,
+                        q4.as_ref().unwrap(),
+                        kmin,
+                        kmax - kmin,
+                        limit,
+                        &mut out,
+                    )
+                },
+                Family::Q6_K => unsafe {
+                    q6_k_row_lanes_avx2(
+                        row,
+                        geom.blocks,
+                        qs,
+                        packed,
+                        q6.as_ref().unwrap(),
+                        kmin,
+                        kmax - kmin,
+                        limit,
+                        &mut out,
+                    )
+                },
+                _ => unreachable!("only the lane carriers reach this branch"),
+            };
+            if !done {
+                return Err(());
+            }
+            let mut c = 0usize;
+            while c < k {
+                band.push(c, out[c]);
+                c += 1;
+            }
+            r += 1;
+        }
+        return Ok(());
+    }
+    // Allocated once per task, not per row: `k` is a rank in the factorisation's projection and
+    // `MAX_K` is the portable kernel's stack width, not this one's.
+    let mut acc = vec![0i128; k];
     let mut stop = false;
     let mut r = 0usize;
-    while r < dst.len() / k && !stop {
+    while r < band.rows() && !stop {
         let o = r0 + r;
         let row = &raw[o * geom.row_bytes..(o + 1) * geom.row_bytes];
-        acc[..k].fill(0);
+        acc.fill(0);
         // SAFETY: the caller established AVX2, `raw.len() >= n_out·row_bytes`, and
-        // `fast_family` checked every column's geometry and the narrow overflow bound.
-        let ok = unsafe {
-            crate::engine::chart::q8_0_row_kcols_avx2(row, geom.blocks, qs, &mut acc[..k])
+        // `fast_family` checked every column's geometry and the call-level bound.
+        let ok = match family {
+            Family::Q8_0 => unsafe {
+                crate::engine::chart::q8_0_row_kcols_avx2(row, geom.blocks, qs, &mut acc)
+            },
+            Family::Q5_0 => unsafe {
+                crate::engine::chart::q5_0_row_kcols_avx2(row, geom.blocks, qs, &mut acc)
+            },
+            Family::Q4_K | Family::Q6_K => {
+                unreachable!("the lane carriers return through their packed lane above")
+            }
         };
         stop = ok.is_none();
         let mut c = 0usize;
         while c < k && !stop {
             if let Ok(v) = i64::try_from(round_shift_32(acc[c])) {
-                dst[r * k + c] = v;
+                band.push(c, v);
             } else {
                 stop = true;
             }
@@ -320,71 +417,103 @@ fn pooled_rows(
     }
 }
 
-/// The [`pooled_q8_0`] piece-task context: the payload, its geometry, the activation columns and the
-/// rows per piece.
+/// The pooled band-task context: the payload, its geometry, the carrier family, the activation
+/// columns, and the packed panel and shift limit.
 #[cfg(target_arch = "x86_64")]
 struct PooledRowsCtx<'a> {
+    family: Family,
     raw: &'a [u8],
     geom: Geom,
     qs: &'a [QuantAct],
-    rows_per: usize,
+    packed: Option<&'a PackedCols>,
+    limit: u32,
 }
 
 #[cfg(target_arch = "x86_64")]
-impl Task1<i64, ()> for PooledRowsCtx<'_> {
-    fn run(&self, t: usize, dst: &mut [i64]) -> Result<(), ()> {
-        pooled_rows(self.raw, self.geom, self.qs, t * self.rows_per, dst)
+impl BandTask<i64, ()> for PooledRowsCtx<'_> {
+    fn run(&self, _t: usize, first_row: usize, band: &mut PBand<i64>) -> Result<(), ()> {
+        pooled_rows(
+            self.family,
+            self.raw,
+            self.geom,
+            self.qs,
+            self.packed,
+            self.limit,
+            first_row,
+            band,
+        )
     }
 }
 
-/// The `Q8_0` fast path split by rows across the persistent pool: each task runs
-/// [`q8_0_row_kcols_avx2`] over its rows for all `k` columns, so every weight row is read from
-/// memory once per call. Column `c` equals [`matvec_q8act`] on `qs[c]` bit for bit (the same exact
-/// `i128` row sums and one [`round_shift_32`]).
+/// The 32-wide chart fast path split by rows across the persistent pool: each task runs the
+/// carrier's row kernel — `q8_0_row_kcols_avx2`, `q5_0_row_kcols_avx2`, or the `Q4_K`/`Q6_K`
+/// packed `q4_k_row_lanes_avx2`/`q6_k_row_lanes_avx2` — over its rows for all `k` columns, so
+/// every weight row is read from memory once per call. Each row value is written straight into
+/// its output column through the row band, so the `n_out × k` result is never staged and
+/// transposed.
 ///
-/// Returns `None` when any row hits a non-finite scale or an output leaves `i64`; the caller then
-/// runs the serial kernel, which carries the exact refusal and fallback semantics.
+/// Returns `None` when any row hits a non-finite scale, an output leaves `i64`, or a `Q4_K`/`Q6_K`
+/// scale is not a power of two; the caller then runs the serial kernel, which carries the exact
+/// refusal and fallback semantics.
 ///
 /// # Complexity
 ///
-/// `O(n_out·n_in·k)` multiply-adds over the pool; `O(n_out·k)` output words, interleaved once and
-/// split into columns once.
+/// `O(n_out·n_in·k)` multiply-adds over the pool; `O(n_out·k)` output words, written once in
+/// place; `O(k·n_in)` bytes of `Q4_K`/`Q6_K` activation pack, the only carriers that build one.
 #[cfg(target_arch = "x86_64")]
 #[allow(
     clippy::many_single_char_names,
     reason = "k columns, r rows, o and c indices are the kernel's standard symbols"
 )]
-fn pooled_q8_0(raw: &[u8], n_out: usize, geom: Geom, qs: &[QuantAct]) -> Option<Vec<Vec<i64>>> {
+fn pooled(
+    family: Family,
+    raw: &[u8],
+    n_out: usize,
+    geom: Geom,
+    qs: &[QuantAct],
+) -> Option<Vec<Vec<i64>>> {
     let k = qs.len();
-    let mut inter = vec![0i64; n_out.checked_mul(k)?];
+    if k > MAX_POOLED_K {
+        return None;
+    }
+    // The `Q4_K`/`Q6_K` packed lanes read the call's columns as `x + 128` code quads, four
+    // consecutive inputs of each column in one 32-bit lane: `pack_cols` builds the panel once per
+    // call, and `lane_spread_limit` is the largest `i64` shift spread the group grid admits.
+    // `Q6_K` has no offset term, so it passes `need_xs = false`. Every other carrier uses the row
+    // kernels' per-column codes and needs neither.
+    let (packed, limit) = match family {
+        Family::Q4_K => {
+            let n32 = geom.blocks * 8;
+            (Some(pack_cols(qs, n32, true)?), lane_spread_limit(n32))
+        }
+        Family::Q6_K => {
+            let n32 = geom.blocks * 8;
+            (
+                Some(pack_cols(qs, n32, false)?),
+                lane_spread_limit(geom.blocks * 16),
+            )
+        }
+        Family::Q8_0 | Family::Q5_0 => (None, 0),
+    };
+    let mut cols: Vec<Vec<i64>> = Vec::with_capacity(k);
+    let mut c = 0usize;
+    while c < k {
+        cols.push(Vec::new());
+        c += 1;
+    }
     let rows_per = n_out
         .div_ceil(crate::engine::ops::par::row_chunk_budget(n_out))
         .max(1);
     let rows_ctx = PooledRowsCtx {
+        family,
         raw,
         geom,
         qs,
-        rows_per,
+        packed: packed.as_ref(),
+        limit,
     };
-    let pooled: Result<(), ()> =
-        crate::engine::chart::pool::for_chunks(&mut inter, rows_per * k, &rows_ctx);
-    if pooled.is_err() {
+    if crate::engine::chart::pool::for_pbands(&mut cols, n_out, rows_per, &rows_ctx).is_err() {
         return None;
-    }
-    let mut cols: Vec<Vec<i64>> = Vec::with_capacity(k);
-    let mut c = 0usize;
-    while c < k {
-        cols.push(Vec::with_capacity(n_out));
-        c += 1;
-    }
-    let mut o = 0usize;
-    while o < n_out {
-        let mut c = 0usize;
-        while c < k {
-            cols[c].push(inter[o * k + c]);
-            c += 1;
-        }
-        o += 1;
     }
     Some(cols)
 }
@@ -414,28 +543,28 @@ fn per_column(
 
 /// The fast kernel's family, or `None` when any column must take the per-column reference.
 ///
-/// True exactly when [`matvec_q8act`]'s `fast` flag is true for every column: a `Q8_0`/`Q5_0`
-/// type, a whole number of 32-wide activation blocks, `1 ≤ k ≤ 16`, each column's length matching
-/// `n_in` with one scale per block, an exact [`ActMagnitude`] (`NoQ32` and the `i128` total
-/// overflow both route [`matvec_q8act`] elsewhere), and [`fast_bound_ok`] — the chart's private
-/// `q8act_fast_bound_ok(…, narrow = true)` predicate, re-derived here from the public `scales()`
-/// accessor so this file edits no other module.
+/// True exactly when [`matvec_q8act`]'s `fast` flag is true for every column: a `Q8_0`, `Q5_0`,
+/// `Q4_K` or `Q6_K` type, a whole number of 32-wide activation blocks (`Q4_K`/`Q6_K` also a whole
+/// 256-weight super-block), `1 ≤ k ≤ MAX_POOLED_K`, each column's length matching `n_in` with one
+/// scale per 32-lane group, an exact [`ActMagnitude`] (`NoQ32` and the `i128` total overflow both
+/// route [`matvec_q8act`] elsewhere), and [`fast_bound_ok`] — the chart's private
+/// `q8act_fast_bound_ok(…, narrow)` predicate, re-derived here from the public `scales()` accessor
+/// so this file edits no other module.
 ///
-/// The exact-magnitude test is implied by [`fast_bound_ok`] for both supported families (`Q8_0` with
-/// `top = 128` and `Q5_0` with `top = 16`), so only [`fast_bound_ok`] runs:
+/// [`fast_bound_ok`] subsumes the exact-magnitude test:
 /// - With `scales.len() == blocks` and `q.len() == n_in`, every scale lookup is in-bounds.
-/// - The narrow condition `s_max·(32·top·127) ≤ i64::MAX` bounds every product:
-///   for `Q8_0` (`top = 128`), `32·128·127 = 520,192`, so `|S_b·xq_j| ≤ 128·s_max ≤ i64::MAX / 4064 < i64::MAX`;
-///   for `Q5_0` (`top = 16`), `32·16·127 = 65,024`, so `|S_b·xq_j| ≤ 128·s_max ≤ i64::MAX / 508 < i64::MAX`.
-///   In both families, for every code `|xq_j| ≤ 128`, every checked `i64` product is `Some`
-///   (ruling out `NoQ32`).
-/// - The sum of at most `2^14` terms (with `n_in ≤ MAX_BLOCKS·32 = 2^14` on this route, and
-///   `fast_bound_ok`'s `bound = n_in·F16_MAX_FIXED·top·127·s_max < i128::MAX` where
-///   `F16_MAX_FIXED·top·127 > 128` for both families) guarantees
+/// - The `s_max·127 ≤ i64::MAX` check is exactly `NoQ32`'s block bound: every code obeys
+///   `|xq_j| ≤ 127`, so every checked `i64` product `S_b·xq_j` is `Some`.
+/// - The narrow condition `s_max·(32·top·127) ≤ i64::MAX` (checked for `Q8_0`'s `top = 128` and
+///   `Q5_0`'s `top = 16`) additionally keeps each block's `i64` product in range; `Q4_K`
+///   (`top = 1008`) and `Q6_K` (`top = 4096`) run their group terms in `i128`, so they take the
+///   wide branch.
+/// - The sum of at most `2^14` terms with `fast_bound_ok`'s
+///   `bound = n_in·F16_MAX_FIXED·top·127·s_max < i128::MAX` guarantees
 ///   `Σ_j |S_b·xq_j| ≤ n_in·128·s_max < bound < i128::MAX`.
 ///   Thus no checked add overflows `i128` (ruling out `TotalOverflow`).
 ///
-/// `ActMagnitude::Exact` is therefore strictly implied by `fast_bound_ok` for both families.
+/// `ActMagnitude::Exact` is therefore strictly implied by [`fast_bound_ok`] for all four families.
 /// `debug_assertions` builds re-check the implication on every accepted column.
 ///
 /// # Complexity
@@ -446,21 +575,29 @@ fn fast_family(ggml_type: u32, n_in: usize, qs: &[QuantAct]) -> Option<Family> {
     let family = match ggml_type {
         GGML_TYPE_Q8_0 => Family::Q8_0,
         GGML_TYPE_Q5_0 => Family::Q5_0,
+        GGML_TYPE_Q4_K => Family::Q4_K,
+        GGML_TYPE_Q6_K => Family::Q6_K,
         _ => return None,
     };
-    if !n_in.is_multiple_of(ACT_QK) || qs.is_empty() || qs.len() > MAX_K {
+    if !n_in.is_multiple_of(ACT_QK) || qs.is_empty() || qs.len() > MAX_POOLED_K {
+        return None;
+    }
+    if matches!(family, Family::Q4_K | Family::Q6_K) && !n_in.is_multiple_of(QK_K) {
         return None;
     }
     let blocks = n_in / ACT_QK;
-    let top: i128 = match family {
-        Family::Q8_0 => 128,
-        Family::Q5_0 => 16,
+    let (top, narrow): (i128, bool) = match family {
+        Family::Q8_0 => (128, true),
+        Family::Q5_0 => (16, true),
+        Family::Q4_K => (1008, false),
+        Family::Q6_K => (4096, false),
     };
     let mut c = 0usize;
     let mut admitted = true;
     while c < qs.len() && admitted {
         let q = &qs[c];
-        admitted = q.len() == n_in && q.scales().len() == blocks && fast_bound_ok(n_in, top, q);
+        admitted =
+            q.len() == n_in && q.scales().len() == blocks && fast_bound_ok(n_in, top, narrow, q);
         if admitted {
             debug_assert!(
                 matches!(q.magnitude(), ActMagnitude::Exact(_)),
@@ -476,16 +613,17 @@ fn fast_family(ggml_type: u32, n_in: usize, qs: &[QuantAct]) -> Option<Family> {
     }
 }
 
-/// The chart's `q8act_fast_bound_ok(n_in, top, q, narrow = true)`, re-derived here.
+/// The chart's `q8act_fast_bound_ok(n_in, top, q, narrow)`, re-derived here.
 ///
-/// `S_max = max_b |S_b|`; the narrow condition `S_max·(32·top·127) ≤ i64::MAX` keeps each block's
-/// `S_b·I_b` in `i64`, and `n_in·(65504·2^32)·top·127·S_max < i128::MAX` keeps every running
-/// `i128` partial sum in range. The strict `<` mirrors the chart's saturated comparison.
+/// `S_max = max_b |S_b|`; `S_max·127 ≤ i64::MAX` keeps every `S_b·xq_j` in `i64` (the exact
+/// magnitude `matvec_q8act` requires), the narrow condition `S_max·(32·top·127) ≤ i64::MAX` keeps
+/// each block's `S_b·I_b` in `i64`, and `n_in·(65504·2^32)·top·127·S_max < i128::MAX` keeps every
+/// running `i128` partial sum in range. The strict `<` mirrors the chart's saturated comparison.
 ///
 /// # Complexity
 ///
 /// `O(n_in/32)` time, `O(1)` extra space.
-fn fast_bound_ok(n_in: usize, top: i128, q: &QuantAct) -> bool {
+fn fast_bound_ok(n_in: usize, top: i128, narrow: bool, q: &QuantAct) -> bool {
     let mut s_max: i128 = 0;
     let mut b = 0usize;
     while b < q.scales().len() {
@@ -495,7 +633,10 @@ fn fast_bound_ok(n_in: usize, top: i128, q: &QuantAct) -> bool {
         }
         b += 1;
     }
-    if s_max.saturating_mul(32 * top * 127) > i128::from(i64::MAX) {
+    if s_max.saturating_mul(127) > i128::from(i64::MAX) {
+        return false;
+    }
+    if narrow && s_max.saturating_mul(32 * top * 127) > i128::from(i64::MAX) {
         return false;
     }
     let bound = (n_in as i128)
@@ -536,6 +677,9 @@ fn row_accs(
                 let dots = match family {
                     Family::Q8_0 => q8_0_block_kdots(avx, row, off + 2, acts, blk, k),
                     Family::Q5_0 => q5_0_block_kdots(avx, row, off, acts, blk, k),
+                    // The affine `Q4_K` fold lives in the pooled carrier only; a call that
+                    // reaches the serial row loop takes the per-column reference instead.
+                    Family::Q4_K | Family::Q6_K => return RowOutcome::Bail,
                 };
                 let mut c = 0usize;
                 while c < k && early.is_none() {
@@ -966,9 +1110,10 @@ mod tests {
         }
     }
 
-    /// `Q8_0`/`Q5_0` (shared-decode kernel) and `Q4_K`/`Q6_K`/`PQ2_0` (per-column fallback) over
-    /// several shapes, including ragged widths, and `k ∈ {1, 2, 3, 8, 16}`: every column equals
-    /// the per-column [`matvec_q8act`] bit for bit.
+    /// `Q8_0`/`Q5_0` (shared-decode kernel), `Q4_K`/`Q6_K` (packed lane on a whole 256-weight
+    /// width, per-column fallback otherwise) and `PQ2_0` (per-column fallback) over several shapes,
+    /// including ragged widths, and `k ∈ {1, 2, 3, 8, 16}`: every column equals the per-column
+    /// [`matvec_q8act`] bit for bit.
     #[test]
     fn columns_match_per_column_matvec_q8act() {
         const TYPES: [u32; 5] = [
@@ -996,22 +1141,39 @@ mod tests {
         }
     }
 
-    /// `k` past the fast kernel's `MAX_K`: the runs of `MAX_K` columns equal the per-column
-    /// [`matvec_q8act`] bit for bit, in column order, including the ragged last run.
+    /// `k` past the portable kernel's `MAX_K` still equals the per-column contract: for both
+    /// carriers the pooled `AVX2` kernel takes the call (asserted on this host) and is
+    /// bit-identical to the reference.
     #[test]
-    fn wide_column_sets_match_per_column_matvec_q8act() {
-        const SHAPES: [(usize, usize); 3] = [(4, 64), (2, 300), (3, 256)];
-        const KS: [usize; 5] = [17, 32, 33, 40, 64];
-        let mut seed = 0x0dd5_eed5_1ced_beefu64;
-        for (ti, &ggml_type) in [GGML_TYPE_Q8_0, GGML_TYPE_Q5_0].iter().enumerate() {
-            for &(rows, n_in) in &SHAPES {
-                seed = seed
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1_442_695_040_888_963_407);
-                let raw = random_payload(ggml_type, rows, n_in, 0x3800, seed);
+    fn columns_past_max_k_match_per_column() {
+        const SHAPES: [(usize, usize); 3] = [(4, 64), (3, 96), (2, 128)];
+        const KS: [usize; 6] = [17, 24, 33, 42, 64, 96];
+        let seed = 0x0f1e_2d3c_4b5a_6978u64;
+        for (si, &(rows, n_in)) in SHAPES.iter().enumerate() {
+            for &(ggml_type, block_bytes) in &[
+                (GGML_TYPE_Q8_0, Q8_0_BLOCK_BYTES),
+                (GGML_TYPE_Q5_0, Q5_0_BLOCK_BYTES),
+            ] {
+                let raw = random_payload(ggml_type, rows, n_in, 0x3800, seed ^ si as u64);
                 for &k in &KS {
-                    let qs = acts(n_in, k, seed ^ ((k as u64) << 17) ^ ti as u64);
+                    let qs = acts(n_in, k, seed ^ ((k as u64) << 17));
                     check_columns(ggml_type, &raw, rows, n_in, &qs);
+                    #[cfg(target_arch = "x86_64")]
+                    if avx2_available() {
+                        let geom = Geom {
+                            blocks: n_in / ACT_QK,
+                            block_bytes,
+                            row_bytes: (n_in / ACT_QK) * block_bytes,
+                        };
+                        let family = match ggml_type {
+                            GGML_TYPE_Q5_0 => Family::Q5_0,
+                            _ => Family::Q8_0,
+                        };
+                        assert!(
+                            pooled(family, &raw, rows, geom, &qs).is_some(),
+                            "type {ggml_type} k = {k} must take the pooled kernel"
+                        );
+                    }
                 }
             }
         }
@@ -1414,5 +1576,368 @@ mod tests {
                 i += 1;
             }
         }
+    }
+
+    /// The fit's `X`-update projection shape: `n_out = 1024`, `n_in = 3072`, `k = r ∈ {864, 432,
+    /// 96, 32}` columns. `k = 864` is the reference rank at 1.18 b/w; `k ≤ 16` is the portable
+    /// kernel's, so `32` is here as the control just above the `MAX_K` branch (`32 > MAX_K` takes
+    /// the pooled route; `16` would not).
+    ///
+    /// Prints the wall and the rate in multiply-adds per second, with the two streams the route
+    /// touches: the weight payload (`n_out·n_in` bytes, read once per call by the shared-decode
+    /// kernel and once per column by the reference) and the activation codes (`k·n_in` bytes per
+    /// row, read once per row and column by both). The last column is the payload traffic the
+    /// old per-column route paid, so the routing row and the traffic model sit in one table.
+    #[test]
+    #[ignore = "measurement: release run, three timed passes per arm"]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the counters are benchmark shapes below 2^53 and RUNS is 3"
+    )]
+    fn pooled_rate_at_fit_shape() {
+        const KS: [usize; 4] = [864, 432, 96, 32];
+        const RUNS: usize = 3;
+        let (n_out, n_in) = (1024usize, 3072usize);
+        let raw = random_payload(GGML_TYPE_Q8_0, n_out, n_in, 0x3800, 0x9e37_79b9);
+        let qs = acts(n_in, KS[0], 0x5eed_0f00);
+        println!(
+            "pooled_rate n_out {n_out} n_in {n_in} runs {RUNS} avx2 {} avxvnni {}",
+            avx2_available(),
+            std::is_x86_feature_detected!("avxvnni")
+        );
+        println!(
+            "{:<5} {:>10} {:>10} {:>10} {:>10} {:>12}",
+            "k", "best_ms", "mean_ms", "G_MAC_s", "act_MB", "per_col_MB"
+        );
+        for &k in &KS {
+            let _ = matmat_q8act(GGML_TYPE_Q8_0, &raw, n_out, n_in, &qs[..k]).expect("warmup");
+            let mut wall = Vec::new();
+            let mut i = 0usize;
+            while i < RUNS {
+                let start = Instant::now();
+                let out =
+                    matmat_q8act(GGML_TYPE_Q8_0, &raw, n_out, n_in, &qs[..k]).expect("timing");
+                let dt = start.elapsed().as_secs_f64();
+                black_box(&out);
+                wall.push(dt);
+                i += 1;
+            }
+            let mean = wall.iter().sum::<f64>() / RUNS as f64;
+            let best = wall.iter().copied().fold(f64::MAX, f64::min);
+            let macs = (n_out * n_in * k) as f64;
+            let acts = (n_out * k * n_in) as f64;
+            let per_col = (k * n_out * (n_in / ACT_QK) * Q8_0_BLOCK_BYTES) as f64;
+            println!(
+                "{k:<5} {:>10.3} {:>10.3} {:>10.3} {:>10.1} {:>12.1}",
+                best * 1e3,
+                mean * 1e3,
+                macs / mean / 1e9,
+                acts / (1024.0 * 1024.0),
+                per_col / (1024.0 * 1024.0)
+            );
+        }
+    }
+
+    /// The shared `Q8_0` pooled loop against the packed VNNI entry on one payload and one set of
+    /// columns: the equality the fold must keep and the throughput it must not lose.
+    ///
+    /// `pooled` is the row-kernel route the one-path fold targets; `gemm_q8_0` is the packed entry
+    /// `matmat_q8act` takes today. Prints the best and mean wall of each arm and their ratio at
+    /// `k ∈ {32, 128, 512}` on the 3584-wide hidden size, plus the payload traffic the best wall
+    /// implies.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "measurement: release run, three interleaved passes per arm"]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the counters are benchmark shapes below 2^53 and RUNS is 3"
+    )]
+    fn pooled_against_gemm_q8_0() {
+        const KS: [usize; 3] = [32, 128, 512];
+        const RUNS: usize = 3;
+        let (n_out, n_in) = (3584usize, 3584usize);
+        let raw = random_payload(GGML_TYPE_Q8_0, n_out, n_in, 0x3800, 0x5eed_1a2b);
+        let qs = acts(n_in, KS[2], 0x0bad_f00d);
+        let geom = Geom {
+            blocks: n_in / ACT_QK,
+            block_bytes: Q8_0_BLOCK_BYTES,
+            row_bytes: (n_in / ACT_QK) * Q8_0_BLOCK_BYTES,
+        };
+        println!(
+            "pooled_vs_gemm n_out {n_out} n_in {n_in} runs {RUNS} avxvnni {}",
+            std::is_x86_feature_detected!("avxvnni")
+        );
+        if !std::is_x86_feature_detected!("avxvnni") {
+            println!(
+                "skip: gemm_q8_0 admits only AVX-VNNI; the shared loop is the only route here"
+            );
+            return;
+        }
+        println!(
+            "{:>5} {:>12} {:>12} {:>8} {:>12} {:>12}",
+            "k", "pooled_ms", "gemm_ms", "p/g", "pooled_GBs", "gemm_GBs"
+        );
+        for &k in &KS {
+            let pool = pooled(Family::Q8_0, &raw, n_out, geom, &qs[..k]).expect("pooled admits");
+            let Some(gq8) =
+                crate::engine::kern::gemm::gemm_q8_0(GGML_TYPE_Q8_0, &raw, n_out, n_in, &qs[..k])
+            else {
+                println!("{k:>5} gemm refuses this payload; skipped");
+                continue;
+            };
+            assert_eq!(pool, gq8, "k = {k}: the two routes differ");
+            let mut p = Vec::with_capacity(RUNS);
+            let mut g = Vec::with_capacity(RUNS);
+            let mut round = 0usize;
+            while round < RUNS {
+                let start = Instant::now();
+                let out = pooled(Family::Q8_0, &raw, n_out, geom, &qs[..k]).expect("pooled");
+                p.push(start.elapsed().as_secs_f64());
+                black_box(&out);
+                let start = Instant::now();
+                let out = crate::engine::kern::gemm::gemm_q8_0(
+                    GGML_TYPE_Q8_0,
+                    &raw,
+                    n_out,
+                    n_in,
+                    &qs[..k],
+                )
+                .expect("gemm");
+                g.push(start.elapsed().as_secs_f64());
+                black_box(&out);
+                round += 1;
+            }
+            let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+            let best = |v: &[f64]| v.iter().copied().fold(f64::MAX, f64::min);
+            let payload = (n_out * (n_in / ACT_QK) * Q8_0_BLOCK_BYTES) as f64;
+            println!(
+                "{k:>5} {:>12.3} {:>12.3} {:>8.2} {:>12.2} {:>12.2}",
+                best(&p) * 1e3,
+                best(&g) * 1e3,
+                best(&p) / best(&g),
+                payload / best(&p) / 1e9,
+                payload / best(&g) / 1e9
+            );
+            println!(
+                "      mean {:.3} / {:.3} ms",
+                mean(&p) * 1e3,
+                mean(&g) * 1e3
+            );
+        }
+    }
+
+    /// The shared `Q4_K` pooled carrier against the per-column contract on small shapes: every
+    /// column equal, including `k > MAX_K` and several 256-weight super-blocks.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pooled_q4_k_matches_per_column() {
+        const SHAPES: [(usize, usize); 2] = [(3, 512), (2, 1024)];
+        const KS: [usize; 4] = [2, 8, 33, 64];
+        if !avx2_available() {
+            return;
+        }
+        let seed = 0x51ce_9a77_2d10_4e01u64;
+        for (si, &(rows, n_in)) in SHAPES.iter().enumerate() {
+            let raw = random_payload(GGML_TYPE_Q4_K, rows, n_in, 0x3800, seed ^ si as u64);
+            let blocks = n_in / QK_K;
+            let geom = Geom {
+                blocks,
+                block_bytes: Q4_K_BLOCK_BYTES,
+                row_bytes: blocks * Q4_K_BLOCK_BYTES,
+            };
+            for &k in &KS {
+                let qs = acts(n_in, k, seed ^ ((k as u64) << 21));
+                let got = pooled(Family::Q4_K, &raw, rows, geom, &qs).expect("Q4_K admits");
+                for (c, q) in qs.iter().enumerate() {
+                    let want = matvec_q8act(GGML_TYPE_Q4_K, &raw, rows, n_in, q)
+                        .expect("the contract admits");
+                    assert_eq!(
+                        got[c], want,
+                        "shape ({rows},{n_in}) column {c} k {k} diverged"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `Q6_K` on the shared path: `matmat_q8act` and the `pooled` carrier each equal
+    /// [`matvec_q8act`] column for column at `n_out ∈ {3, 2}`, `n_in ∈ {512, 1024}` and
+    /// `k ∈ {2, 8, 33, 64}`, on random codes and scales. `Q6_K` has no offset term, so the
+    /// activation needs no `xsum`; the lane's shift grid is the same shape as `Q4_K`'s.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pooled_q6_k_matches_per_column() {
+        const SHAPES: [(usize, usize); 2] = [(3, 512), (2, 1024)];
+        const KS: [usize; 4] = [2, 8, 33, 64];
+        if !avx2_available() {
+            return;
+        }
+        let seed = 0x6c6b_51ce_9a77_2d10u64;
+        for (si, &(rows, n_in)) in SHAPES.iter().enumerate() {
+            let raw = random_payload(GGML_TYPE_Q6_K, rows, n_in, 0x3800, seed ^ si as u64);
+            let blocks = n_in / QK_K;
+            let geom = Geom {
+                blocks,
+                block_bytes: Q6_K_BLOCK_BYTES,
+                row_bytes: blocks * Q6_K_BLOCK_BYTES,
+            };
+            for &k in &KS {
+                let qs = acts(n_in, k, seed ^ ((k as u64) << 21));
+                let got = pooled(Family::Q6_K, &raw, rows, geom, &qs).expect("Q6_K admits");
+                let entry =
+                    matmat_q8act(GGML_TYPE_Q6_K, &raw, rows, n_in, &qs).expect("the entry admits");
+                assert_eq!(
+                    got, entry,
+                    "shape ({rows},{n_in}) k {k}: pooled and entry diverge"
+                );
+                for (c, q) in qs.iter().enumerate() {
+                    let want = matvec_q8act(GGML_TYPE_Q6_K, &raw, rows, n_in, q)
+                        .expect("the contract admits");
+                    assert_eq!(
+                        got[c], want,
+                        "shape ({rows},{n_in}) column {c} k {k} diverged"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The `Q4_K` carrier's rate on the production shapes: the 3584-wide hidden projection at
+    /// `k ∈ {32, 128, 512}` and the 7B FFN's `18944 × 256` up-projection at `k = 256`, which the
+    /// direct-write band path now admits. Prints the wall and the payload rate.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "measurement: release run, three passes per shape"]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the counters are benchmark shapes below 2^53 and RUNS is 3"
+    )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one measured shape loop per production geometry; the printed table is the artifact"
+    )]
+    fn q4_k_carrier_rate_at_production_shapes() {
+        const RUNS: usize = 3;
+        let (n_out, n_in) = (3584usize, 3584usize);
+        let raw = random_payload(GGML_TYPE_Q4_K, n_out, n_in, 0x3800, 0x5eed_1a2b);
+        let qs = acts(n_in, 512, 0x0bad_f00d);
+        println!(
+            "q4_k_carrier_rate n_out {n_out} n_in {n_in} runs {RUNS} avx2 {}",
+            avx2_available()
+        );
+        if !avx2_available() {
+            println!("skip: the Q4_K carrier needs AVX2");
+            return;
+        }
+        println!(
+            "{:>7} {:>7} {:>12} {:>12} {:>8} {:>12}",
+            "n_out", "k", "pooled_ms", "matmat_ms", "m/p", "GB/s"
+        );
+        for &k in &[32usize, 128, 512] {
+            let geom = Geom {
+                blocks: n_in / QK_K,
+                block_bytes: Q4_K_BLOCK_BYTES,
+                row_bytes: (n_in / QK_K) * Q4_K_BLOCK_BYTES,
+            };
+            let mut p = Vec::with_capacity(RUNS);
+            let mut m = Vec::with_capacity(RUNS);
+            let mut round = 0usize;
+            while round < RUNS {
+                // Alternate the order: the second arm of a round runs on a hotter package, and at
+                // these walls that is a larger effect than the entry's own overhead.
+                let mat_first = round % 2 == 1;
+                if !mat_first {
+                    let start = Instant::now();
+                    let out = pooled(Family::Q4_K, &raw, n_out, geom, &qs[..k]).expect("pooled");
+                    p.push(start.elapsed().as_secs_f64());
+                    black_box(&out);
+                }
+                let start = Instant::now();
+                let out = matmat_q8act(GGML_TYPE_Q4_K, &raw, n_out, n_in, &qs[..k])
+                    .expect("the carrier admits");
+                m.push(start.elapsed().as_secs_f64());
+                black_box(&out);
+                if mat_first {
+                    let start = Instant::now();
+                    let out = pooled(Family::Q4_K, &raw, n_out, geom, &qs[..k]).expect("pooled");
+                    p.push(start.elapsed().as_secs_f64());
+                    black_box(&out);
+                }
+                round += 1;
+            }
+            let best = |v: &[f64]| v.iter().copied().fold(f64::MAX, f64::min);
+            let payload = (n_out * (n_in / QK_K) * Q4_K_BLOCK_BYTES) as f64;
+            println!(
+                "{n_out:>7} {k:>7} {:>12.3} {:>12.3} {:>8.2} {:>12.2}",
+                best(&p) * 1e3,
+                best(&m) * 1e3,
+                best(&m) / best(&p),
+                payload / best(&m) / 1e9
+            );
+        }
+        // Decode is the same payload with one column: the per-column row kernel the engine's
+        // `k = 1` route takes. The 7B at 20 tok/s needs 141G weights/s; this is the rate to beat.
+        let mut wall = Vec::with_capacity(RUNS);
+        let mut round = 0usize;
+        while round < RUNS {
+            let start = Instant::now();
+            let out = matvec_q8act(GGML_TYPE_Q4_K, &raw, n_out, n_in, &qs[0])
+                .expect("the decode contract admits");
+            wall.push(start.elapsed().as_secs_f64());
+            black_box(&out);
+            round += 1;
+        }
+        let best = wall.iter().copied().fold(f64::MAX, f64::min);
+        let weights = (n_out * n_in) as f64;
+        println!(
+            "decode k=1 n_out {n_out} n_in {n_in}: best {:.3} ms, {:.1} G weights/s",
+            best * 1e3,
+            weights / best / 1e9
+        );
+
+        // The 7B FFN up-projection: 18,944 rows over the 3,584-wide hidden size, 256 columns. Its
+        // `n_out·k = 4.85M` output was refused by the old `n_out·k ≤ 2^22` staging cap; the band
+        // path reads each row once.
+        let (n_out, n_in, k) = (18_944usize, 3584usize, 256usize);
+        let raw = random_payload(GGML_TYPE_Q4_K, n_out, n_in, 0x3800, 0x5eed_7b00);
+        let qs = acts(n_in, k, 0x0bad_7b00);
+        let geom = Geom {
+            blocks: n_in / QK_K,
+            block_bytes: Q4_K_BLOCK_BYTES,
+            row_bytes: (n_in / QK_K) * Q4_K_BLOCK_BYTES,
+        };
+        let mut p = Vec::with_capacity(RUNS);
+        let mut m = Vec::with_capacity(RUNS);
+        let mut round = 0usize;
+        while round < RUNS {
+            let mat_first = round % 2 == 1;
+            if !mat_first {
+                let start = Instant::now();
+                let out = pooled(Family::Q4_K, &raw, n_out, geom, &qs).expect("pooled");
+                p.push(start.elapsed().as_secs_f64());
+                black_box(&out);
+            }
+            let start = Instant::now();
+            let out =
+                matmat_q8act(GGML_TYPE_Q4_K, &raw, n_out, n_in, &qs).expect("the FFN shape admits");
+            m.push(start.elapsed().as_secs_f64());
+            black_box(&out);
+            if mat_first {
+                let start = Instant::now();
+                let out = pooled(Family::Q4_K, &raw, n_out, geom, &qs).expect("pooled");
+                p.push(start.elapsed().as_secs_f64());
+                black_box(&out);
+            }
+            round += 1;
+        }
+        let best = |v: &[f64]| v.iter().copied().fold(f64::MAX, f64::min);
+        let payload = (n_out * (n_in / QK_K) * Q4_K_BLOCK_BYTES) as f64;
+        println!(
+            "{n_out:>7} {k:>7} {:>12.3} {:>12.3} {:>8.2} {:>12.2}",
+            best(&p) * 1e3,
+            best(&m) * 1e3,
+            best(&m) / best(&p),
+            payload / best(&m) / 1e9
+        );
     }
 }

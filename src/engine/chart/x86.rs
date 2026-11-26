@@ -245,36 +245,9 @@ unsafe fn reduce4_split(p1: __m256i, p2: __m256i, p3: __m256i, p4: __m256i) -> _
 #[target_feature(enable = "avx2")]
 #[inline]
 pub(super) unsafe fn dot32x4_ptr(codes: *const u8, stride: usize, xq: *const i8) -> [i32; 4] {
-    // SAFETY: the caller's four blocks give each pass its 32 bytes and 32 lanes.
-    unsafe {
-        let c0 = _mm256_loadu_si256(codes.cast());
-        let c1 = _mm256_loadu_si256(codes.add(stride).cast());
-        let c2 = _mm256_loadu_si256(codes.add(2 * stride).cast());
-        let c3 = _mm256_loadu_si256(codes.add(3 * stride).cast());
-        let x0 = _mm256_loadu_si256(xq.cast());
-        let x1 = _mm256_loadu_si256(xq.add(32).cast());
-        let x2 = _mm256_loadu_si256(xq.add(64).cast());
-        let x3 = _mm256_loadu_si256(xq.add(96).cast());
-        let r = if avxvnni() {
-            reduce4(
-                dot32_lanes_vnni(c0, x0),
-                dot32_lanes_vnni(c1, x1),
-                dot32_lanes_vnni(c2, x2),
-                dot32_lanes_vnni(c3, x3),
-            )
-        } else {
-            reduce4(
-                dot32_lanes_avx2(c0, x0),
-                dot32_lanes_avx2(c1, x1),
-                dot32_lanes_avx2(c2, x2),
-                dot32_lanes_avx2(c3, x3),
-            )
-        };
-        let mut out = [0i32; 4];
-        // SAFETY: `out` is four `i32` = 16 bytes, exactly one 128-bit store.
-        _mm_storeu_si128(out.as_mut_ptr().cast(), r);
-        out
-    }
+    // SAFETY: the caller's four blocks give each load its 32 bytes and 128 lanes.
+    let decoded = unsafe { q8_0_codes4(codes, stride) };
+    unsafe { dot32x4_codes(&decoded, xq, avxvnni()) }
 }
 
 /// Four exact 32-lane byte dots for two rows against two blocks: lane `(r, b)` is row `r`'s codes
@@ -458,6 +431,101 @@ pub(super) unsafe fn dot32_u8_i8(codes: &[u8], xq: &[i8]) -> i32 {
     unsafe { dot32_ptr(codes.as_ptr(), xq.as_ptr()) }
 }
 
+/// The 32 signed `Q8_0` codes of four consecutive blocks, loaded once for all activation columns
+/// of a pooled row. The block scale is not read here; the row kernel decodes it with the group.
+///
+/// # Safety
+///
+/// `codes + 3·stride` must point at 32 readable bytes; the caller must have AVX2.
+#[target_feature(enable = "avx2")]
+#[inline]
+pub(super) unsafe fn q8_0_codes4(codes: *const u8, stride: usize) -> [__m256i; 4] {
+    // SAFETY: the caller's four blocks give each load its 32 bytes.
+    unsafe {
+        [
+            _mm256_loadu_si256(codes.cast()),
+            _mm256_loadu_si256(codes.add(stride).cast()),
+            _mm256_loadu_si256(codes.add(2 * stride).cast()),
+            _mm256_loadu_si256(codes.add(3 * stride).cast()),
+        ]
+    }
+}
+
+/// Four exact 32-lane code dots against one activation column group, from codes already decoded
+/// by the caller. `vnni` selects the `vpdpbusd` core; it is hoisted out of the column loop so the
+/// feature check runs once per row, not once per column.
+///
+/// # Safety
+///
+/// `xq` must point at 128 readable lanes; the caller must have AVX2 and must pass the host's
+/// actual AVX-VNNI state.
+#[target_feature(enable = "avx2")]
+#[inline]
+pub(super) unsafe fn dot32x4_codes(codes: &[__m256i; 4], xq: *const i8, vnni: bool) -> [i32; 4] {
+    // SAFETY: the caller guarantees the 128-lane read and AVX2.
+    let (x0, x1, x2, x3) = unsafe {
+        (
+            _mm256_loadu_si256(xq.cast()),
+            _mm256_loadu_si256(xq.add(32).cast()),
+            _mm256_loadu_si256(xq.add(64).cast()),
+            _mm256_loadu_si256(xq.add(96).cast()),
+        )
+    };
+    let r = if vnni {
+        reduce4(
+            dot32_lanes_vnni(codes[0], x0),
+            dot32_lanes_vnni(codes[1], x1),
+            dot32_lanes_vnni(codes[2], x2),
+            dot32_lanes_vnni(codes[3], x3),
+        )
+    } else {
+        reduce4(
+            dot32_lanes_avx2(codes[0], x0),
+            dot32_lanes_avx2(codes[1], x1),
+            dot32_lanes_avx2(codes[2], x2),
+            dot32_lanes_avx2(codes[3], x3),
+        )
+    };
+    let mut out = [0i32; 4];
+    // SAFETY: `out` is four `i32` = 16 bytes, exactly one 128-bit store.
+    unsafe { _mm_storeu_si128(out.as_mut_ptr().cast(), r) };
+    out
+}
+
+/// One exact 32-lane code dot from a code vector already decoded by the caller.
+///
+/// # Safety
+///
+/// `xq` must point at 32 readable lanes; the caller must have AVX2 and must pass the host's
+/// actual AVX-VNNI state.
+#[target_feature(enable = "avx2")]
+#[inline]
+pub(super) unsafe fn dot32_codes(c: __m256i, xq: *const i8, vnni: bool) -> i32 {
+    // SAFETY: the caller guarantees the 32-lane read and AVX2.
+    let x = unsafe { _mm256_loadu_si256(xq.cast()) };
+    let lanes = if vnni {
+        dot32_lanes_vnni(c, x)
+    } else {
+        dot32_lanes_avx2(c, x)
+    };
+    // SAFETY: register arithmetic only.
+    unsafe { hsum256(lanes) }
+}
+
+/// [`dot32_ptr`] with the AVX-VNNI decision supplied by the caller.
+///
+/// # Safety
+///
+/// `codes` must point at 32 readable bytes and `xq` at 32 readable lanes; the caller must have
+/// AVX2 and must pass the host's actual AVX-VNNI state.
+#[target_feature(enable = "avx2")]
+#[inline]
+pub(super) unsafe fn dot32_ptr_vnni(codes: *const u8, xq: *const i8, vnni: bool) -> i32 {
+    // SAFETY: the caller guarantees the two reads and AVX2.
+    let c = unsafe { _mm256_loadu_si256(codes.cast()) };
+    unsafe { dot32_codes(c, xq, vnni) }
+}
+
 /// Test-only slice wrapper around [`q5_0_dot32_ptr`].
 #[cfg(test)]
 #[target_feature(enable = "avx2")]
@@ -511,38 +579,9 @@ pub(super) unsafe fn q5_0_dot32x4_ptr(
     stride: usize,
     xq: *const i8,
 ) -> [i32; 4] {
-    // SAFETY: the caller's four blocks give each pass its 4 `qh` bytes, 16 `qs` bytes and 32 lanes.
-    unsafe {
-        let (c0, c1, c2, c3) = (
-            q5_0_codes(qh, qs),
-            q5_0_codes(qh.add(stride), qs.add(stride)),
-            q5_0_codes(qh.add(2 * stride), qs.add(2 * stride)),
-            q5_0_codes(qh.add(3 * stride), qs.add(3 * stride)),
-        );
-        let x0 = _mm256_loadu_si256(xq.cast());
-        let x1 = _mm256_loadu_si256(xq.add(32).cast());
-        let x2 = _mm256_loadu_si256(xq.add(64).cast());
-        let x3 = _mm256_loadu_si256(xq.add(96).cast());
-        let r = if avxvnni() {
-            reduce4(
-                dot32_lanes_vnni(c0, x0),
-                dot32_lanes_vnni(c1, x1),
-                dot32_lanes_vnni(c2, x2),
-                dot32_lanes_vnni(c3, x3),
-            )
-        } else {
-            reduce4(
-                dot32_lanes_avx2(c0, x0),
-                dot32_lanes_avx2(c1, x1),
-                dot32_lanes_avx2(c2, x2),
-                dot32_lanes_avx2(c3, x3),
-            )
-        };
-        let mut out = [0i32; 4];
-        // SAFETY: `out` is four `i32` = 16 bytes, exactly one 128-bit store.
-        _mm_storeu_si128(out.as_mut_ptr().cast(), r);
-        out
-    }
+    // SAFETY: the caller's four blocks give each decode its bytes and 128 lanes.
+    let decoded = unsafe { q5_0_codes4(qh, qs, stride) };
+    unsafe { dot32x4_codes(&decoded, xq, avxvnni()) }
 }
 
 /// Four `Q5_0` offset-representation dots for two rows against two blocks, the `Q5_0` twin of
@@ -638,12 +677,33 @@ unsafe fn q5_0_nib_and_set(qh: *const u8, qs: *const u8) -> (__m256i, __m256i) {
 
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn q5_0_codes(qh: *const u8, qs: *const u8) -> __m256i {
+pub(super) unsafe fn q5_0_codes(qh: *const u8, qs: *const u8) -> __m256i {
     let (nib, set) = unsafe { q5_0_nib_and_set(qh, qs) };
     _mm256_or_si256(
         nib,
         _mm256_andnot_si256(set, _mm256_set1_epi8(0xF0u8.cast_signed())),
     )
+}
+
+/// The 32 signed `Q5_0` codes of four consecutive blocks, decoded once for all activation columns
+/// of a pooled row.
+///
+/// # Safety
+///
+/// `qh + 3·stride` must point at 4 readable bytes, `qs + 3·stride` at 16; the caller must have
+/// AVX2.
+#[target_feature(enable = "avx2")]
+#[inline]
+pub(super) unsafe fn q5_0_codes4(qh: *const u8, qs: *const u8, stride: usize) -> [__m256i; 4] {
+    // SAFETY: the caller's four blocks give each decode its 4 `qh` bytes and 16 `qs` bytes.
+    unsafe {
+        [
+            q5_0_codes(qh, qs),
+            q5_0_codes(qh.add(stride), qs.add(stride)),
+            q5_0_codes(qh.add(2 * stride), qs.add(2 * stride)),
+            q5_0_codes(qh.add(3 * stride), qs.add(3 * stride)),
+        ]
+    }
 }
 
 /// [`q5_0_lanes_ptr`] with the activation vector already loaded, so four rows can share one

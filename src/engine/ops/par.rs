@@ -12,6 +12,7 @@ use super::fused::matvec_fused;
 use crate::engine::MatvecError;
 
 /// The fewest rows a projection chunk may carry, so scoped-thread overhead does not dominate.
+#[cfg(not(target_arch = "wasm32"))]
 const MIN_ROWS_PER_CHUNK: usize = 64;
 
 /// The row-chunk count for a projection with `n_out` rows: at most the machine's available
@@ -21,10 +22,20 @@ const MIN_ROWS_PER_CHUNK: usize = 64;
 /// # Complexity
 ///
 /// `O(1)`; the CPU count is resolved once behind a process-wide `OnceLock`.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn row_chunk_budget(n_out: usize) -> usize {
     chunk_budget(n_out, online_threads())
 }
 
+/// The wasm32 build has no scoped threads (`std::thread::scope` is not executed) and no worker
+/// pool, so every projection runs as one chunk through the unchunked row kernel. Fixed here, at
+/// compile time, rather than by a runtime flag.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn row_chunk_budget(_n_out: usize) -> usize {
+    1
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn chunk_budget(n_out: usize, threads: usize) -> usize {
     let by_rows = n_out / MIN_ROWS_PER_CHUNK;
     if by_rows == 0 {
@@ -36,6 +47,7 @@ pub(crate) fn chunk_budget(n_out: usize, threads: usize) -> usize {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn online_threads() -> usize {
     static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     if let Some(t) = THREADS.get() {
@@ -52,6 +64,7 @@ fn online_threads() -> usize {
 /// pins its dispatching thread to one core on its first dispatch. Cached after such a dispatch, it
 /// read 1 and serialised every chunked projection: Qwen3.5 decode fell from 69 to 19 tok/s
 /// whenever a pooled quantization ran before the first step (the batched prefill's order).
+#[cfg(not(target_arch = "wasm32"))]
 fn online_cpus() -> usize {
     #[cfg(target_os = "linux")]
     {

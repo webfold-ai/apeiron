@@ -501,3 +501,96 @@ fn zero_discrepancy_gives_zero_gradient() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+/// Data-parallel gradient shards merge exactly. Four "nodes" take the real backward of the KL
+/// objective against four different teachers (different data, same student); `Grads::merge` over
+/// them equals an independently written word sum, in forward, reverse and tree order and over the
+/// wire. Controls: a flipped word and a truncated wire are caught; the merge refuses an overflow
+/// and leaves the target unchanged.
+#[test]
+fn gradient_shards_merge_exactly() {
+    let (engine, path) = open_fixture("shardmerge");
+    let (w, cfg) = Weights::from_engine(&engine).expect("weights");
+    let (_, tape) = exact_forward(&path, &cfg, &w);
+    let shards: Vec<Grads> = (1..=4u64)
+        .map(|salt| {
+            let mut wt = w.clone();
+            perturb_teacher(&mut wt, salt, 1 << 26);
+            let (teacher, _) = exact_forward(&path, &cfg, &wt);
+            let (_, dz) = objective(&path, &cfg, &w, &teacher);
+            backward(&w, &cfg, &tape, &dz).expect("backward")
+        })
+        .collect();
+    assert_ne!(shards[0], shards[1], "shards must differ");
+    if let Ok(dir) = std::env::var("APEIRON_SHARD_OUT") {
+        for (i, s) in shards.iter().enumerate() {
+            std::fs::write(format!("{dir}/grads-shard-{i}.bin"), s.to_wire()).expect("write shard");
+        }
+    }
+
+    // independent reference: add the shards' buffers word by word, outside Grads::merge
+    let mut reference = shards[0].clone();
+    for s in &shards[1..] {
+        for (a, b) in reference.layers.iter_mut().zip(&s.layers) {
+            for (x, y) in [
+                (&mut a.wq, &b.wq), (&mut a.wk, &b.wk), (&mut a.wv, &b.wv), (&mut a.wo, &b.wo),
+                (&mut a.w_gate, &b.w_gate), (&mut a.w_up, &b.w_up), (&mut a.w_down, &b.w_down),
+                (&mut a.attn_norm, &b.attn_norm), (&mut a.ffn_norm, &b.ffn_norm),
+                (&mut a.bq, &b.bq), (&mut a.bk, &b.bk), (&mut a.bv, &b.bv),
+            ] {
+                for (p, q) in x.iter_mut().zip(y) {
+                    *p += q;
+                }
+            }
+        }
+        for (x, y) in [
+            (&mut reference.output_norm, &s.output_norm),
+            (&mut reference.token_embd, &s.token_embd),
+            (&mut reference.lm_head, &s.lm_head),
+        ] {
+            for (p, q) in x.iter_mut().zip(y) {
+                *p += q;
+            }
+        }
+    }
+
+    let mut fwd = shards[0].clone();
+    for s in &shards[1..] {
+        fwd.merge(s).unwrap();
+    }
+    let mut rev = shards[3].clone();
+    for s in shards[..3].iter().rev() {
+        rev.merge(s).unwrap();
+    }
+    let mut left = shards[0].clone();
+    left.merge(&shards[1]).unwrap();
+    let mut right = shards[2].clone();
+    right.merge(&shards[3]).unwrap();
+    left.merge(&right).unwrap();
+    let mut wire = Grads::from_wire(&shards[0].to_wire()).unwrap();
+    for s in &shards[1..] {
+        wire.merge(&Grads::from_wire(&s.to_wire()).unwrap()).unwrap();
+    }
+    assert_eq!(fwd, reference, "forward merge");
+    assert_eq!(rev, reference, "reverse merge");
+    assert_eq!(left, reference, "tree merge");
+    assert_eq!(wire, reference, "merge over the wire");
+
+    // controls
+    let mut flipped = shards[1].clone();
+    flipped.lm_head[0] += 1;
+    let mut m = shards[0].clone();
+    m.merge(&flipped).unwrap();
+    let mut ok = shards[0].clone();
+    ok.merge(&shards[1]).unwrap();
+    assert_ne!(m, ok, "control: a flipped word still compared equal");
+    let wb = shards[0].to_wire();
+    assert!(Grads::from_wire(&wb[..wb.len() - 1]).is_err());
+    let mut huge = shards[0].clone();
+    huge.lm_head[0] = i64::MAX;
+    let mut one = shards[0].clone();
+    one.lm_head[0] = 1;
+    let before = one.clone();
+    assert!(matches!(one.merge(&huge), Err(ModelError::Overflow)));
+    assert_eq!(one, before, "overflowing merge mutated the target");
+}

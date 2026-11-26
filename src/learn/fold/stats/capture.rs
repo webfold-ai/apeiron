@@ -392,6 +392,197 @@ impl Grams {
         res?;
         Ok(out)
     }
+
+    /// Add another shard's accumulator into this one: the exact merge of two calibration shards.
+    ///
+    /// Every word is an integer sum, so the merge is associative and commutative, and
+    /// `merge(accumulate(A), accumulate(B))` is bit-identical to accumulating `A` then `B` into one
+    /// accumulator, whatever the shard count or arrival order. Nothing is rounded. `other` is
+    /// untouched; `self` is untouched on error (the sums are checked before any word is written).
+    ///
+    /// # Errors
+    /// [`CaptureError::Shape`] when the two geometries differ; [`CaptureError::Overflow`] when a
+    /// word or the token count would leave its range.
+    ///
+    /// # Complexity
+    /// Two passes over the accumulator words: time `O(n_layer·(n_embd² + q_out² + n_ff²))`, space `O(1)`.
+    pub fn merge(&mut self, other: &Grams) -> Result<(), CaptureError> {
+        if self.n_embd != other.n_embd
+            || self.q_out != other.q_out
+            || self.n_ff != other.n_ff
+            || self.layers.len() != other.layers.len()
+        {
+            return Err(CaptureError::Shape("merge: geometries differ".to_string()));
+        }
+        let mut fits = true;
+        let mut l = 0usize;
+        while l < self.layers.len() && fits {
+            let (a, b) = (&self.layers[l], &other.layers[l]);
+            fits = a.tokens.checked_add(b.tokens).is_some()
+                && words_fit(&a.qkv, &b.qkv)
+                && words_fit(&a.o, &b.o)
+                && words_fit(&a.gate_up, &b.gate_up)
+                && words_fit(&a.down, &b.down);
+            l += 1;
+        }
+        if !fits {
+            return Err(CaptureError::Overflow);
+        }
+        let mut l = 0usize;
+        while l < self.layers.len() {
+            let b = &other.layers[l];
+            let a = &mut self.layers[l];
+            a.tokens = a.tokens.wrapping_add(b.tokens);
+            words_add(&mut a.qkv, &b.qkv);
+            words_add(&mut a.o, &b.o);
+            words_add(&mut a.gate_up, &b.gate_up);
+            words_add(&mut a.down, &b.down);
+            l += 1;
+        }
+        Ok(())
+    }
+
+    /// The shard's wire form: a header (`APGR1`, then `n_layer`, `n_embd`, `q_out`, `n_ff` as
+    /// little-endian `u64`), then per layer the token count and the four upper triangles
+    /// (`i ≤ j`, row-major) as little-endian `i64` Q32.32 words. The lower triangle is never
+    /// written by [`Grams::accumulate_tap`], so it is not sent.
+    ///
+    /// # Complexity
+    /// Time and space `O(n_layer·(n_embd² + q_out² + n_ff²)/2)` words.
+    #[must_use]
+    pub fn to_wire(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"APGR1");
+        for v in [self.layers.len(), self.n_embd, self.q_out, self.n_ff] {
+            out.extend_from_slice(&(v as u64).to_le_bytes());
+        }
+        let mut l = 0usize;
+        while l < self.layers.len() {
+            let a = &self.layers[l];
+            out.extend_from_slice(&a.tokens.to_le_bytes());
+            put_upper(&mut out, &a.qkv, self.n_embd);
+            put_upper(&mut out, &a.o, self.q_out);
+            put_upper(&mut out, &a.gate_up, self.n_embd);
+            put_upper(&mut out, &a.down, self.n_ff);
+            l += 1;
+        }
+        out
+    }
+
+    /// Read a shard written by [`Grams::to_wire`].
+    ///
+    /// # Errors
+    /// [`CaptureError::Shape`] for a wrong magic, a truncated or over-long buffer, or a geometry
+    /// whose size does not fit; [`CaptureError::Overflow`] when a length product leaves `usize`.
+    ///
+    /// # Complexity
+    /// Time and space as [`Grams::to_wire`].
+    pub fn from_wire(bytes: &[u8]) -> Result<Grams, CaptureError> {
+        let bad = |m: &str| CaptureError::Shape(format!("wire: {m}"));
+        if bytes.len() < 5 + 32 || &bytes[..5] != b"APGR1" {
+            return Err(bad("magic or header"));
+        }
+        let rd = |at: usize| -> usize {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&bytes[at..at + 8]);
+            usize::try_from(u64::from_le_bytes(w)).unwrap_or(usize::MAX)
+        };
+        let (n_layer, n_embd, q_out, n_ff) = (rd(5), rd(13), rd(21), rd(29));
+        let tri = |w: usize| -> Result<usize, CaptureError> {
+            w.checked_mul(w.checked_add(1).ok_or(CaptureError::Overflow)?)
+                .map(|x| x / 2)
+                .ok_or(CaptureError::Overflow)
+        };
+        let per_layer = 8usize
+            .checked_add(
+                tri(n_embd)?
+                    .checked_mul(2)
+                    .and_then(|x| x.checked_add(tri(q_out).ok()?))
+                    .and_then(|x| x.checked_add(tri(n_ff).ok()?))
+                    .and_then(|x| x.checked_mul(8))
+                    .ok_or(CaptureError::Overflow)?,
+            )
+            .ok_or(CaptureError::Overflow)?;
+        let want = per_layer
+            .checked_mul(n_layer)
+            .and_then(|x| x.checked_add(37))
+            .ok_or(CaptureError::Overflow)?;
+        if bytes.len() != want {
+            return Err(bad("length does not match the header geometry"));
+        }
+        let (e2, q2, f2) = (square(n_embd)?, square(q_out)?, square(n_ff)?);
+        let mut at = 37usize;
+        let mut layers = Vec::with_capacity(n_layer);
+        let mut l = 0usize;
+        while l < n_layer {
+            let mut t = [0u8; 8];
+            t.copy_from_slice(&bytes[at..at + 8]);
+            at += 8;
+            let mut lay = LayerGramQ {
+                qkv: vec![0; e2],
+                o: vec![0; q2],
+                gate_up: vec![0; e2],
+                down: vec![0; f2],
+                tokens: u64::from_le_bytes(t),
+            };
+            get_upper(bytes, &mut at, &mut lay.qkv, n_embd);
+            get_upper(bytes, &mut at, &mut lay.o, q_out);
+            get_upper(bytes, &mut at, &mut lay.gate_up, n_embd);
+            get_upper(bytes, &mut at, &mut lay.down, n_ff);
+            layers.push(lay);
+            l += 1;
+        }
+        Ok(Grams { layers, n_embd, q_out, n_ff })
+    }
+}
+
+/// `true` when every `dst[i] + src[i]` stays in `i64`.
+fn words_fit(dst: &[i64], src: &[i64]) -> bool {
+    let mut i = 0usize;
+    let mut ok = dst.len() == src.len();
+    while ok && i < dst.len() {
+        ok = dst[i].checked_add(src[i]).is_some();
+        i += 1;
+    }
+    ok
+}
+
+/// `dst[i] += src[i]`; the caller has already proved no word overflows.
+fn words_add(dst: &mut [i64], src: &[i64]) {
+    let mut i = 0usize;
+    while i < dst.len() {
+        dst[i] = dst[i].wrapping_add(src[i]);
+        i += 1;
+    }
+}
+
+/// Append the `i ≤ j` triangle of a `w × w` row-major matrix as little-endian words.
+fn put_upper(out: &mut Vec<u8>, m: &[i64], w: usize) {
+    let mut i = 0usize;
+    while i < w {
+        let mut j = i;
+        while j < w {
+            out.extend_from_slice(&m[i * w + j].to_le_bytes());
+            j += 1;
+        }
+        i += 1;
+    }
+}
+
+/// Read the `i ≤ j` triangle written by [`put_upper`], advancing `at`.
+fn get_upper(bytes: &[u8], at: &mut usize, m: &mut [i64], w: usize) {
+    let mut i = 0usize;
+    while i < w {
+        let mut j = i;
+        while j < w {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&bytes[*at..*at + 8]);
+            m[i * w + j] = i64::from_le_bytes(b);
+            *at += 8;
+            j += 1;
+        }
+        i += 1;
+    }
 }
 
 /// One layer's finished Grams: the zero-token refusal, then the four mirrored matrices.

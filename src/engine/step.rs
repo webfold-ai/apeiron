@@ -16,9 +16,10 @@ use super::chart::task::HeadTask;
 use super::error::{
     TensorKey, N_BLK_PARTS, N_LAYER_PARTS, PART_OUTPUT, TENSOR_PART_BYTES, TENSOR_PART_LEN,
 };
-#[cfg(test)]
+#[cfg(any(test, target_arch = "wasm32"))]
 use super::kern::lut::q8act_projection;
 use super::kern::lut::LUT_ROW_ALIGN;
+use super::kern::nq::NqError;
 use super::loader::{opt_slice, HadamardMeta, PayloadRef};
 use super::mixer::AffineState;
 use super::{
@@ -30,8 +31,9 @@ use crate::engine::num::dequant::dequant_row_fixed;
 use crate::engine::num::value::round_shift_32;
 use crate::engine::ops::lm_head;
 
-// Unchunked kernel: test-only `Sched::Sequential`; executing `Sched::Resident` is `par::matvec_rows_chunked`.
-#[cfg(test)]
+// Unchunked kernel: the `Sched::Sequential` oracle (tests and the wasm32 build); executing
+// `Sched::Resident` is `par::matvec_rows_chunked`.
+#[cfg(any(test, target_arch = "wasm32"))]
 use super::matvec_fixed;
 
 /// One greedy decode step's result (rows 0–8 composed).
@@ -58,6 +60,8 @@ pub enum StepError {
     Kv(AttnError),
     /// A projection refused.
     Matvec(MatvecError),
+    /// A `NanoQuant` sign-rank product refused.
+    Nq(NqError),
     /// The FFN refused.
     Ffn(FfnError),
     /// The LM head refused.
@@ -105,6 +109,8 @@ pub enum StepError {
         /// Supplied head width.
         kv_head_dim: usize,
     },
+    /// A file-backed KV cache could not be created, allocated or mapped.
+    KvFile(String),
     /// A config field cannot form a step quantity.
     BadConfig(String),
     /// A length did not fit the target integer width.
@@ -122,6 +128,7 @@ impl core::fmt::Display for StepError {
             StepError::Norm(e) => write!(f, "norm: {e:?}"),
             StepError::Kv(e) => write!(f, "kv: {e:?}"),
             StepError::Matvec(e) => write!(f, "matvec: {e:?}"),
+            StepError::Nq(e) => write!(f, "nq: {e}"),
             StepError::Ffn(e) => write!(f, "ffn: {e:?}"),
             StepError::LmHead(e) => write!(f, "lm head: {e:?}"),
             StepError::Sampler(e) => write!(f, "sampler: {e:?}"),
@@ -151,6 +158,7 @@ impl core::fmt::Display for StepError {
                 f,
                 "kv geometry {kv_layer}x{kv_head}x{kv_head_kv}x{kv_head_dim} != config"
             ),
+            StepError::KvFile(e) => write!(f, "kv file: {e}"),
             StepError::BadConfig(k) => write!(f, "bad config field {k}"),
             StepError::LengthOverflow => write!(f, "length overflow"),
             StepError::Overflow => write!(f, "fixed-point overflow"),
@@ -209,7 +217,8 @@ impl From<F32Error> for StepError {
 }
 
 /// Which projection kernel a decode step uses: [`KernelMode::Exact`] the pre-chart path,
-/// [`KernelMode::Q8Act`] the int8-activation chart (`matvec ∘ quant_act`) or LUT kernel.
+/// [`KernelMode::Q8Act`] the int8-activation chart (`matvec ∘ quant_act`) or LUT kernel,
+/// [`KernelMode::Ternary`] the ternary-activation reader over a `NanoQuant` pack.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KernelMode {
     /// The pre-change path over the dequantized activation.
@@ -217,16 +226,32 @@ pub enum KernelMode {
     Exact,
     /// The int8-activation chart kernel, or the `PQ2_0` lookup-table kernel.
     Q8Act,
+    /// The ternary-activation reader over the fitted linears; stored tensors keep the `Q8Act`
+    /// kernels, because the dial only changes the activation reader over the factors.
+    Ternary,
 }
 
 /// How a step sources each tensor payload: [`Sched::Resident`] the executing borrowed path,
-/// [`Sched::Sequential`] the `cfg(test)` oracle (owned `read_range`, one [`matvec_fixed`]).
+/// [`Sched::Sequential`] the unchunked oracle (owned `read_range` in tests, the resident slice on
+/// wasm32, one [`matvec_fixed`] in both).
 #[derive(Clone, Copy)]
 pub(crate) enum Sched {
     Resident,
-    #[cfg(test)]
+    #[cfg(any(test, target_arch = "wasm32"))]
     Sequential,
 }
+
+/// The schedule the step entry points select, fixed at compile time: native executes the resident
+/// path; wasm32 has no scoped threads or worker pool, so it executes the sequential one. The host
+/// carries no runtime test of this choice.
+#[cfg(target_arch = "wasm32")]
+const STEP_SCHED: Sched = Sched::Sequential;
+#[cfg(not(target_arch = "wasm32"))]
+const STEP_SCHED: Sched = Sched::Resident;
+/// The wasm build cannot reach the resident path's scoped threads, so the selection is checked at
+/// compile time rather than by a test that only runs on the host.
+#[cfg(target_arch = "wasm32")]
+const _: () = assert!(matches!(STEP_SCHED, Sched::Sequential));
 
 /// Checked `x[i] += y[i]` over two equal-width Q32.32 rows (the residual adds and bias add).
 fn add_assign_fixed(x: &mut [i64], y: &[i64]) -> Result<(), StepError> {
@@ -378,10 +403,19 @@ impl Engine {
     }
 }
 
-/// Prefill block width: the columns one pass carries, so the `Q8_0` weights are read once per
-/// block and the power-of-two GEMM (`kern::gemm`) reuses each weight row across them.
-/// `APEIRON_PREFILL_COLS` overrides it (read once). Default 256: a 200-token prompt is one block
-/// (receipts `1790772852-w6-t08-width-after-5arms`, `1790774715-w6-integ-ab1`).
+/// Prefill block width: the columns one pass carries, so the served weights are read once per
+/// block and the column tile folds each read across the block's columns. `APEIRON_PREFILL_COLS`
+/// overrides it (read once).
+///
+/// Default 1024 on a pool of four or more participants and 256 below: the pass pays a per-block
+/// fixed cost (the serial residual add, attention's per-pass setup, the norm and the pool
+/// dispatches), so the wider block pays it once per 1,024 columns instead of once per 256. On the
+/// OVH box, 0.6B pack, 1,827 columns (`bench/cpu/1795573862-prefill-block-and-group.md`):
+/// 1024/256 is 1.17× at eight participants and 1.15× at four; the phase split that locates the
+/// effect was taken at width 8, and width 4 was 1.007 before the group hoist against 1.152 after
+/// it, so the two changes are not separated there. At one participant the pass is instruction-bound
+/// and 1024 is 0.97× of 256. The rows are one model on one host; the threshold is the lowest
+/// measured winning width, not a located crossover, and widths 2–3 and the laptop are unmeasured.
 pub(crate) fn prefill_block() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -389,7 +423,13 @@ pub(crate) fn prefill_block() -> usize {
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(256)
+            .unwrap_or_else(|| {
+                if super::chart::pool::width_global() >= 4 {
+                    1024
+                } else {
+                    256
+                }
+            })
     })
 }
 
@@ -863,6 +903,10 @@ impl Engine {
         #[cfg(not(test))]
         match sched {
             Sched::Resident => {}
+            // The wasm build has no file to read: the sequential schedule borrows the resident
+            // bytes, and only the row kernel differs from `Resident`.
+            #[cfg(target_arch = "wasm32")]
+            Sched::Sequential => {}
         }
         let at = match self.payload_ref(t.byte_range.start, n_bytes) {
             Ok(p) => p,
@@ -1166,8 +1210,10 @@ impl Engine {
         }
         let raw = match sched {
             Sched::Resident => Cow::Borrowed(self.payload(at, row_bytes)?),
-            #[cfg(test)]
+            #[cfg(all(test, not(target_arch = "wasm32")))]
             Sched::Sequential => Cow::Owned(self.read_range(at, row_bytes)?),
+            #[cfg(target_arch = "wasm32")]
+            Sched::Sequential => Cow::Borrowed(self.payload(at, row_bytes)?),
         };
         let mut out: Vec<i64> = Vec::with_capacity(self.config.n_embd);
         dequant_row_fixed(t.ggml_type, raw.as_ref(), self.config.n_embd, &mut out)?;
@@ -1191,7 +1237,19 @@ impl Engine {
     /// [`RopeError`] for a malformed head geometry, a non-positive or non-finite `rope_theta`, or a
     /// frequency that does not fit Q32.32.
     pub fn rope_table(&self) -> Result<RopeTable, RopeError> {
-        RopeTable::new(self.config.rope_theta, self.config.rot_dims)
+        let mut table = RopeTable::new(self.config.rope_theta, self.config.rot_dims)?;
+        // A `llama` GGUF stores Q and K in the permuted layout ggml rotates as adjacent pairs.
+        if self.config.architecture == "llama" {
+            table = table.with_adjacent_pairs();
+        }
+        // Llama-3.1 ships `rope_freqs.weight` (one `F32` factor per rotary pair): the llama3 RoPE
+        // scaling. `ggml_rope_ext` divides each pair's angle by its factor, so without it the
+        // low-frequency pairs rotate too fast and the model degrades as position grows.
+        match self.rope_freq_factors() {
+            Ok(Some(factors)) => table.divided_by_q32(&factors[..]),
+            Ok(None) => Ok(table),
+            Err(_) => Err(RopeError::TableLength),
+        }
     }
 
     /// The output (LM-head) tensor entry (port-map row 7): `output.weight` when the directory
@@ -1266,7 +1324,7 @@ impl Engine {
     ) -> Result<Vec<Vec<i64>>, LmHeadError> {
         let n_embd = self.config.n_embd;
         let vocab = self.config.vocab_size;
-        if xs.len() > 1 && mode == KernelMode::Q8Act {
+        if xs.len() > 1 && matches!(mode, KernelMode::Q8Act | KernelMode::Ternary) {
             let t = self.lm_head();
             let need = lm_head::head_payload_len(t.ggml_type, &t.dims, n_embd, vocab)?;
             let extent = t.byte_range.end - t.byte_range.start;
@@ -1333,6 +1391,8 @@ impl Engine {
         #[cfg(not(test))]
         match sched {
             Sched::Resident => {}
+            #[cfg(target_arch = "wasm32")]
+            Sched::Sequential => {}
         }
         let at = match self.payload_ref(t.byte_range.start, need) {
             Ok(p) => p,
@@ -1364,24 +1424,25 @@ impl Engine {
                     }
                 }
             }
-            (Sched::Resident, KernelMode::Q8Act) => match self.proj_q8act_quantified(
-                self.lm_head_index(),
-                t.ggml_type,
-                at,
-                vocab,
-                n_embd,
-                x,
-                crate::engine::ops::par::row_chunk_budget(vocab),
-            ) {
+            (Sched::Resident, KernelMode::Q8Act | KernelMode::Ternary) => match self
+                .proj_q8act_quantified(
+                    self.lm_head_index(),
+                    t.ggml_type,
+                    at,
+                    vocab,
+                    n_embd,
+                    x,
+                    crate::engine::ops::par::row_chunk_budget(vocab),
+                ) {
                 Ok(v) => Ok(v),
                 Err(e) => Err(LmHeadError::Matvec(e)),
             },
-            #[cfg(test)]
+            #[cfg(any(test, target_arch = "wasm32"))]
             (Sched::Sequential, KernelMode::Exact) => {
                 lm_head::lm_head_fixed(t.ggml_type, raw, vocab, n_embd, x)
             }
-            #[cfg(test)]
-            (Sched::Sequential, KernelMode::Q8Act) => match q8act_projection(
+            #[cfg(any(test, target_arch = "wasm32"))]
+            (Sched::Sequential, KernelMode::Q8Act | KernelMode::Ternary) => match q8act_projection(
                 self,
                 self.lm_head_index(),
                 t.ggml_type,
@@ -1464,7 +1525,10 @@ impl Engine {
         sched: Sched,
         mode: KernelMode,
     ) -> Result<Vec<i64>, StepError> {
-        if let Some(out) = self.fold_proj(key, n_out, n_in, x)? {
+        // A packed NanoQuant linear replaces the payload: the factors carry the weight, so no GGUF
+        // row is read. The kernel mode chooses the activation reader over those factors: the exact
+        // Q32.32 words, the Q8 block codes or the ternary trit masks.
+        if let Some(out) = self.nq_proj(key, n_out, n_in, x, mode)? {
             return Ok(out);
         }
         let (idx, ggml_type, at) = self.tensor_payload(key, n_out, n_in, sched)?;
@@ -1479,16 +1543,17 @@ impl Engine {
                 activation,
                 crate::engine::ops::par::row_chunk_budget(n_out),
             ),
-            (Sched::Resident, KernelMode::Q8Act) => self.proj_q8act_quantified(
-                idx,
-                ggml_type,
-                at,
-                n_out,
-                n_in,
-                activation,
-                crate::engine::ops::par::row_chunk_budget(n_out),
-            ),
-            #[cfg(test)]
+            (Sched::Resident, KernelMode::Q8Act | KernelMode::Ternary) => self
+                .proj_q8act_quantified(
+                    idx,
+                    ggml_type,
+                    at,
+                    n_out,
+                    n_in,
+                    activation,
+                    crate::engine::ops::par::row_chunk_budget(n_out),
+                ),
+            #[cfg(any(test, target_arch = "wasm32"))]
             (Sched::Sequential, KernelMode::Exact) => matvec_fixed(
                 ggml_type,
                 &self.resident()[at.off..at.off + at.len],
@@ -1496,8 +1561,8 @@ impl Engine {
                 n_in,
                 activation,
             ),
-            #[cfg(test)]
-            (Sched::Sequential, KernelMode::Q8Act) => q8act_projection(
+            #[cfg(any(test, target_arch = "wasm32"))]
+            (Sched::Sequential, KernelMode::Q8Act | KernelMode::Ternary) => q8act_projection(
                 self,
                 idx,
                 ggml_type,
@@ -1509,35 +1574,6 @@ impl Engine {
             ),
         };
         out.map_err(StepError::Matvec)
-    }
-
-    /// The fitted linear's product of `x` where the GGUF's payload would be projected, or `None` when
-    /// `key` is not fitted. The fold face, not the payload, carries the weight: the projection runs on
-    /// [`matvec_fold`](super::matvec_fold) and the tensor's bytes are never read.
-    ///
-    /// # Errors
-    ///
-    /// [`StepError::BadShape`] when the config's shape for `key` is not the fold linear's;
-    /// [`StepError::Overflow`] when the product leaves `i64` or the face refuses the activation.
-    fn fold_proj(
-        &self,
-        key: TensorKey,
-        n_out: usize,
-        n_in: usize,
-        x: &[i64],
-    ) -> Result<Option<Vec<i64>>, StepError> {
-        let Some(lin) = self.fold_linear(key) else {
-            return Ok(None);
-        };
-        if (lin.o(), lin.n()) != (n_out, n_in) {
-            return Err(StepError::BadShape {
-                tensor: key.to_string(),
-                dims: vec![n_in as u64, n_out as u64],
-                expected: vec![lin.n() as u64, lin.o() as u64],
-            });
-        }
-        let out = lin.project(x).ok_or(StepError::Overflow)?;
-        Ok(Some(out))
     }
 
     /// Q/K/V projections for `layer` over `x` under the schedule and kernel `sched`/`mode` choose:
@@ -1554,7 +1590,12 @@ impl Engine {
         mode: KernelMode,
     ) -> Result<[Vec<i64>; 3], StepError> {
         let keys = [part_key(layer, 0), part_key(layer, 1), part_key(layer, 2)];
-        if !matches!(sched, Sched::Resident) || mode != KernelMode::Q8Act {
+        // A packed linear has no GGUF payload for the fused group to read; the three separate
+        // calls take the sign-rank product.
+        if keys.iter().any(|&key| self.nq_linear(key).is_some())
+            || !matches!(sched, Sched::Resident)
+            || !matches!(mode, KernelMode::Q8Act | KernelMode::Ternary)
+        {
             return self.step_qkv_separate(&keys, outs, n_in, x, sched, mode);
         }
         // A folded tensor rotates its own activation copy; the three then share no `quant_act`.
@@ -1666,14 +1707,7 @@ impl Engine {
     /// `O(n_layer·(n_embd² + n_embd·n_ff) + vocab·n_embd)` checked multiply-adds plus the LM-head
     /// dequantization; `O(vocab)` for the returned logits.
     pub fn step_logits(&self, kv: &mut KvState, token_id: u32) -> Result<Vec<i64>, StepError> {
-        self.compose_logits(
-            kv,
-            None,
-            token_id,
-            Sched::Resident,
-            KernelMode::Exact,
-            false,
-        )
+        self.compose_logits(kv, None, token_id, STEP_SCHED, KernelMode::Exact, false)
     }
 
     /// The Q32.32 logits of one decode step under the projection kernel `mode`.
@@ -1693,9 +1727,12 @@ impl Engine {
             kv,
             None,
             token_id,
-            Sched::Resident,
+            STEP_SCHED,
             mode,
-            mode == KernelMode::Q8Act,
+            // The Q8Act head dispatch is the pool's; the wasm build keeps the serial head even
+            // when a caller asks for that kernel.
+            matches!(mode, KernelMode::Q8Act | KernelMode::Ternary)
+                && !cfg!(target_arch = "wasm32"),
         )
     }
 
@@ -1758,7 +1795,7 @@ impl Engine {
             token_id,
             Sched::Resident,
             mode,
-            mode == KernelMode::Q8Act,
+            matches!(mode, KernelMode::Q8Act | KernelMode::Ternary),
         )
     }
 
@@ -1834,12 +1871,51 @@ impl Engine {
     /// The [`KvState`] planes plus `O(n_affine · state words)`, zeroed once.
     pub fn state(&self, cap: usize) -> Result<DecodeState, StepError> {
         let kv = self.decode_state(cap)?;
+        Ok(self.state_with_kv(kv))
+    }
+
+    /// A decode state whose KV planes live in one writable cache file at `path`.
+    ///
+    /// The file is created (or truncated), allocated to its full capacity and mapped
+    /// `MAP_SHARED`; see [`KvState::with_file`]. The capacity check is the allocation, so a cache
+    /// the filesystem cannot hold is refused here.
+    ///
+    /// # Errors
+    ///
+    /// [`StepError::BadConfig`] for a zero or above-context capacity, [`StepError::Kv`] for a
+    /// geometry refusal, and [`StepError::KvFile`] for a refused file.
+    pub fn state_with_file(&self, cap: usize, path: &str) -> Result<DecodeState, StepError> {
+        if cap == 0 {
+            return Err(StepError::BadConfig(String::from("kv capacity")));
+        }
+        let ctx = self.config.context_length;
+        if ctx != 0 && cap > ctx {
+            return Err(StepError::BadConfig(String::from(
+                "kv capacity above context_length",
+            )));
+        }
+        let kv = KvState::with_file(
+            path,
+            count_mixers(&self.config.mixers, MixerKind::Softmax),
+            self.config.n_head,
+            self.config.n_head_kv,
+            self.config.head_dim,
+            cap,
+        )
+        .map_err(|e| StepError::KvFile(e.to_string()))?;
+        Ok(self.state_with_kv(kv))
+    }
+
+    /// Wrap a resolved [`KvState`] with the affine carrier this model's schedule needs.
+    /// A decode state around a caller-supplied [`KvState`]: the affine state, when the model has
+    /// affine mixers, is allocated fresh; the KV planes are the caller's.
+    pub fn state_with_kv(&self, kv: KvState) -> DecodeState {
         let n_affine = count_mixers(&self.config.mixers, MixerKind::Affine);
         let affine = match self.config.affine {
             Some(g) if n_affine > 0 => Some(AffineState::new(&g, n_affine)),
             _ => None,
         };
-        Ok(DecodeState { kv, affine })
+        DecodeState { kv, affine }
     }
 
     /// One greedy decode step over any schedule; `mode` selects the projection kernel.
@@ -1879,7 +1955,7 @@ impl Engine {
             token_id,
             Sched::Resident,
             mode,
-            mode == KernelMode::Q8Act,
+            matches!(mode, KernelMode::Q8Act | KernelMode::Ternary),
         )
     }
 
@@ -1925,7 +2001,7 @@ impl Engine {
                 block,
                 Sched::Resident,
                 mode,
-                mode == KernelMode::Q8Act,
+                matches!(mode, KernelMode::Q8Act | KernelMode::Ternary),
                 None,
             )?);
         }
@@ -1944,6 +2020,32 @@ impl Engine {
         mode: KernelMode,
     ) -> Result<u32, StepError> {
         self.prefill_state_with_width(st, tokens, mode, prefill_block())
+    }
+
+    /// Prefill `tokens` and return every position's output-normed final state, before the head.
+    ///
+    /// Column `c` is exactly the state of one single-token step at position `c`, at the
+    /// prefill block width the engine chooses. The caller reads the head itself when it needs the
+    /// logits of every position, as the perplexity harness does.
+    ///
+    /// # Errors
+    ///
+    /// As [`Engine::step_state`]; [`StepError::BadConfig`] for an empty prompt.
+    ///
+    /// # Complexity
+    ///
+    /// `⌈n / prefill_block()⌉` block passes, each reading the served weights once where the kernel
+    /// supports a multi-column pass; `O(n · n_embd)` returned words.
+    pub fn prefill_states(
+        &self,
+        st: &mut DecodeState,
+        tokens: &[u32],
+        mode: KernelMode,
+    ) -> Result<Vec<Vec<i64>>, StepError> {
+        if tokens.is_empty() {
+            return Err(StepError::BadConfig(String::from("empty prompt")));
+        }
+        self.prefill_cols(st, tokens, mode)
     }
 
     pub(crate) fn prefill_state_with_width(
@@ -1971,7 +2073,7 @@ impl Engine {
                 block,
                 Sched::Resident,
                 mode,
-                mode == KernelMode::Q8Act,
+                matches!(mode, KernelMode::Q8Act | KernelMode::Ternary),
                 None,
             )?;
             if i + 1 == num_blocks {
@@ -1991,7 +2093,7 @@ impl Engine {
             super::trace::q8_bytes(vocab, n_embd),
             super::trace::macs(vocab, n_embd, 1),
         );
-        if mode == KernelMode::Q8Act && bitplane_enabled() {
+        if matches!(mode, KernelMode::Q8Act | KernelMode::Ternary) && bitplane_enabled() {
             if let Some(bp) = self.bitplane_head() {
                 if let Some(q) = super::chart::ffn::quant_act_pooled(xf) {
                     if super::chart::q8act_fast_bound_ok(xf.len(), 128, &q, true) {
@@ -2033,7 +2135,7 @@ impl Engine {
             token_id,
             Sched::Resident,
             mode,
-            mode == KernelMode::Q8Act,
+            matches!(mode, KernelMode::Q8Act | KernelMode::Ternary),
         )?;
         self.head_greedy_state(&xf, mode)
     }

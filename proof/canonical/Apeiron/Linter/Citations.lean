@@ -984,7 +984,122 @@ def sources : List Source := [
       ++ "monotone local updates, and merge as least upper bound. The join's "
       ++ "associativity, commutativity and idempotence remove delivery order "
       ++ "and duplication from the converged state. These are operation-level "
-      ++ "conditions and do not classify a trichotomy face." }
+      ++ "conditions and do not classify a trichotomy face." },
+  -- ── The comparators ─────────────────────────────────────────────────────────────────────────
+  -- These are NOT sources the corpus draws on. They are the nearest prior art for the
+  -- mechanisms the corpus realises, recorded here so that a `@cite` in a docstring can name
+  -- the comparator and the comparison can be stated rather than implied. Each was resolved
+  -- against its primary registry on 2026-11-23; none has been read in full, so each is a
+  -- pointer and carries no evidential weight (see book/src/reference/bibliography.md).
+  { key := "schlag-fast-weights-2021"
+    who := "Imanol Schlag, Kazuki Irie and Jürgen Schmidhuber 2021"
+    work := "Linear Transformers Are Secretly Fast Weight Programmers, ICML 2021"
+    where? := "arXiv:2102.11174"
+    contribution :=
+      "Comparator, not source. The nearest prior art for a forward computation that "
+      ++ "writes the weights it later reads, and for the delta rule that corrects an "
+      ++ "associative memory. The corpus's mechanism is NOT this: it changes the "
+      ++ "REPRESENTATION, with an explicit inverse, and can fold the change into the "
+      ++ "weights (rotor_folds_into_weight). A memory update is not a representation "
+      ++ "change, and the memory's capacity and interference arguments do not transfer "
+      ++ "to a prescribed basis." },
+  { key := "katharopoulos-linear-attention-2020"
+    who := "Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas and François Fleuret 2020"
+    work := "Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention, NeurIPS 2020"
+    where? := "arXiv:2006.16236"
+    contribution :=
+      "Comparator, not source. The nearest prior art for the predictive READ: a ratio "
+      ++ "of a numerator to a normaliser over accumulated state. The corpus's read has "
+      ++ "the same shape (attnOut_is_bulk_ratio) and differs in what the numerator and "
+      ++ "the drag ARE: channel coordinates of a cell, not inner products with a feature "
+      ++ "map; the state is O(1) and exact, not linear in the sequence length; and the "
+      ++ "read has a refusal where a normaliser can vanish." },
+  { key := "zhuang-acil-2022"
+    who := "Huiping Zhuang, Zhenyu Weng, Hongxin Wei, Renchunzi Xie, Kar-Ann Toh and Zhiping Lin 2022"
+    work := "ACIL: Analytic Class-Incremental Learning with Absolute Memorization and Privacy Protection, NeurIPS 2022"
+    where? := "arXiv:2205.14922"
+    contribution :=
+      "Comparator, not source. The nearest prior art for the claim that retaining an "
+      ++ "analytic state reproduces the joint solution without retaining the samples. "
+      ++ "The corpus's additive face makes that statement for the Gram ledger "
+      ++ "(stage_removal_exact, normal_equations_order_free); the overlap is on the "
+      ++ "CLAIM, and the corpus's addition is that the state is the cell's product as "
+      ++ "well as its sum, so that the same inverse serves the execution face." },
+  { key := "chen-liu-bls-2018"
+    who := "C. L. Philip Chen and Zhulin Liu 2018"
+    work := "Broad Learning System: An Effective and Efficient Incremental Learning System Without the Need for Deep Architecture, IEEE TNNLS 29"
+    where? := "DOI 10.1109/TNNLS.2017.2716952"
+    contribution :=
+      "Comparator, not source. The older incremental-analytic line: mapped features, "
+      ++ "enhancement nodes, and incremental update without complete retraining. It is "
+      ++ "the ancestor of the 'keep the state, not the samples' claim and is named here "
+      ++ "so that the corpus's version of that claim is not read as the origin of it." },
+  { key := "quan-federated-unlearning-2026"
+    who := "Yijun Quan, Wentai Wu and Giovanni Montana 2026"
+    work := "Exact Federated Continual Unlearning for Ridge Heads on Frozen Foundation Models"
+    where? := "arXiv:2603.12977"
+    contribution :=
+      "Comparator, not source. The closest prior art for the corpus's Gram ledger: "
+      ++ "fixed-size additive sufficient statistics from clients, a server supporting "
+      ++ "interleaved additions and deletions, and a head recovered pointwise identical "
+      ++ "to centralised retraining IN EXACT ARITHMETIC. The corpus's mechanism is NOT "
+      ++ "novel here; what the corpus adds is the arithmetic (exact in a fixed i64 ring, "
+      ++ "not exact arithmetic over the reals), the cost (O(d^2), no re-scan of the "
+      ++ "remaining peers), and the machine-checked link from the Rust to the canonical "
+      ++ "definition." },
+  { key := "alsulaimawi-federated-ridge-2026"
+    who := "Zahir Alsulaimawi 2026"
+    work := "One-Shot Federated Ridge Regression: Exact Recovery via Sufficient Statistic Aggregation"
+    where? := "arXiv:2601.08216"
+    contribution :=
+      "Comparator, not source. Aggregating Gram and feature-response statistics and "
+      ++ "solving the global ridge problem once is the corpus's additive face, and this "
+      ++ "is the prior art for it. Named so that the accumulation law is not presented as "
+      ++ "the corpus's own." },
+  { key := "jayraj-unlearning-curation-2026"
+    who := "Priyank Jayraj, Devanshu Sahoo and Uday Mittal 2026"
+    work := "Exact Unlearning After Data Curation"
+    where? := "arXiv:2610.33426"
+    contribution :=
+      "Comparator, not source. Prior art for exact removal of a contributed block. The "
+      ++ "corpus's subtraction (stage_removal_exact) is an instance of this established "
+      ++ "shape; the contribution is the cost and the verification, not the shape." },
+  { key := "tavory-unlearning-quantized-2026"
+    who := "Ami Tavory, Shripad Gade, Tal Sarig, Noam Touitou and Ido Guy 2026"
+    work := "Exact Unlearning via Quantized Sufficient Statistics"
+    where? := "arXiv:2610.07197"
+    contribution :=
+      "Comparator, not source. Prior art for exact removal from sufficient statistics, "
+      ++ "in the quantized case. It is the nearest neighbour of the corpus's own "
+      ++ "quantized carriers and of statfold's exact-merge and exact-unmerge, and it is "
+      ++ "named here rather than left to be rediscovered." },
+  { key := "gonzalez-linear-dynamical-2025"
+    who := "Xavier Gonzalez, E. Kelly Buchanan, Hyun Dong Lee, Jerry Weihong Liu, Ke Alexander Wang, David M. Zoltowski and Leo Kozachkov 2025"
+    work := "A Unifying Framework for Parallelizing Sequential Models with Linear Dynamical Systems"
+    where? := "arXiv:2509.21716"
+    contribution :=
+      "Comparator, not source. The survey-level account of associative scan and of the "
+      ++ "composition law for affine recurrences, which the corpus's affine laws "
+      ++ "(AnyRing.lean) formalise. The corpus's contribution is the verified "
+      ++ "integration, not the invention of the composition law." },
+  { key := "sun-test-time-learning-2024"
+    who := "Yu Sun, Xinhao Li, Karan Dalal, Jiarui Xu, Arjun Vikram, Genghan Zhang, Yann Dubois and others 2024"
+    work := "Learning to (Learn at Test Time): RNNs with Expressive Hidden States"
+    where? := "arXiv:2407.04620"
+    contribution :=
+      "Comparator, not source. Prior art for blurring the training and inference "
+      ++ "boundary by updating a state during the forward computation. The corpus's "
+      ++ "update is a composable accumulation with a supported inverse, which is a "
+      ++ "different update rule from a learning step on a hidden model." },
+  { key := "guan-merging-vs-ensembling-2019"
+    who := "Zoe Guan, Giovanni Parmigiani and Prasad Patil 2019"
+    work := "Merging versus Ensembling in Multi-Study Prediction: Theoretical Insight from Random Effects"
+    where? := "arXiv:1905.07382"
+    contribution :=
+      "Comparator, not source. The statistical account of when pooling per-unit "
+      ++ "estimates differs from averaging their predictions. It is the prior art for "
+      ++ "the distinction the corpus's shard law rests on: a shard is a contribution to a "
+      ++ "shared state, not a separately fitted model whose predictions are averaged." }
 ]
 
 /-- Is `k` a registered citation key? -/

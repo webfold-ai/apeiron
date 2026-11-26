@@ -13,6 +13,24 @@ const F_FF: usize = 128;
 const F_Q: usize = 8;
 const F_KO: usize = 4;
 
+/// Bound between the tiled attention and the per-position oracle in Q32.32 words: the tile
+/// rescales the accumulator once per key tile, the oracle once per position, so the two differ by
+/// the f32 roundoff the per-position recurrence accumulates over the prefix. Relative to the
+/// larger word, with a small absolute floor.
+fn assert_words_close(a: &[i64], b: &[i64], prefix: usize, what: &str) {
+    assert_eq!(a.len(), b.len(), "{what}: lengths");
+    for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
+        let m = i128::from(x.abs().max(y.abs()));
+        let tol = 256
+            + i64::try_from((m * 512 * (prefix as i128 + 64)) >> 32)
+                .expect("the tile bound fits i64");
+        assert!(
+            (x - y).abs() <= tol,
+            "{what} word {i}: {x} vs {y} (tol {tol})"
+        );
+    }
+}
+
 fn put_u32(b: &mut Vec<u8>, v: u32) {
     b.extend_from_slice(&v.to_le_bytes());
 }
@@ -246,5 +264,123 @@ fn prefill_state_matches_two_phase_computation() {
         }
     }
     std::env::remove_var("APEIRON_PREFILL_COLS");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A `NanoQuant` section of the fixture model's shape for `kind`: a deterministic sign plane and
+/// the served pack's reader geometry (exact-power-of-two scales, no salient correction, no dense
+/// residual layer).
+fn packed_kind(kind: usize, out: usize, inn: usize) -> crate::format::nq::PackedLinear {
+    let rank = 8usize;
+    let u_words = rank.div_ceil(32);
+    let v_words = inn.div_ceil(32);
+    let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ (kind as u64) << 32 ^ out as u64;
+    let mut word = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as u32
+    };
+    let u: Vec<u32> = (0..out * u_words).map(|_| word()).collect();
+    let v: Vec<u32> = (0..rank * v_words).map(|_| word()).collect();
+    // bfloat16 bits of 1/4, 1/2 and 1/2: exact powers of two, so every scale is one Q32.32 word.
+    let s_pre: Vec<u16> = vec![0x3e80; inn];
+    let s_mid: Vec<u16> = vec![0x3f00; rank];
+    let s_post: Vec<u16> = vec![0x3f00; out];
+    crate::format::nq::PackedLinear {
+        layer: 0,
+        kind,
+        out,
+        inn,
+        rank,
+        u: u.into(),
+        v: v.into(),
+        s_pre: s_pre.into(),
+        s_mid: s_mid.into(),
+        s_post: s_post.into(),
+        salient_idx: Vec::new().into(),
+        salient: Vec::new().into(),
+        res_layers: 0,
+        shared: false,
+        res: Vec::new().into(),
+        s_res: Vec::new().into(),
+    }
+}
+
+/// The whole executor on a packed model: one column per block (the per-column projection path)
+/// and `len` columns per block (the pooled path) produce the same prefill token, the same next
+/// token's logits word for word, and the same cached rows. The kernel test owns the projection's
+/// arithmetic; this owns the wiring — the reader choice, the group split and the fallback.
+#[test]
+fn the_nq_prefill_agrees_with_the_per_column_prefill() {
+    let (engine, path) = open_bytes("prefill_nq", &build_layer_gguf());
+    let c = &engine.config;
+    let shapes = [
+        (0, c.n_head * c.head_dim, c.n_embd),
+        (1, c.n_head_kv * c.head_dim, c.n_embd),
+        (2, c.n_head_kv * c.head_dim, c.n_embd),
+        (3, c.n_embd, c.n_head * c.head_dim),
+        (4, c.n_ff, c.n_embd),
+        (5, c.n_ff, c.n_embd),
+        (6, c.n_embd, c.n_ff),
+    ];
+    let linears: Vec<_> = shapes
+        .iter()
+        .map(|&(kind, out, inn)| packed_kind(kind, out, inn))
+        .collect();
+    let pack = crate::format::nq::NqPack::new(1, linears).expect("pack");
+    let engine = Engine::open_with_nq(&path, pack).expect("open packed");
+    assert!(
+        engine.nq_linear(super::part_key(0, 0)).is_some(),
+        "the pack must replace the layer's `q` linear, or this test runs the dense path twice"
+    );
+
+    let prompt = &[
+        0u32, 1, 2, 5, 9, 3, 7, 4, 8, 6, 0, 2, 4, 1, 3, 5, 7, 9, 8, 6, 1, 0, 5, 2, 8, 4, 9, 7, 3,
+        6, 2, 1, 4, 0, 7, 5, 6, 8, 9, 3, 4, 7, 1, 8, 0, 9, 2, 6, 5, 3, 8, 1, 6, 0, 4, 9, 7, 2, 5,
+    ];
+    for mode in [KernelMode::Exact, KernelMode::Q8Act] {
+        // Every prompt column's hidden state: the block path's tiled attention writes each
+        // column's `att` through the fold gather, so this is the comparison that sees it. (The
+        // next-token logits below read only the KV rows, which attention never writes.)
+        let mut one = engine.state(prompt.len() + 2).expect("state one");
+        let mut block = engine.state(prompt.len() + 2).expect("state block");
+        let sa = engine
+            .prefill_cols_width(&mut one, prompt, mode, 1)
+            .expect("prefill one");
+        let sb = engine
+            .prefill_cols_width(&mut block, prompt, mode, prompt.len())
+            .expect("prefill block");
+        assert_eq!(sa.len(), sb.len(), "prefill state rows, {mode:?}");
+        for (c, (a, b)) in sa.iter().zip(&sb).enumerate() {
+            assert_words_close(a, b, prompt.len(), &format!("prefill column {c}, {mode:?}"));
+        }
+        assert_eq!(
+            one.kv.occupied(0).expect("occupied"),
+            block.kv.occupied(0).expect("occupied"),
+            "cache length, {mode:?}"
+        );
+        let mut one = engine.state(prompt.len() + 2).expect("state one");
+        let mut block = engine.state(prompt.len() + 2).expect("state block");
+        let a = engine
+            .prefill_state_with_width(&mut one, prompt, mode, 1)
+            .expect("prefill one");
+        let b = engine
+            .prefill_state_with_width(&mut block, prompt, mode, prompt.len())
+            .expect("prefill block");
+        assert_eq!(a, b, "prefill token, {mode:?}");
+        let la = engine
+            .step_logits_with_mode(&mut one.kv, a, mode)
+            .expect("logits one");
+        let lb = engine
+            .step_logits_with_mode(&mut block.kv, b, mode)
+            .expect("logits block");
+        assert_words_close(
+            &la,
+            &lb,
+            prompt.len(),
+            &format!("next-token logits, {mode:?}"),
+        );
+    }
     let _ = std::fs::remove_file(&path);
 }

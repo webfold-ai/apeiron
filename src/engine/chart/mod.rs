@@ -44,7 +44,10 @@ mod portable;
 mod kcols;
 
 #[cfg(target_arch = "x86_64")]
-pub(crate) use kcols::{gemm_q4_k, gemm_q6_k};
+pub(crate) use kcols::{
+    lane_spread_limit, pack_cols, q4_k_row_lanes_avx2, q6_k_row_lanes_avx2, PackedCols, Q4KRow,
+    Q6KRow,
+};
 #[cfg(all(test, target_arch = "x86_64"))]
 use kcols::{q4_k_row_kcols_avx2, q6_k_row_kcols_avx2};
 
@@ -434,6 +437,8 @@ pub(crate) unsafe fn q8_0_row_kcols_avx2(
     acc: &mut [i128],
 ) -> Option<()> {
     let k = acc.len();
+    // One feature decision per row: the column loop below must not re-read the atomic.
+    let vnni = x86::avxvnni();
     let mut blk = 0usize;
     while blk + 4 <= blocks {
         let off = blk * Q8_0_BLOCK_BYTES;
@@ -446,17 +451,14 @@ pub(crate) unsafe fn q8_0_row_kcols_avx2(
                 f16_to_fixed_fast(scale_word(row.as_ptr(), off + 3 * Q8_0_BLOCK_BYTES))?,
             ]
         };
+        // The four code vectors are decoded once and reused by every column.
+        let codes = unsafe { x86::q8_0_codes4(row.as_ptr().add(off + 2), Q8_0_BLOCK_BYTES) };
         let mut c = 0usize;
         while c < k {
             let q = &qs[c];
-            // SAFETY: four blocks of codes and lanes are in range by the caller's geometry.
-            let dots = unsafe {
-                x86::dot32x4_ptr(
-                    row.as_ptr().add(off + 2),
-                    Q8_0_BLOCK_BYTES,
-                    q.codes.as_ptr().add(blk * ACT_QK),
-                )
-            };
+            // SAFETY: four blocks of lanes are in range by the caller's geometry.
+            let dots =
+                unsafe { x86::dot32x4_codes(&codes, q.codes.as_ptr().add(blk * ACT_QK), vnni) };
             let mut i = 0usize;
             while i < 4 {
                 // SAFETY: `q.scales.len() == blocks >= blk + 4`.
@@ -477,14 +479,96 @@ pub(crate) unsafe fn q8_0_row_kcols_avx2(
             let q = &qs[c];
             // SAFETY: the block's 32 code bytes and 32 lanes are in range.
             let dot = unsafe {
-                x86::dot32_ptr(
+                x86::dot32_ptr_vnni(
                     row.as_ptr().add(off + 2),
                     q.codes.as_ptr().add(blk * ACT_QK),
+                    vnni,
                 )
             };
             // SAFETY: `q.scales.len() == blocks > blk`.
             let scaled_dot = unsafe { *q.scales.get_unchecked(blk) } * i64::from(dot);
             acc[c] += i128::from(d) * i128::from(scaled_dot);
+            c += 1;
+        }
+        blk += 1;
+    }
+    Some(())
+}
+
+/// The `Q5_0` twin of [`q8_0_row_kcols_avx2`]: one weight row's 5-bit blocks decoded once and
+/// dotted against all `k` activation columns, with the row's `f16` block scale and each column's
+/// activation scale applied in `i128`.
+///
+/// # Safety
+///
+/// The caller established AVX2, `row.len() >= blocks·Q5_0_BLOCK_BYTES`, and every column's
+/// geometry and bound exactly as for [`q8_0_row_kcols_avx2`].
+///
+/// # Complexity
+///
+/// `O(blocks·k)` exact 32-lane dots, `O(k)` accumulator words.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn q5_0_row_kcols_avx2(
+    row: &[u8],
+    blocks: usize,
+    qs: &[QuantAct],
+    acc: &mut [i128],
+) -> Option<()> {
+    let k = acc.len();
+    // One feature decision per row: the column loop below must not re-read the atomic.
+    let vnni = x86::avxvnni();
+    let mut blk = 0usize;
+    while blk + 4 <= blocks {
+        let off = blk * Q5_0_BLOCK_BYTES;
+        // SAFETY: four block scales are in range by the caller's geometry.
+        let ds = unsafe {
+            [
+                f16_to_fixed_fast(scale_word(row.as_ptr(), off))?,
+                f16_to_fixed_fast(scale_word(row.as_ptr(), off + Q5_0_BLOCK_BYTES))?,
+                f16_to_fixed_fast(scale_word(row.as_ptr(), off + 2 * Q5_0_BLOCK_BYTES))?,
+                f16_to_fixed_fast(scale_word(row.as_ptr(), off + 3 * Q5_0_BLOCK_BYTES))?,
+            ]
+        };
+        // The four 5-bit blocks are decoded once and reused by every column.
+        let codes = unsafe {
+            x86::q5_0_codes4(
+                row.as_ptr().add(off + 2),
+                row.as_ptr().add(off + 6),
+                Q5_0_BLOCK_BYTES,
+            )
+        };
+        let mut c = 0usize;
+        while c < k {
+            let q = &qs[c];
+            // SAFETY: four blocks of lanes are in range by the caller's geometry.
+            let dots =
+                unsafe { x86::dot32x4_codes(&codes, q.codes.as_ptr().add(blk * ACT_QK), vnni) };
+            let mut i = 0usize;
+            while i < 4 {
+                // SAFETY: `q.scales.len() == blocks >= blk + 4`.
+                let scaled = unsafe { *q.scales.get_unchecked(blk + i) } * i64::from(dots[i]);
+                acc[c] += i128::from(ds[i]) * i128::from(scaled);
+                i += 1;
+            }
+            c += 1;
+        }
+        blk += 4;
+    }
+    while blk < blocks {
+        let off = blk * Q5_0_BLOCK_BYTES;
+        // SAFETY: `off + 6 <= row.len()`.
+        let d = f16_to_fixed_fast(unsafe { scale_word(row.as_ptr(), off) })?;
+        // SAFETY: the block's `qh`/`qs` bytes are in range.
+        let codes =
+            unsafe { x86::q5_0_codes(row.as_ptr().add(off + 2), row.as_ptr().add(off + 6)) };
+        let mut c = 0usize;
+        while c < k {
+            let q = &qs[c];
+            // SAFETY: the block's 32 lanes are in range.
+            let dot = unsafe { x86::dot32_codes(codes, q.codes.as_ptr().add(blk * ACT_QK), vnni) };
+            // SAFETY: `q.scales.len() == blocks > blk`.
+            let scaled = unsafe { *q.scales.get_unchecked(blk) } * i64::from(dot);
+            acc[c] += i128::from(d) * i128::from(scaled);
             c += 1;
         }
         blk += 1;

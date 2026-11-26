@@ -421,6 +421,131 @@ pub struct Grads {
     pub lm_head: Vec<i64>,
 }
 
+impl Grads {
+    /// Every gradient buffer in one fixed order: per layer the twelve buffers, then the output
+    /// norm, the embedding and the head.
+    fn buffers(&self) -> Vec<&Vec<i64>> {
+        let mut v: Vec<&Vec<i64>> = Vec::new();
+        for l in &self.layers {
+            v.extend([
+                &l.attn_norm, &l.wq, &l.bq, &l.wk, &l.bk, &l.wv, &l.bv, &l.wo, &l.ffn_norm,
+                &l.w_gate, &l.w_up, &l.w_down,
+            ]);
+        }
+        v.extend([&self.output_norm, &self.token_embd, &self.lm_head]);
+        v
+    }
+
+    fn buffers_mut(&mut self) -> Vec<&mut Vec<i64>> {
+        let mut v: Vec<&mut Vec<i64>> = Vec::new();
+        for l in &mut self.layers {
+            v.extend([
+                &mut l.attn_norm, &mut l.wq, &mut l.bq, &mut l.wk, &mut l.bk, &mut l.wv,
+                &mut l.bv, &mut l.wo, &mut l.ffn_norm, &mut l.w_gate, &mut l.w_up, &mut l.w_down,
+            ]);
+        }
+        v.extend([&mut self.output_norm, &mut self.token_embd, &mut self.lm_head]);
+        v
+    }
+
+    /// Add another data-parallel shard's gradient into this one: the exact all-reduce.
+    ///
+    /// Each word is an integer sum, so the merge is associative and commutative: summing the
+    /// gradients of disjoint sequences is bit-identical in any order, shard count or tree shape.
+    /// `self` is untouched on error (all sums are checked before any word is written).
+    ///
+    /// # Errors
+    /// [`ModelError::Shape`] when the buffer layout differs; [`ModelError::Overflow`] when a word
+    /// would leave `i64`.
+    ///
+    /// # Complexity
+    /// Two passes over the gradient words, space `O(1)` beyond the buffer list.
+    pub fn merge(&mut self, other: &Grads) -> Result<(), ModelError> {
+        let (a, b) = (self.buffers(), other.buffers());
+        if a.len() != b.len() || a.iter().zip(&b).any(|(x, y)| x.len() != y.len()) {
+            return Err(ModelError::Shape("Grads::merge: layouts differ".to_string()));
+        }
+        if a.iter().zip(&b).any(|(x, y)| x.iter().zip(y.iter()).any(|(p, q)| p.checked_add(*q).is_none())) {
+            return Err(ModelError::Overflow);
+        }
+        for (x, y) in self.buffers_mut().into_iter().zip(b) {
+            for (p, q) in x.iter_mut().zip(y.iter()) {
+                *p = p.wrapping_add(*q);
+            }
+        }
+        Ok(())
+    }
+
+    /// The shard's wire form: `APGD1`, the buffer count, then per buffer its length and its words,
+    /// all little-endian.
+    ///
+    /// # Complexity
+    /// Time and space `O(words)`.
+    #[must_use]
+    pub fn to_wire(&self) -> Vec<u8> {
+        let bufs = self.buffers();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"APGD1");
+        out.extend_from_slice(&(self.layers.len() as u64).to_le_bytes());
+        for b in bufs {
+            out.extend_from_slice(&(b.len() as u64).to_le_bytes());
+            for w in b {
+                out.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// Read a shard written by [`Grads::to_wire`].
+    ///
+    /// # Errors
+    /// [`ModelError::Shape`] for a wrong magic or a truncated, over-long or inconsistent buffer.
+    ///
+    /// # Complexity
+    /// Time and space `O(words)`.
+    pub fn from_wire(bytes: &[u8]) -> Result<Grads, ModelError> {
+        let bad = |m: &str| ModelError::Shape(format!("Grads wire: {m}"));
+        if bytes.len() < 13 || &bytes[..5] != b"APGD1" {
+            return Err(bad("magic or header"));
+        }
+        let rd = |at: usize| -> Option<u64> {
+            let s = bytes.get(at..at + 8)?;
+            let mut w = [0u8; 8];
+            w.copy_from_slice(s);
+            Some(u64::from_le_bytes(w))
+        };
+        let n_layer = usize::try_from(rd(5).ok_or_else(|| bad("header"))?).map_err(|_| bad("layers"))?;
+        let mut at = 13usize;
+        let mut take = |at: &mut usize| -> Result<Vec<i64>, ModelError> {
+            let len = usize::try_from(rd(*at).ok_or_else(|| bad("truncated length"))?).map_err(|_| bad("length"))?;
+            *at += 8;
+            let end = len.checked_mul(8).and_then(|n| at.checked_add(n)).ok_or_else(|| bad("length overflow"))?;
+            let body = bytes.get(*at..end).ok_or_else(|| bad("truncated words"))?;
+            *at = end;
+            Ok(body.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect())
+        };
+        let mut layers = Vec::with_capacity(n_layer);
+        for _ in 0..n_layer {
+            layers.push(LayerGrads {
+                attn_norm: take(&mut at)?, wq: take(&mut at)?, bq: take(&mut at)?,
+                wk: take(&mut at)?, bk: take(&mut at)?, wv: take(&mut at)?, bv: take(&mut at)?,
+                wo: take(&mut at)?, ffn_norm: take(&mut at)?, w_gate: take(&mut at)?,
+                w_up: take(&mut at)?, w_down: take(&mut at)?,
+            });
+        }
+        let g = Grads {
+            layers,
+            output_norm: take(&mut at)?,
+            token_embd: take(&mut at)?,
+            lm_head: take(&mut at)?,
+        };
+        if at != bytes.len() {
+            return Err(bad("trailing bytes"));
+        }
+        Ok(g)
+    }
+}
+
 /// `dembedding[token[r], :] += dh[r, :]`, checked, over a `t × w` hidden gradient.
 ///
 /// # Complexity

@@ -14,6 +14,7 @@
 
 - [The algebra](theory/algebra.md)
 - [The three faces](theory/faces.md)
+- [The five layers](theory/layers.md)
 - [Scalars](theory/scalars.md)
 - [Addressing](theory/addressing.md)
 - [The table](theory/table.md)

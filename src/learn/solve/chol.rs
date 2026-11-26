@@ -448,6 +448,44 @@ fn trailing_update_pool(
 /// Derivation: the trailing update contracts over `kb` per block column for `Σ_blocks (n−k)²`,
 /// which is `n³/3`. Promoted to `pub(super)` so [`super::inv`] factors the reversed equilibrated
 /// matrix through this body instead of a copy.
+/// The lower Cholesky factor `L` of SPD `a` (`L·Lᵀ = a`), row-major `[n, n]`, in Q32.32.
+///
+/// [`chol_solve`] answers a system; this answers the factor itself, for a caller that needs the
+/// factorisation and not the solution (GPTQ's error-feedback, a Heron-style refit, a determinant).
+/// The factor is built the same way the solve builds it: Jacobi equilibration `Â = D⁻¹AD⁻¹`
+/// ([`equilibrate`]), the blocked factor `Â = L̂L̂ᵀ` ([`factor_scaled`]), and the undo `L = D·L̂`, which
+/// is exact because `D` is diagonal.
+///
+/// # Errors
+///
+/// [`SolveError::Empty`] if `n == 0`; [`SolveError::ShapeMismatch`] if `a.len() != n·n`;
+/// [`SolveError::NonPositiveDiagonal`] if some `a_ii <= 0`; [`SolveError::NotPositiveDefinite`] if a
+/// pivot of `Â` is non-positive; [`SolveError::Overflow`] on any checked `i128` operation.
+///
+/// # Complexity
+///
+/// `O(n³/3)` checked multiply-adds and `O(n²)` space - one equilibration pass, one factor, one
+/// diagonal multiply.
+pub fn chol_factor(a: &[i64], n: usize) -> Result<Vec<i64>, SolveError> {
+    if n == 0 {
+        return Err(SolveError::Empty);
+    }
+    if a.len() != n * n {
+        return Err(SolveError::ShapeMismatch);
+    }
+    let (scaled, d) = equilibrate(a, n)?;
+    let l_hat = factor_scaled(&scaled, n)?;
+    let mut l = vec![0i64; n * n];
+    for i in 0..n {
+        for j in 0..=i {
+            let prod = i128::from(d[i]) * i128::from(l_hat[i * n + j]);
+            l[i * n + j] = narrow(crate::learn::solve::q32::rshift_rne(prod, 32).ok_or(SolveError::Overflow)?)
+                .ok_or(SolveError::Overflow)?;
+        }
+    }
+    Ok(l)
+}
+
 pub(crate) fn factor_scaled(a: &[i64], n: usize) -> Result<Vec<i64>, SolveError> {
     if a.len() != n * n {
         return Err(SolveError::ShapeMismatch);
@@ -874,4 +912,36 @@ pub fn chol_solve(a: &[i64], b: &[i64], n: usize, k: usize) -> Result<Solved, So
     let rf = exact_residual(a, b, &x, n, k)?;
     let residual_max = ov(max_abs(&rf))?;
     Ok(Solved { x, residual_max })
+}
+
+#[cfg(test)]
+mod chol_factor_tests {
+    use super::*;
+
+    /// `L·Lᵀ = A`, in Q32.32, for a matrix with a spread diagonal (which exercises the
+    /// equilibration undo).
+    #[test]
+    fn chol_factor_reconstructs() {
+        let n = 4usize;
+        let one = 1i64 << 32;
+        // A = [[6,1,0,0],[1,9,1,0],[0,1,12,1],[0,0,1,20]] in Q32.32, scaled by `one`
+        let raw = [6i64, 1, 0, 0, 1, 9, 1, 0, 0, 1, 12, 1, 0, 0, 1, 20];
+        let a: Vec<i64> = raw.iter().map(|v| v * one).collect();
+        let l = chol_factor(&a, n).expect("factor");
+        for i in 0..n {
+            for j in 0..n {
+                let mut acc: i128 = 0;
+                for k in 0..n {
+                    acc += i128::from(l[i * n + k]) * i128::from(l[j * n + k]);
+                }
+                let got = narrow(crate::learn::solve::q32::rshift_rne(acc, 32).expect("shift")).expect("narrow");
+                let want = a[i * n + j];
+                let tol = one / 1024; // a few LSB of Q32.32 against an entry of order 6
+                assert!(
+                    (got - want).abs() <= tol,
+                    "[{i}][{j}]: {got} vs {want} (tol {tol})"
+                );
+            }
+        }
+    }
 }

@@ -27,7 +27,6 @@
 )]
 
 pub mod nq;
-pub mod bpe;
 pub mod gguf;
 pub mod packing;
 pub mod quant;

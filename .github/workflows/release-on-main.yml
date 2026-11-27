@@ -1,0 +1,79 @@
+name: Tag the release main declares
+
+# A merge becomes a release with no human and no private dependency: read the version the default branch
+# declares, and if nothing on the remote carries it, tag that commit. Where the repository has a
+# tag-triggered `release.yml`, that job then packages and signs it.
+#
+# This is the tag half of the release, not the bump half. Bumping is a pull request, which is where the
+# version is decided and reviewed; this makes the tag appear so dependents have a semver to pin instead of
+# `rev = "<sha>"`, and so `caretaker-pins --prefer-tags` has a tag to move to.
+#
+# It deliberately does not fetch `caretakers-bump`: that tool lives in a private repository and a public
+# repository's runner cannot install it (measured: every push to main failed at that step, and no
+# RELEASE_TOKEN secret exists). The scheduled fleet job runs the same step from the box, where the token and
+# the tool both exist; this is the variant that works with nothing but the repository itself.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-on-main
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: tag the declared version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main with tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+
+      - name: Tag the version the manifest declares, once
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          # `[package] version = "..."`, or `[workspace.package]` when the package inherits it.
+          field() {
+            awk -v want="$1" '
+              /^[[:space:]]*\[/ { s = $0; gsub(/[][[:space:]]/, "", s); next }
+              s == want && $0 ~ /^version[[:space:]]*=[[:space:]]*"/ {
+                v = $0; sub(/^[^"]*"/, "", v); sub(/"[[:space:]]*$/, "", v); print v; exit
+              }' Cargo.toml
+          }
+          version="$(field package)"
+          [ -n "$version" ] || version="$(field workspace.package)"
+          if [ -z "$version" ]; then
+            echo "no [package] version and no [workspace.package] version in Cargo.toml" >&2
+            exit 1
+          fi
+          tag="v$version"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "$tag is already on the remote: nothing to release"
+            exit 0
+          fi
+          git config user.name "caretakers-bump"
+          git config user.email "caretakers-bump@twn.systems"
+          git tag -a "$tag" -m "$tag"
+          git push origin "refs/tags/$tag"
+          echo "tagged $(git rev-parse --short HEAD) as $tag"
+          # A tag pushed with GITHUB_TOKEN does not start a workflow, so start the packaging job here — but
+          # only if it can be started. A `release.yml` that triggers on push rather than on tags (several
+          # fleet repositories do) has no workflow_dispatch, and dispatching it would fail this job for no
+          # reason: the tag is still the release.
+          if [ ! -f .github/workflows/release.yml ]; then
+            echo "no release.yml: the tag is the release"
+          elif grep -qE '^[[:space:]]*workflow_dispatch:' .github/workflows/release.yml; then
+            gh workflow run release.yml --ref "$tag"
+          else
+            echo "release.yml does not offer workflow_dispatch: the tag is the release"
+          fi

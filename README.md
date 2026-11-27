@@ -215,34 +215,6 @@ Numbers quoted here are measured outputs of merged `main` commits, not projectio
 See `LICENSE` in this repository. Third-party datasets and models keep their own terms; the
 reproduction guide names each one and where its licence applies.
 
-## Part of
-
-**Webfold AI** — an Australian AI lab based in Tasmania, Australia. <https://webfold.ai>
-## Where the rest of the stack lives
-
-This repository is one part of the Webfold stack. The parts you need are **not** here:
-
-| what | where |
-|---|---|
-| **the evals** — one binary, 101 benchmarks, closed-form scoring, zero model calls in the judging path | [`webfold-ai/agent-evals`](https://github.com/webfold-ai/agent-evals) |
-| **the gates** — the caretakers that refuse work (policy, provenance, scope) | [`webfold-ai/caretaker`](https://github.com/webfold-ai/caretaker) |
-| **the store** — the substrate; new storage code belongs here | [`webfold-ai/iotadb`](https://github.com/webfold-ai/iotadb) |
-| **the training** — the distributed fleet and the Gram/RidgeFold shards | [`webfold-ai/webtrainer`](https://github.com/webfold-ai/webtrainer) |
-| **the models** — the model crates and the checkpoint format | [`webfold-ai/modelfold`](https://github.com/webfold-ai/modelfold), [`webfold-ai/seed-format`](https://github.com/webfold-ai/seed-format) |
-| **the serving** — the engine, the gateway and the admission guard | [`webfold-ai/peregrine-ng`](https://github.com/webfold-ai/peregrine-ng), [`webfold-ai/ai-gateway`](https://github.com/webfold-ai/ai-gateway), [`webfold-ai/guardfold`](https://github.com/webfold-ai/guardfold) |
-| **the statistics** — the monoid, the Gram, the significance tests | [`webfold-ai/statfold`](https://github.com/webfold-ai/statfold) |
-| **the product** — the engine | [`webfold-ai/webfold`](https://github.com/webfold-ai/webfold) |
-| **the agent** — the coding agent the harness adapters are written for | [`webfold-ai/webfold-coding-agent`](https://github.com/webfold-ai/webfold-coding-agent) |
-
-**The evals are the gate.** A change is measured by `agent-evals` (or by the benchmark
-harness in this repository), never by a private script:
-
-```sh
-git clone https://github.com/webfold-ai/agent-evals && cd agent-evals
-cargo build --release
-./target/release/agent_evals list                    # every benchmark it knows
-./target/release/agent_evals run <bench> --dataset=<file>.jsonl
-```
 
 If a benchmark you need does not exist there, add it there — not in a scratch
 directory next to the code.

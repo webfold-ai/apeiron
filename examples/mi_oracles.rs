@@ -1943,6 +1943,166 @@ fn assoc() -> bool {
     report("E-ASSOC", &checks)
 }
 
+// ---------------------------------------------------------------------------------------------
+// E-TRUNC: the apeiron law on the memory — no tuned ridge; fold, read the spectrum, truncate.
+// ---------------------------------------------------------------------------------------------
+
+fn trunc() -> bool {
+    println!("\n--- E-TRUNC: truncate by the spectrum instead of regularising (SYNTHETIC; same memory as E-ASSOC) ---");
+    println!("Law under test (apeiron, as recorded in the Pi session): no tuned lambda; accumulate G exactly, read its spectrum with");
+    println!("top_eigh, keep the modes that carry signal, solve on those. Read = B̃ᵀ V_r diag(1/μ_r) V_rᵀ k̃. Memory: d=64, 16 classes,");
+    println!("n in {{64, 96, 128}} pairs (full rank only: top_eigh refuses a singular matrix and no PSD patch is applied).");
+    println!("Noisy keys: noise 0.5 of the per-coordinate key std, 5 draws. 'oracle r' is chosen by noisy recall, so it is a ceiling.");
+    println!("Rules for r (fixed before the run): CONE99 = smallest r with cone(r) >= 0.99, cone(r)=Σ_{{k<=r}} μ_k² / ‖G‖_F²;");
+    println!("FLOOR = number of modes with μ >= 0.01·μ_max.");
+    println!("PREDICTIONS (fixed before the first run):");
+    println!("  T1 at n=d the best truncation matches the best ridge on noisy keys within 0.03 (a hard filter vs a soft filter on the same spectrum).");
+    println!("  T2 at n=d the collapse comes from the smallest modes: the oracle r is >= 52 and the untruncated read (r=64) is <= 0.70 noisy.");
+    println!("  T3 at n=d the CONE99 rule picks r >= 60 (the spectrum is nearly flat) and so does NOT remove the collapse (<= 0.70 noisy),");
+    println!("     while the FLOOR rule is within 0.05 of the best ridge.");
+    println!("  T4 at n=96 there is no collapse: untruncated noisy >= 0.85, and best truncation vs best ridge differ by <= 0.03.");
+    println!("  T5 truncation costs clean recall only when it cuts signal: at n=d, clean recall at r=32 is <= 0.90 and at the FLOOR rule is >= 0.99.");
+
+    let (d, v) = (64usize, 16usize);
+    let mut rng = Rng(0x77AC_E5EC_7203_0001);
+    let n_max = 128usize;
+    let keys: Vec<Vec<i8>> = (0..n_max).map(|_| (0..d).map(|_| q8(rng.gauss() * 40.0)).collect()).collect();
+    let vals: Vec<usize> = (0..n_max).map(|_| (rng.next() % v as u64) as usize).collect();
+    let tilde = |k: &[i8]| -> Vec<f64> { k.iter().map(|&x| f64::from(x) / 127.0).collect() };
+    let argmax = |x: &[f64]| (0..x.len()).max_by(|&a, &b| x[a].partial_cmp(&x[b]).unwrap()).unwrap();
+    let noise_sd = 0.5 * (40.0 / 127.0);
+
+    struct Row {
+        n: usize,
+        best_ridge: (f64, f64),
+        full_noisy: f64,
+        oracle: (usize, f64),
+        cone99: (usize, f64, f64),
+        floor: (usize, f64, f64),
+        r32_clean: f64,
+    }
+    let mut rows = Vec::new();
+    for &n in &[64usize, 96, 128] {
+        let ids: Vec<usize> = (0..n).collect();
+        let mut flat = Vec::new();
+        for &i in &ids {
+            flat.extend_from_slice(&keys[i]);
+        }
+        let g = gram(&flat, n, d);
+        let mut b = vec![0i64; d * v];
+        for &i in &ids {
+            for j in 0..d {
+                b[j * v + vals[i]] += i64::from(keys[i][j]) * 127;
+            }
+        }
+        let s = n as f64 * 127.0 * 127.0;
+        let bn: Vec<f64> = b.iter().map(|&x| x as f64 / s).collect();
+        // exact spectrum of G/S via the full top_eigh
+        let mut q = vec![0i64; d * d];
+        for i in 0..d {
+            for j in 0..=i {
+                let val = (g[i * d + j] as f64 / s * Q).round() as i64;
+                q[i * d + j] = val;
+                q[j * d + i] = val;
+            }
+        }
+        let eig = top_eigh(&q, d, d).expect("top_eigh (full rank)");
+        let mu_asc = to_f(&eig.evals);
+        let vecs = to_f(&eig.evecs);
+        // descending order
+        let order: Vec<usize> = (0..d).rev().collect();
+        let mu: Vec<f64> = order.iter().map(|&k| mu_asc[k]).collect();
+        let frob2: f64 = mu.iter().map(|m| m * m).sum();
+        let mut cone = vec![0f64; d + 1];
+        for r in 1..=d {
+            cone[r] = cone[r - 1] + mu[r - 1] * mu[r - 1] / frob2;
+        }
+        // T = Vᵀ B̃ (columns in descending order)
+        let mut t = vec![0f64; d * v];
+        for (rank, &k) in order.iter().enumerate() {
+            for c in 0..v {
+                t[rank * v + c] = (0..d).map(|i| vecs[i * d + k] * bn[i * v + c]).sum();
+            }
+        }
+        let weights = |r: usize| -> Vec<f64> {
+            let mut w = vec![0f64; d * v];
+            for rank in 0..r {
+                let inv = 1.0 / mu[rank];
+                let k = order[rank];
+                for i in 0..d {
+                    let vik = vecs[i * d + k] * inv;
+                    for c in 0..v {
+                        w[i * v + c] += vik * t[rank * v + c];
+                    }
+                }
+            }
+            w
+        };
+        let recall = |w: &[f64], noisy: bool, rng: &mut Rng| -> f64 {
+            let mut ok = 0usize;
+            let reps = if noisy { 5 } else { 1 };
+            for _ in 0..reps {
+                for &i in &ids {
+                    let mut kt = tilde(&keys[i]);
+                    if noisy {
+                        for x in kt.iter_mut() {
+                            *x += noise_sd * rng.gauss();
+                        }
+                    }
+                    if argmax(&predict(w, d, v, &kt)) == vals[i] {
+                        ok += 1;
+                    }
+                }
+            }
+            ok as f64 / (n * reps) as f64
+        };
+        // ridge reference (the read we are replacing), best lambda on noisy keys
+        let mut best_ridge = (0f64, 0f64);
+        for &lm in &[1e-4, 1e-3, 1e-2, 1e-1, 1.0] {
+            let w = to_f(&solve_q(&g, &b, d, v, s, lm));
+            let (c, nz) = (recall(&w, false, &mut rng), recall(&w, true, &mut rng));
+            if nz > best_ridge.1 {
+                best_ridge = (c, nz);
+            }
+        }
+        let grid: Vec<usize> = (4..=d).step_by(4).collect();
+        let mut curve = Vec::new();
+        for &r in &grid {
+            let w = weights(r);
+            curve.push((r, recall(&w, false, &mut rng), recall(&w, true, &mut rng)));
+        }
+        let oracle = curve.iter().max_by(|a, b| a.2.partial_cmp(&b.2).unwrap()).map(|c| (c.0, c.2)).unwrap();
+        let full_noisy = curve.last().unwrap().2;
+        let r_cone99 = (1..=d).find(|&r| cone[r] >= 0.99).unwrap_or(d);
+        let r_floor = mu.iter().filter(|&&m| m >= 0.01 * mu[0]).count();
+        let at = |r: usize, rng: &mut Rng| -> (f64, f64) {
+            let w = weights(r);
+            (recall(&w, false, rng), recall(&w, true, rng))
+        };
+        let (c99_clean, c99_noisy) = at(r_cone99, &mut rng);
+        let (fl_clean, fl_noisy) = at(r_floor, &mut rng);
+        let r32_clean = curve.iter().find(|c| c.0 == 32).map(|c| c.1).unwrap();
+        println!("\n  n={n}: spectrum μ_max {:.4}, μ_min {:.2e}, cone at r=8/16/32/48: {:.3}/{:.3}/{:.3}/{:.3}", mu[0], mu[d - 1], cone[8], cone[16], cone[32], cone[48]);
+        println!("    r    clean  noisy   (truncated read; r=64 is the untruncated one)");
+        for c in curve.iter().filter(|c| [8, 16, 32, 48, 52, 56, 60, 64].contains(&c.0)) {
+            println!("    {:>3}  {:.3}  {:.3}", c.0, c.1, c.2);
+        }
+        println!("    best ridge (lambda grid): clean {:.3} noisy {:.3}", best_ridge.0, best_ridge.1);
+        println!("    oracle r = {} -> noisy {:.3};  CONE99 picks r = {} -> clean {:.3} noisy {:.3};  FLOOR picks r = {} -> clean {:.3} noisy {:.3}", oracle.0, oracle.1, r_cone99, c99_clean, c99_noisy, r_floor, fl_clean, fl_noisy);
+        rows.push(Row { n, best_ridge, full_noisy, oracle, cone99: (r_cone99, c99_clean, c99_noisy), floor: (r_floor, fl_clean, fl_noisy), r32_clean });
+    }
+    let r64 = rows.iter().find(|r| r.n == 64).unwrap();
+    let r96 = rows.iter().find(|r| r.n == 96).unwrap();
+    let checks = vec![
+        Check { name: "T1 best truncation matches best ridge at n=d", pass: (r64.oracle.1 - r64.best_ridge.1).abs() <= 0.03 || r64.oracle.1 > r64.best_ridge.1, detail: format!("oracle-r noisy {:.3} (r={}) vs best ridge noisy {:.3}", r64.oracle.1, r64.oracle.0, r64.best_ridge.1) },
+        Check { name: "T2 the collapse is the smallest modes", pass: r64.oracle.0 >= 52 && r64.full_noisy <= 0.70, detail: format!("oracle r = {}; untruncated noisy {:.3}", r64.oracle.0, r64.full_noisy) },
+        Check { name: "T3 the cone rule does not fix it; the eigenvalue floor does", pass: r64.cone99.0 >= 60 && r64.cone99.2 <= 0.70 && r64.floor.2 >= r64.best_ridge.1 - 0.05, detail: format!("CONE99 r={} noisy {:.3}; FLOOR r={} noisy {:.3} (best ridge {:.3})", r64.cone99.0, r64.cone99.2, r64.floor.0, r64.floor.2, r64.best_ridge.1) },
+        Check { name: "T4 no collapse beyond d; truncation = ridge", pass: r96.full_noisy >= 0.85 && (r96.oracle.1 - r96.best_ridge.1).abs() <= 0.03, detail: format!("n=96: untruncated noisy {:.3}; oracle {:.3} vs best ridge {:.3}", r96.full_noisy, r96.oracle.1, r96.best_ridge.1) },
+        Check { name: "T5 truncation costs clean recall only when it cuts signal", pass: r64.r32_clean <= 0.90 && r64.floor.1 >= 0.99, detail: format!("n=d: clean at r=32 {:.3}; at the FLOOR rule {:.3}", r64.r32_clean, r64.floor.1) },
+    ];
+    report("E-TRUNC", &checks)
+}
+
 fn main() -> ExitCode {
     let which = std::env::args().nth(1).unwrap_or_else(|| "all".to_string());
     let mut ok = true;
@@ -1960,6 +2120,9 @@ fn main() -> ExitCode {
     }
     if which == "assoc" || which == "all" {
         ok &= assoc();
+    }
+    if which == "trunc" || which == "all" {
+        ok &= trunc();
     }
     println!(
         "\n{}",

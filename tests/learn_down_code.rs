@@ -9,7 +9,7 @@
 //!   by construction (`APEIRON_DOWN_LAYERS`, `APEIRON_DOWN_SKIP`, `APEIRON_DOWN_CHUNKS`).
 //! - `down_unit_energy`: the exact decomposition of the hidden-layer error energy
 //!   `tr(E H Eᵀ) = Σ_i c_i` with `E = D̂ − D` (`n_embd × n_ff`) and `H` the held-out down Gram
-//!   `E[m mᵀ]` (`n_ff × n_ff`, the production `Grams::down` over tap stage 4, the engine's `SwiGLU`
+//!   `E[m mᵀ]` (`n_ff × n_ff`, the production `SyrkAcc::down` over tap stage 4, the engine's `SwiGLU`
 //!   product `m = silu(g·x)⊙(u·x)`).
 //!
 //! Token disjointness: `H` for the energy is the mean Gram over chunk `CALIB` (8) of the base file's
@@ -46,7 +46,7 @@ use apeiron::format::gguf::Gguf;
 use apeiron::format::quant;
 use apeiron::learn::fold::fit::fold_fit::{fold_fit, FoldFitConfig};
 use apeiron::learn::fold::run::convert::{encode_f16, encode_f32};
-use apeiron::learn::fold::stats::capture::{Grams, Normalisation};
+use apeiron::learn::fold::stats::capture::{Normalisation, SyrkAcc};
 use apeiron::learn::fold::stats::heldout::{held_out, held_out_kldbase_chunk};
 use apeiron::learn::fold::stats::kldbase::KldBase;
 use apeiron::learn::grad::load::layer_from_engine;
@@ -74,7 +74,7 @@ fn base_path() -> String {
     std::env::var("APEIRON_DOWN_BASE").unwrap_or_else(|_| String::from(BASE))
 }
 
-/// Where the fitted rows and the calibration Grams are cached as Q32.32 words.
+/// Where the fitted rows and the calibration SyrkAcc are cached as Q32.32 words.
 const CACHE: &str = "~/kld08/gatecode-tok";
 
 /// Tap slot of the `SwiGLU` product `m`, the `ffn_down` input (`STAGE_M`), `n_ff` wide.
@@ -156,7 +156,7 @@ fn tapped(engine: &Engine, tokens: &[u32]) -> Vec<Vec<Vec<Vec<i64>>>> {
 ///
 /// `O(rows·n²/2)` multiply-adds, the upper triangle only; the row loop is outer so each `O(n)`
 /// row is read once per row index.
-fn gram_add(x: &[i64], rows: usize, n: usize, acc: &mut [f64]) {
+fn syrk_add(x: &[i64], rows: usize, n: usize, acc: &mut [f64]) {
     for r in 0..rows {
         let row = unq(&x[r * n..(r + 1) * n]);
         for i in 0..n {
@@ -374,7 +374,7 @@ fn down_control_self() {
 /// with `h`. Space `O(n²)` for the Gram.
 fn energy_of(e: &[i64], h: &[f64], o: usize, n: usize) -> (f64, f64, Vec<f64>) {
     let mut g = vec![0.0f64; n * n];
-    gram_add(e, o, n, &mut g);
+    syrk_add(e, o, n, &mut g);
     mirror(&mut g, n);
     let mut c = vec![0.0f64; n];
     for i in 0..n {
@@ -432,16 +432,16 @@ fn down_unit_energy() {
     );
     let t0 = Instant::now();
     let rows = tapped(&engine, &chunks[held]);
-    let mut grams = Grams::new(&cfg).expect("grams");
+    let mut grams = SyrkAcc::new(&cfg).expect("grams");
     grams.accumulate_tap(&rows).expect("accumulate");
-    let held_grams = grams.finish(Normalisation::Mean).expect("finish");
+    let held_syrks = grams.finish(Normalisation::Mean).expect("finish");
     drop(grams);
-    println!("DOWNEN tap and Grams {:.1} s", t0.elapsed().as_secs_f64());
+    println!("DOWNEN tap and SyrkAcc {:.1} s", t0.elapsed().as_secs_f64());
     let mut control_done = false;
     let mut best_c = (0usize, 0.0f64);
     for &l in &layers {
         let t = Instant::now();
-        let h: &[f64] = &held_grams[l].down;
+        let h: &[f64] = &held_syrks[l].down;
         let mut dm = vec![0.0f64; n];
         for col in &rows[l][TAP_M] {
             for (k, v) in unq(col).iter().enumerate() {
@@ -463,7 +463,7 @@ fn down_unit_energy() {
         let e: Vec<i64> = dhw.iter().zip(&d).map(|(a, b)| a - b).collect();
         let (total, diag, c) = energy_of(&e, h, o, n);
         let mut gd = vec![0.0f64; n * n];
-        gram_add(&d, o, n, &mut gd);
+        syrk_add(&d, o, n, &mut gd);
         mirror(&mut gd, n);
         let mut base = 0.0f64;
         for i in 0..n {
@@ -589,7 +589,7 @@ fn keep_indices(score: &[f64], k: usize, l: usize, select: &str) -> Vec<usize> {
     out
 }
 
-/// The calibration `ffn_down` input Grams (`Grams::down`, tap stage [`TAP_M`]) over chunks `0..CALIB`
+/// The calibration `ffn_down` input SyrkAcc (`SyrkAcc::down`, tap stage [`TAP_M`]) over chunks `0..CALIB`
 /// of `chunks`, mean-normalised, returned per layer index over `0..cfg.n_layer` — empty for a layer
 /// not in `layers`.
 ///
@@ -597,9 +597,9 @@ fn keep_indices(score: &[f64], k: usize, l: usize, select: &str) -> Vec<usize> {
 /// the tap columns, relative error below `1e-4`. A feature-major buffer read as token rows (the
 /// defect this replaces) misses it by `O(1)`.
 ///
-/// `Grams::accumulate_tap` carries the accumulation, `O(CALIB·tokens·(n_embd² + q_out² + n_ff²))`;
+/// `SyrkAcc::accumulate_tap` carries the accumulation, `O(CALIB·tokens·(n_embd² + q_out² + n_ff²))`;
 /// this block adds `O(CALIB·|layers|·tokens·n_ff)` for the control. Space `O(n_layer·n_ff²)` for the
-/// finished Grams plus `O(|layers|·n_ff)`.
+/// finished SyrkAcc plus `O(|layers|·n_ff)`.
 fn calib_down(
     engine: &Engine,
     cfg: &Config,
@@ -607,7 +607,7 @@ fn calib_down(
     layers: &[usize],
 ) -> Vec<Vec<f64>> {
     let n = cfg.n_ff;
-    let mut grams = Grams::new(cfg).expect("grams");
+    let mut grams = SyrkAcc::new(cfg).expect("grams");
     let mut dm = vec![vec![0.0f64; n]; layers.len()];
     let mut tokens = 0usize;
     let t0 = Instant::now();
@@ -631,7 +631,7 @@ fn calib_down(
     let done = grams.finish(Normalisation::Mean).expect("finish");
     drop(grams);
     println!(
-        "CALIB calibration Grams {:.1} s",
+        "CALIB calibration SyrkAcc {:.1} s",
         t0.elapsed().as_secs_f64()
     );
     let mut out: Vec<Vec<f64>> = Vec::with_capacity(done.len());
@@ -681,11 +681,11 @@ fn salience(h: &[f64], d: &[i64], o: usize, n: usize) -> Vec<f64> {
 /// `{CACHE}/l{l}.down-keep{K}-{select}.i64`, the fit with the selected columns taken from the
 /// teacher, for [`down_arm_kl`].
 ///
-/// Cost: the calibration Grams is `O(CALIB·tokens·(n_ff² + n_embd²))`; per layer two `energy_of` at
+/// Cost: the calibration SyrkAcc is `O(CALIB·tokens·(n_ff² + n_embd²))`; per layer two `energy_of` at
 /// `O(n_embd·n_ff²)` each, one symmetric `n_ff × n_ff` Gram of `E`, the dominant term. Space
-/// `O(n_layer·n_ff²)` for the Grams plus `O(n_embd·n_ff)` for one layer's words.
+/// `O(n_layer·n_ff²)` for the SyrkAcc plus `O(n_embd·n_ff)` for one layer's words.
 #[test]
-#[ignore = "builds the 8-chunk calibration n_ff x n_ff Grams and two Gram energies per layer"]
+#[ignore = "builds the 8-chunk calibration n_ff x n_ff SyrkAcc and two Gram energies per layer"]
 fn down_keep_fit() {
     let engine = Engine::open(&model_path()).expect("open teacher");
     let cfg = Config::from_engine(&engine).expect("config");
@@ -797,7 +797,7 @@ fn down_keep_fit() {
 /// plus `O(n²)` to mask `Hm` and `O(o·n)` to zero `D'` and restore `S`. Space `O(n² + o·n)` per
 /// layer.
 #[test]
-#[ignore = "builds the 8-chunk calibration Grams and runs production fold_fit on the masked metric"]
+#[ignore = "builds the 8-chunk calibration SyrkAcc and runs production fold_fit on the masked metric"]
 fn down_spqr_fit() {
     let engine = Engine::open(&model_path()).expect("open teacher");
     let cfg = Config::from_engine(&engine).expect("config");

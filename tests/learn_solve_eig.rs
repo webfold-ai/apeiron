@@ -67,7 +67,7 @@ fn round32(v: i128) -> i128 {
 }
 
 /// The test-local oracle product `A·Aᵀ` (`A` `n × m` Q32.32), one round-to-nearest per entry.
-fn naive_gram(a: &[i64], n: usize, m: usize) -> Vec<i64> {
+fn naive_syrk(a: &[i64], n: usize, m: usize) -> Vec<i64> {
     let mut out = vec![0i64; n * n];
     for i in 0..n {
         for j in 0..n {
@@ -132,7 +132,7 @@ fn planted_psd(n: usize, spec: &[f64], seed: u64) -> Vec<i64> {
             a[i * m + k] = (q[i * m + k] * spec[k].sqrt() * ONE_F).round() as i64;
         }
     }
-    naive_gram(&a, n, m)
+    naive_syrk(&a, n, m)
 }
 
 /// Raw Q32.32 to `f64`.

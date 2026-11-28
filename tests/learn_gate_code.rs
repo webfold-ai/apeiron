@@ -49,7 +49,7 @@ use apeiron::learn::fold::fit::eigh::eigh;
 use apeiron::learn::fold::fit::fold_fit::{fold_fit, FoldFit, FoldFitConfig};
 use apeiron::learn::fold::run::convert::{encode_f16, encode_f32};
 use apeiron::learn::fold::stats::basis::solve_water_fill;
-use apeiron::learn::fold::stats::capture::{Grams, LayerGrams, Normalisation};
+use apeiron::learn::fold::stats::capture::{LayerSyrk, Normalisation, SyrkAcc};
 use apeiron::learn::fold::stats::heldout::{held_out, held_out_kldbase_chunk};
 use apeiron::learn::fold::stats::kldbase::KldBase;
 use apeiron::learn::grad::load::layer_from_engine;
@@ -71,7 +71,7 @@ const BASE: &str = "~/kld08/calib.c40.kld";
 /// Calibration chunks `0..CALIB`: 8 chunks of 512 tokens give 4096 rows, above the `n_ff = 3584`
 /// width of the down Gram; 2 chunks bound its rank by 1024 and `fold_fit` refuses it as not
 /// positive-definite. Every held-out read starts at chunk `CALIB` or later.
-/// Fixed with the production Grams under board .
+/// Fixed with the production SyrkAcc under board .
 const CALIB: usize = 8;
 
 /// The base file path, overridable by `APEIRON_GATE_BASE` (the binary16 teacher's own base).
@@ -366,7 +366,7 @@ fn calib_set(chunks: &[Vec<u32>], calib: usize, extra: usize) -> Vec<Vec<u32>> {
         .collect()
 }
 
-/// The production calibration Grams over chunks `0..calib`: `Grams::accumulate_tap` on each tapped
+/// The production calibration SyrkAcc over chunks `0..calib`: `SyrkAcc::accumulate_tap` on each tapped
 /// chunk, then `Normalisation::Mean`. `gate_up` is the `ffn_gate`/`ffn_up` input Gram (stage 3) and
 /// `down` the `ffn_down` input Gram (stage 4, the engine's own `SwiGLU` product), both `Σ_t x_t x_tᵀ / T`
 /// over tokens, so this file restates no layout. Layout control, per layer in `layers`: the diagonal of each Gram against `Σ_t x_t[k]² / T`
@@ -375,15 +375,15 @@ fn calib_set(chunks: &[Vec<u32>], calib: usize, extra: usize) -> Vec<Vec<u32>> {
 /// `O(calib·n_layer·t·(n_embd² + q_out² + n_ff²)/2)` multiply-adds in the accumulator plus
 /// `O(calib·|layers|·t·(n_embd + n_ff))` for the control; space the accumulator's
 /// `O(n_layer·(n_embd² + q_out² + n_ff²))` words and one `f64` copy.
-fn calib_grams(
+fn calib_syrks(
     engine: &Engine,
     cfg: &Config,
     chunks: &[Vec<u32>],
     calib: usize,
     layers: &[usize],
-) -> Vec<LayerGrams> {
+) -> Vec<LayerSyrk> {
     let (n, f) = (cfg.n_embd, cfg.n_ff);
-    let mut grams = Grams::new(cfg).expect("grams");
+    let mut grams = SyrkAcc::new(cfg).expect("grams");
     let mut diag: Vec<(Vec<f64>, Vec<f64>)> = vec![(vec![0.0; n], vec![0.0; f]); cfg.n_layer];
     let mut seen = 0usize;
     let t0 = Instant::now();
@@ -432,19 +432,19 @@ fn calib_grams(
     done
 }
 
-/// [`calib_grams`] over all of `set`, cached per layer as `g{l}.{tag}.{o,gate_up,down}.i64` in Q32.32
+/// [`calib_syrks`] over all of `set`, cached per layer as `g{l}.{tag}.{o,gate_up,down}.i64` in Q32.32
 /// words, the precision every consumer reads them at. When every file exists they are read and the
 /// layout control is not re-run (it ran when they were written); `qkv` and `tokens` are not cached.
-/// Layers outside `layers` hold empty Grams.
+/// Layers outside `layers` hold empty SyrkAcc.
 ///
-/// `O(|layers|·(q_out² + n_embd² + n_ff²))` words read or written, plus one [`calib_grams`] on a miss.
-fn grams_cached(
+/// `O(|layers|·(q_out² + n_embd² + n_ff²))` words read or written, plus one [`calib_syrks`] on a miss.
+fn syrks_cached(
     engine: &Engine,
     cfg: &Config,
     set: &[Vec<u32>],
     layers: &[usize],
     tag: &str,
-) -> Vec<LayerGrams> {
+) -> Vec<LayerSyrk> {
     let path = |l: usize, k: &str| format!("{CACHE}/g{l}.{tag}.{k}.i64");
     let kinds = ["o", "gate_up", "down"];
     let hit = layers.iter().all(|&l| {
@@ -453,7 +453,7 @@ fn grams_cached(
             .all(|k| std::path::Path::new(&path(l, k)).exists())
     });
     if !hit {
-        let grams = calib_grams(engine, cfg, set, set.len(), layers);
+        let grams = calib_syrks(engine, cfg, set, set.len(), layers);
         for &l in layers {
             for (k, g) in kinds
                 .iter()
@@ -470,7 +470,7 @@ fn grams_cached(
         .map(|l| {
             let on = layers.contains(&l);
             let get = |k: &str| if on { read(l, k) } else { Vec::new() };
-            LayerGrams {
+            LayerSyrk {
                 qkv: Vec::new(),
                 o: get("o"),
                 gate_up: get("gate_up"),
@@ -516,7 +516,7 @@ fn gate_code_probe() {
     println!("PROBE tap {prefill:.2} s per {n_ctx}-token chunk");
     let n = cfg.n_embd;
     let t = Instant::now();
-    let grams = calib_grams(&engine, &cfg, &chunks, 1, &[0]);
+    let grams = calib_syrks(&engine, &cfg, &chunks, 1, &[0]);
     let gram = t.elapsed().as_secs_f64();
     println!("PROBE grams {gram:.2} s per chunk, all layers, tap included");
     let (g, u, mixer) = gate_up(&engine, &cfg, 0);
@@ -545,7 +545,7 @@ fn gate_code_probe() {
 /// (`APEIRON_GATE_CALIB`, `APEIRON_GATE_EXTRA`), written as `l{l}.{name}.i64` by [`fit_name`]; an
 /// existing file is skipped. `APEIRON_GATE_CALIB=6` drops chunks 6–7, the start of held-out 8–10's
 /// article. `APEIRON_GATE_COPY=1` writes the `APEIRON_GATE_MODEL` tensor itself, no fit (with
-/// `APEIRON_GATE_TAG=-q4km`: same-scope `Q4_K_M` arm). Cost: [`calib_grams`], [`fit_select`].
+/// `APEIRON_GATE_TAG=-q4km`: same-scope `Q4_K_M` arm). Cost: [`calib_syrks`], [`fit_select`].
 #[test]
 #[ignore = "opens the teacher and runs production fold_fit per tensor; run explicitly"]
 fn gate_code_fit_kind() {
@@ -559,7 +559,7 @@ fn gate_code_fit_kind() {
     let set = calib_set(&chunks, calib, extra);
     std::fs::create_dir_all(CACHE).expect("cache dir");
     let t0 = Instant::now();
-    let grams = grams_cached(&engine, &cfg, &set, &layers, &format!("c{calib}x{extra}"));
+    let grams = syrks_cached(&engine, &cfg, &set, &layers, &format!("c{calib}x{extra}"));
     for &l in &layers {
         for kind in kinds.split(',') {
             let name = fit_name(kind, calib, extra);
@@ -608,13 +608,13 @@ fn energy(h: &[f64], e: &[i64], o: usize, n: usize) -> f64 {
 }
 
 /// The teacher words `W` (`o × n`) of `kind` in layer `l` and its calibration Gram `H` (`n × n`):
-/// for gate/up the cached `g{l}.c8x0.gate_up.i64` ([`grams_cached`]) when `grams` is empty, else `grams`' Gram of that kind.
+/// for gate/up the cached `g{l}.c8x0.gate_up.i64` ([`syrks_cached`]) when `grams` is empty, else `grams`' Gram of that kind.
 ///
 /// `O(o·n)` to read the tensor; space `O(o·n + n²)`.
 fn teacher(
     engine: &Engine,
     cfg: &Config,
-    grams: &[LayerGrams],
+    grams: &[LayerSyrk],
     kind: &str,
     l: usize,
 ) -> (Vec<i64>, usize, usize, Vec<f64>) {
@@ -656,7 +656,7 @@ fn teacher(
 /// `APEIRON_GATE_KIND` (`up` | `gate` | `down` | `o`, default `up`), `APEIRON_GATE_LAYERS` (default:
 /// every layer), `APEIRON_GATE_PASSES` (`P`, default 2: the cached fit plus `P − 1` residual passes).
 /// `H` is the calibration Gram of chunks `0..CALIB`: the cached `g{l}.c8x0.gate_up.i64` for gate/up, the
-/// [`calib_grams`] `down` or `o` Gram for down/o; no held-out chunk is read. `APEIRON_GATE_EXTRA`
+/// [`calib_syrks`] `down` or `o` Gram for down/o; no held-out chunk is read. `APEIRON_GATE_EXTRA`
 /// widens `H` by [`calib_set`] (every kind) and starts from `l{l}.{kind}-x{extra}.i64`; with
 /// `APEIRON_GATE_CALIB` set off `CALIB` it starts from `l{l}.{kind}-c{calib}x{extra}.i64`, the
 /// [`fit_name`] (board row ); each pass fits through [`fit_select`].
@@ -664,7 +664,7 @@ fn teacher(
 /// (`APEIRON_GATE_ARM=up-res2`); `P = 1` writes the cached fit back unchanged.
 ///
 /// Cost: `(P−1)` `fold_fit` per layer (~33 s each for gate/up, ~52–75 s down, measured) plus `2(P−1)`
-/// [`energy`] at `O(o·n²)`, and for down/o one [`calib_grams`] (~70 s); space `O(n² + o·n)` per layer
+/// [`energy`] at `O(o·n²)`, and for down/o one [`calib_syrks`] (~70 s); space `O(n² + o·n)` per layer
 /// for the Gram, the words and the residual. **Measurement 11** adds `o` and the `down`/`o` passes.
 #[test]
 #[ignore = "opens the teacher and runs production fold_fit on the residual; run explicitly"]
@@ -686,7 +686,7 @@ fn ffn_residual_fit() {
     let grams = if matches!(kind.as_str(), "down" | "o") || extra > 0 || calib != CALIB {
         let (chunks, _) = base_tokens(&base_path());
         let set = calib_set(&chunks, calib, extra);
-        grams_cached(&engine, &cfg, &set, &layers, &format!("c{calib}x{extra}"))
+        syrks_cached(&engine, &cfg, &set, &layers, &format!("c{calib}x{extra}"))
     } else {
         Vec::new()
     };
@@ -839,7 +839,7 @@ fn eigvalsh(mut a: Vec<f64>, n: usize) -> Vec<f64> {
 ///
 /// Cost: one [`eigvalsh`] of `H` per layer, `O(4n³/3)` (`APEIRON_FLOOR_EIGH` selects the crate [`eigh`],
 /// `O(I·n³)`, 120 s at `n = 1024`, measured); `1 + P` [`energy`] at `O(o·n²)`; per plane a
-/// 50-step bisection over [`solve_water_fill`] at `O(n·S)` each; for down/o one [`calib_grams`].
+/// 50-step bisection over [`solve_water_fill`] at `O(n·S)` each; for down/o one [`calib_syrks`].
 #[test]
 #[ignore = "opens the teacher and decomposes each calibration Gram; run explicitly"]
 fn gate_code_floor() {
@@ -849,7 +849,7 @@ fn gate_code_floor() {
     let kind = std::env::var("APEIRON_GATE_KIND").unwrap_or_else(|_| String::from("up"));
     let grams = if matches!(kind.as_str(), "down" | "o") {
         let (chunks, _) = base_tokens(&base_path());
-        calib_grams(&engine, &cfg, &chunks, CALIB, &layers)
+        calib_syrks(&engine, &cfg, &chunks, CALIB, &layers)
     } else {
         Vec::new()
     };
@@ -1005,8 +1005,8 @@ fn cols_fit() {
     let k = env_usize("APEIRON_COLS_K", 128);
     assert!(k.is_multiple_of(128) && k > 0, "APEIRON_COLS_K {k}");
     let (chunks, _) = base_tokens(&base_path());
-    let grams = grams_cached(&engine, &cfg, &chunks[..CALIB], &layers, "c8x0");
-    let ho = grams_cached(&engine, &cfg, &chunks[CALIB..CALIB + 3], &layers, "ho");
+    let grams = syrks_cached(&engine, &cfg, &chunks[..CALIB], &layers, "c8x0");
+    let ho = syrks_cached(&engine, &cfg, &chunks[CALIB..CALIB + 3], &layers, "ho");
     let passes = env_usize("APEIRON_COLS_PASSES", 1).max(1);
     let ridge: f64 = std::env::var("APEIRON_COLS_RIDGE").map_or(0.0, |v| v.parse().expect("ridge"));
     let resid = std::env::var("APEIRON_COLS_TARGET").is_ok_and(|v| v == "resid");
@@ -1090,8 +1090,8 @@ fn cols_fit() {
 }
 
 /// The held-out metric of `kind` at layer `l`: its Gram over chunks 8, 9, 10, the KL chunks of
-/// [`gate_code_kl`] (`ho` is [`calib_grams`] on that slice).
-fn heldout_h(ho: &[LayerGrams], kind: &str, l: usize) -> Vec<f64> {
+/// [`gate_code_kl`] (`ho` is [`calib_syrks`] on that slice).
+fn heldout_h(ho: &[LayerSyrk], kind: &str, l: usize) -> Vec<f64> {
     let g = match kind {
         "o" => &ho[l].o,
         "down" => &ho[l].down,
@@ -1107,7 +1107,7 @@ fn heldout_h(ho: &[LayerGrams], kind: &str, l: usize) -> Vec<f64> {
 /// comma-separated (default `o,o-res2,o-cols256x8`); a layer without an arm's file skips it, so
 /// sums compare only over a common layer set.
 ///
-/// Cost: the Grams over 11 chunks (~7 s each), two [`energy`] per arm and layer at `O(o·n²)`.
+/// Cost: the SyrkAcc over 11 chunks (~7 s each), two [`energy`] per arm and layer at `O(o·n²)`.
 #[test]
 #[ignore = "opens the teacher and reads the cached fits; run explicitly"]
 fn heldout_energy() {
@@ -1119,8 +1119,8 @@ fn heldout_energy() {
         std::env::var("APEIRON_HE_ARMS").unwrap_or_else(|_| String::from("o,o-res2,o-cols256x8"));
     let arms: Vec<&str> = arms.split(',').collect();
     let (chunks, _) = base_tokens(&base_path());
-    let grams = grams_cached(&engine, &cfg, &chunks[..CALIB], &layers, "c8x0");
-    let ho = grams_cached(&engine, &cfg, &chunks[CALIB..CALIB + 3], &layers, "ho");
+    let grams = syrks_cached(&engine, &cfg, &chunks[..CALIB], &layers, "c8x0");
+    let ho = syrks_cached(&engine, &cfg, &chunks[CALIB..CALIB + 3], &layers, "ho");
     let mut tot = vec![(0.0f64, 0.0f64); arms.len()];
     for &l in &layers {
         let (w, o, n, h) = teacher(&engine, &cfg, &grams, &kind, l);

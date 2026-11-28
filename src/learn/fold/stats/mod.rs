@@ -1,11 +1,11 @@
-//! Statistics the fold transfer consumes: activation Grams, held-out evaluation, shrinkage
+//! Statistics the fold transfer consumes: activation SyrkAcc, held-out evaluation, shrinkage
 //! intensity and byte accounting.
 
 /// Input-basis concentration arms (`H`, `I`, `J`, `V`) and reverse water-filling at 1.18 b/w.
 pub mod basis;
 /// Exact 27B byte accounting at a target bits-per-weight, over the reference class table.
 pub mod budget;
-/// Per-layer activation Grams of the four linears, accumulated from the forward tape.
+/// Per-layer activation SyrkAcc of the four linears, accumulated from the forward tape.
 pub mod capture;
 /// Softmax, sampled-label cross entropy and target draw of the held-out capture.
 pub mod ce;

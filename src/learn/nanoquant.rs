@@ -10,7 +10,7 @@
 //! `ρ = t/T`, `main.py:81`; `cubic`, `ρ = (t/T)³`, is the function signature's default).
 //!
 //! Every matrix product runs on the kernel through [`crate::engine::kern::limb`] (AGENTS.md §0 K2):
-//! the Grams and the right-hand sides by prepared products, the solves by `gemm_q32`, the power
+//! the SyrkAcc and the right-hand sides by prepared products, the solves by `gemm_q32`, the power
 //! iteration by prepared one-column products and the norms by `rowdot_q32`. The `r × r` ridge
 //! system is solved as `F = H⁻¹R` with `H⁻¹` from the block Schur-complement recursion
 //! [`spd_inverse`], so the `O(r²·k)` substitution is one kernel product instead of a scalar

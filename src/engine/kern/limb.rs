@@ -2264,12 +2264,12 @@ mod tests {
             let b = operand(&mut seed, p, n, -2);
             let c = operand(&mut seed, m, n, 1);
             let out_prod = gemm_q32(&a, m, &b, p, n, 3).expect("carried");
-            let out_gram = syrk_q32(&c, m, n, 3).expect("carried");
+            let out_syrk = syrk_q32(&c, m, n, 3).expect("carried");
             let out_vec = gemv_q32(&a[..n], &b, p, n, 3).expect("carried");
             let out_dots = rowdot_q32(&a, &c, m, n, 3).expect("carried");
             let got = [
                 digest(&out_prod),
-                digest(&out_gram),
+                digest(&out_syrk),
                 digest(&out_vec),
                 digest(&out_dots),
             ];

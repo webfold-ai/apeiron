@@ -387,7 +387,7 @@ fn flat_tail_names_the_non_convergence() {
 }
 
 /// `M = (ΔW·Hl)·ΔWᵀ` by the scalar `f64` triple loops the gemm path replaces, row-major `[o, o]`.
-fn old_gram(dw: &[f64], hl: &[f64], o: usize, n: usize) -> Vec<f64> {
+fn old_syrk(dw: &[f64], hl: &[f64], o: usize, n: usize) -> Vec<f64> {
     let w1 = matmul(dw, hl, o, n, n);
     let dwt = transpose(dw, o, n);
     matmul(&w1, &dwt, o, n, o)
@@ -484,7 +484,7 @@ fn eigen_stage_matches_f64_reference() {
         for &rank in &[1usize, 2] {
             let (dw, hl) = gapped_fixture(0xC0FF_EE00_1234 + (o as u64) * 31 + rank as u64, o, n);
             // Reference: the old scalar loops and `eigh`.
-            let m_ref = old_gram(&dw, &hl, o, n);
+            let m_ref = old_syrk(&dw, &hl, o, n);
             let (evals_ref, evecs_ref) = eigh(&qv(&m_ref), o).expect("eigh reference");
             let (evals_ref, evecs_ref) = (uw(&evals_ref), uw(&evecs_ref));
             let u_ref = top_columns(&evecs_ref, o, rank);
@@ -555,7 +555,7 @@ fn eigen_gram_agrees_with_f64_oracle() {
         let (dd, dh) = (max_abs(&dw), max_abs(&hl));
         let w1 = matmul(&dw, &hl, o, n, n);
         let dw1 = max_abs(&w1);
-        let m_ref = old_gram(&dw, &hl, o, n);
+        let m_ref = old_syrk(&dw, &hl, o, n);
         // Each operand crosses the grid once (≤ `half`), each product rounds once per entry, so the
         // first product carries `ε₁ ≤ n(|Hl|·ε_d + |ΔW|·ε_h) + half(w1)` and the second sums it
         // through `n` entries of `ΔW`: `|ΔM| ≤ half(M) + n(|w1|·ε_d + |ΔW|·ε₁)`. The factor two

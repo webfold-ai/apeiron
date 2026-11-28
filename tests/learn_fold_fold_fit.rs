@@ -669,10 +669,10 @@ fn ref_fold_fit(
 
     // Step 2: the `gptq_e8` candidate (lines 843–860).
     let ws_rot = fwht128(ws)?;
-    let h_gram = uw(&had_gram(&qw(h), n)?);
+    let h_syrk = uw(&had_gram(&qw(h), n)?);
     let q = gptq_e8(
         &qw(&ws_rot),
-        &qw(&h_gram),
+        &qw(&h_syrk),
         o,
         n,
         cfg.damp,

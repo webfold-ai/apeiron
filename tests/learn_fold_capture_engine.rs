@@ -2,15 +2,15 @@
 //! The engine's `Q8Act` activation Gram against its own `Exact` tape.
 //!
 //! One dense `qwen2` layer is written to a GGUF fixture and loaded by the engine. The reference
-//! Grams are [`Grams::accumulate`] over the tape of
+//! SyrkAcc are [`SyrkAcc::accumulate`] over the tape of
 //! `hocapture::engine_tape_mode(.., KernelMode::Exact)`: Q32.32 words, `i128` products each
-//! rounded once. The compared Grams are [`Grams::accumulate_tap`] over `Engine::prefill_tap_cols`
+//! rounded once. The compared SyrkAcc are [`SyrkAcc::accumulate_tap`] over `Engine::prefill_tap_cols`
 //! under [`KernelMode::Q8Act`], the production limbed path.
 //!
 //! The two modes are not asserted equal a priori: the test measures the per-entry and
-//! matrix-scaled relative difference of each of the four Grams and reports it. Under
+//! matrix-scaled relative difference of each of the four SyrkAcc and reports it. Under
 //! [`KernelMode::Q8Act`] the projections read an 8-bit quantised copy of each activation, so the
-//! Grams differ through the hidden state the quantisation moves; `Q8_BOUND` states that
+//! SyrkAcc differ through the hidden state the quantisation moves; `Q8_BOUND` states that
 //! difference. The same measurement carries the fold path's own residual, the limb adapter against
 //! the exact `i128` fold: `1.6e-6` of scale on `qkv`, whose input is the same word under both
 //! modes. The tap rows themselves are the words the projections read, so a mutated tap word is the
@@ -37,7 +37,7 @@ use std::time::Instant;
 use apeiron::engine::loader::Engine;
 use apeiron::engine::{testdata, KernelMode};
 use apeiron::format::quant;
-use apeiron::learn::fold::stats::capture::{Grams, LayerGrams, Normalisation};
+use apeiron::learn::fold::stats::capture::{LayerSyrk, Normalisation, SyrkAcc};
 use apeiron::learn::fold::stats::hocapture;
 use apeiron::learn::grad::model::{Config, LayerTape, Tape, Weights};
 
@@ -60,13 +60,13 @@ const L: usize = 1;
 /// Tokens the fixture runs.
 const TOKENS: [u32; 4] = [1, 2, 3, 4];
 
-/// Relative bound for the [`KernelMode::Q8Act`] Grams, on the matrix-scale metric: each projection
+/// Relative bound for the [`KernelMode::Q8Act`] SyrkAcc, on the matrix-scale metric: each projection
 /// input is quantised to an 8-bit block code, so one activation word moves by at most `2⁻⁸` of its
 /// block scale; the hidden state composes one layer of those projections and a Gram entry sees the
 /// input twice. `2⁻⁵` is 2.8× the measured worst (`down`, `1.1e-2`).
 const Q8_BOUND: f64 = 1.0 / 32.0;
 
-/// Stage slots of the tap, as [`Grams::accumulate_tap`] reads them.
+/// Stage slots of the tap, as [`SyrkAcc::accumulate_tap`] reads them.
 const STAGE_LN1_OUT: usize = 1;
 
 fn put_u32(b: &mut Vec<u8>, v: u32) {
@@ -278,20 +278,20 @@ fn open(tag: &str) -> (Engine, String) {
     (Engine::open(&path).expect("open fixture"), path)
 }
 
-/// The reference Grams of the fixture: the engine's own `Exact` tape folded by the exact
+/// The reference SyrkAcc of the fixture: the engine's own `Exact` tape folded by the exact
 /// accumulator. The `cfg` comes from [`Weights::from_engine`], the same dimensions the engine
 /// holds.
-fn reference(engine: &Engine) -> (Config, Vec<LayerGrams>) {
+fn reference(engine: &Engine) -> (Config, Vec<LayerSyrk>) {
     let (_, cfg) = Weights::from_engine(engine).expect("weights");
     let (_, tape) =
         hocapture::engine_tape_mode(engine, &cfg, &TOKENS, KernelMode::Exact).expect("exact tape");
-    let mut grams = Grams::new(&cfg).expect("grams");
+    let mut grams = SyrkAcc::new(&cfg).expect("grams");
     grams.accumulate(&tape, &cfg).expect("reference accumulate");
     (cfg, grams.finish(Normalisation::Sum).expect("finish"))
 }
 
-/// The four finished Grams of the same reference tape, as a tuple, for a compact comparison.
-fn quads(g: &[LayerGrams]) -> Vec<(&[f64], &[f64], &[f64], &[f64])> {
+/// The four finished SyrkAcc of the same reference tape, as a tuple, for a compact comparison.
+fn quads(g: &[LayerSyrk]) -> Vec<(&[f64], &[f64], &[f64], &[f64])> {
     g.iter()
         .map(|l| {
             (
@@ -337,7 +337,7 @@ fn scaled_rel(a: &[f64], b: &[f64]) -> f64 {
 }
 
 /// The per-Gram entry-wise and matrix-scale relative differences, layer by layer.
-fn diff(want: &[LayerGrams], got: &[LayerGrams]) -> ([f64; 4], [f64; 4]) {
+fn diff(want: &[LayerSyrk], got: &[LayerSyrk]) -> ([f64; 4], [f64; 4]) {
     assert_eq!(want.len(), got.len());
     let mut m = [0.0f64; 4];
     let mut s = [0.0f64; 4];
@@ -354,17 +354,17 @@ fn diff(want: &[LayerGrams], got: &[LayerGrams]) -> ([f64; 4], [f64; 4]) {
     (m, s)
 }
 
-/// The engine tap Grams of `engine` under `mode`.
-fn engine_grams(
+/// The engine tap SyrkAcc of `engine` under `mode`.
+fn engine_syrks(
     engine: &Engine,
     cfg: &Config,
     mode: KernelMode,
-) -> (Vec<LayerGrams>, Vec<Vec<Vec<Vec<i64>>>>) {
+) -> (Vec<LayerSyrk>, Vec<Vec<Vec<Vec<i64>>>>) {
     let mut st = engine.state(TOKENS.len()).expect("state");
     let (_, rows) = engine
         .prefill_tap_cols(&mut st, &TOKENS, mode, true)
         .expect("tapped prefill");
-    let mut grams = Grams::new(cfg).expect("grams");
+    let mut grams = SyrkAcc::new(cfg).expect("grams");
     grams.accumulate_tap(&rows).expect("tap accumulate");
     let fin = grams.finish(Normalisation::Sum).expect("finish");
     (fin, rows)
@@ -374,10 +374,10 @@ fn engine_grams(
 /// bounded. The `ln1_out` Gram is the residual norm of the embedding, before the first quantised
 /// projection runs; the other three carry the quantiser's effect through the hidden state.
 #[test]
-fn engine_q8act_grams_are_within_the_stated_bound() {
+fn engine_q8act_syrks_are_within_the_stated_bound() {
     let (engine, path) = open("q8act");
     let (cfg, want) = reference(&engine);
-    let (got, _) = engine_grams(&engine, &cfg, KernelMode::Q8Act);
+    let (got, _) = engine_syrks(&engine, &cfg, KernelMode::Q8Act);
     let _ = std::fs::remove_file(&path);
     let (m, s) = diff(&want, &got);
     println!("q8act max entry rel err qkv/o/gate_up/down = {m:?}");
@@ -400,13 +400,13 @@ fn engine_q8act_grams_are_within_the_stated_bound() {
 fn mutated_tap_row_breaks_the_comparison() {
     let (engine, path) = open("control");
     let (cfg, want) = reference(&engine);
-    let (clean, mut mut_rows) = engine_grams(&engine, &cfg, KernelMode::Q8Act);
+    let (clean, mut mut_rows) = engine_syrks(&engine, &cfg, KernelMode::Q8Act);
     let _ = std::fs::remove_file(&path);
     let (_, clean_s) = diff(&want, &clean);
     // One word of the `ln1_out` stage, by `2⁻⁸` real (Q32.32 `2²⁴`), well inside the quantiser's
     // own scale: the comparison must still see it.
     mut_rows[0][STAGE_LN1_OUT][0][1] += 1 << 24;
-    let mut grams = Grams::new(&cfg).expect("grams");
+    let mut grams = SyrkAcc::new(&cfg).expect("grams");
     grams.accumulate_tap(&mut_rows).expect("mutated accumulate");
     let got = grams.finish(Normalisation::Sum).expect("finish");
     let (m, s) = diff(&want, &got);
@@ -425,7 +425,7 @@ fn mutated_tap_row_breaks_the_comparison() {
 /// per-run ratio is the Gram phase's, not the forward's.
 #[test]
 #[ignore = "measured report: five paired runs at the production Gram shape; run with --ignored --nocapture"]
-fn gram_fold_old_vs_new_at_production_shape() {
+fn syrk_fold_old_vs_new_at_production_shape() {
     const T: usize = 512;
     const W: usize = 4864;
     const RUNS: usize = 5;
@@ -469,15 +469,15 @@ fn gram_fold_old_vs_new_at_production_shape() {
         final_hidden: Vec::new(),
         final_normed: Vec::new(),
     };
-    // `n_embd = 1` keeps the three other Grams trivial; the down Gram is the production shape.
+    // `n_embd = 1` keeps the three other SyrkAcc trivial; the down Gram is the production shape.
     let mut pairs: Vec<(f64, f64)> = Vec::new();
     for _ in 0..RUNS {
         let t0 = Instant::now();
-        let mut old = Grams::new(&cfg).expect("grams");
+        let mut old = SyrkAcc::new(&cfg).expect("grams");
         old.accumulate(&tape, &cfg).expect("old accumulate");
         let old_s = t0.elapsed().as_secs_f64();
         let t1 = Instant::now();
-        let mut new = Grams::new(&cfg).expect("grams");
+        let mut new = SyrkAcc::new(&cfg).expect("grams");
         let ones: Vec<Vec<i64>> = vec![vec![0i64; e]; T];
         let rows = vec![vec![
             Vec::new(),
@@ -539,12 +539,12 @@ fn capture_qwen05b_512_wall() {
             .expect("tapped prefill");
         let t_fwd = t0.elapsed().as_secs_f64();
         let t1 = Instant::now();
-        let mut grams = Grams::new(&cfg).expect("grams");
+        let mut grams = SyrkAcc::new(&cfg).expect("grams");
         grams.accumulate_tap(&rows).expect("accumulate");
-        let t_gram = t1.elapsed().as_secs_f64();
+        let t_syrk = t1.elapsed().as_secs_f64();
         println!(
-            "qwen05b t={T} run {run}: prefill+tap {t_fwd:.2}s gram {t_gram:.2}s total {:.2}s",
-            t_fwd + t_gram
+            "qwen05b t={T} run {run}: prefill+tap {t_fwd:.2}s gram {t_syrk:.2}s total {:.2}s",
+            t_fwd + t_syrk
         );
     }
 }

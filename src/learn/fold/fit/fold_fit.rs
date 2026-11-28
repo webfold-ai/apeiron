@@ -610,8 +610,8 @@ pub fn fold_fit(
 
     // Step 2: the `gptq_e8` candidate (lines 843–860), words in and out.
     let ws_rot_q = rotate(ws.to_vec())?;
-    let h_gram_q = had_gram(&hlq, n)?;
-    let q = gptq_e8(&ws_rot_q, &h_gram_q, o, n, damp_q, true, true, cfg.e8_beam)?;
+    let h_syrk_q = had_gram(&hlq, n)?;
+    let q = gptq_e8(&ws_rot_q, &h_syrk_q, o, n, damp_q, true, true, cfg.e8_beam)?;
     let s_rot0 = q.s;
     let r0 = q.scale;
     let c0 = vec![ONE; n];

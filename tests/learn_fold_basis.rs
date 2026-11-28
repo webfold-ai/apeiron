@@ -34,7 +34,7 @@ use apeiron::learn::fold::stats::basis::{
     identity_basis, rate_at, row_energies, solve_water_fill, sum_log_column_energies,
     uniform_distortion, BasisError, Coefficients, Density, GROUP,
 };
-use apeiron::learn::fold::stats::capture::{Grams, Normalisation};
+use apeiron::learn::fold::stats::capture::{Normalisation, SyrkAcc};
 use apeiron::learn::fold::stats::hocapture::engine_tape_mode;
 use apeiron::learn::grad::model::{Config, Weights};
 use apeiron::learn::solve::q32::{from_grid, round_q32_even, to_grid, GRID_BOUND};
@@ -764,8 +764,8 @@ fn basis_rate_qwen05b() {
     let t0 = Instant::now();
     let (_, tape32) =
         engine_tape_mode(&engine, &cfg, &probe, KernelMode::Exact).expect("tape probe");
-    let mut grams32 = Grams::new(&cfg).expect("grams");
-    grams32.accumulate(&tape32, &cfg).expect("accumulate probe");
+    let mut syrks32 = SyrkAcc::new(&cfg).expect("grams");
+    syrks32.accumulate(&tape32, &cfg).expect("accumulate probe");
     let wall32 = t0.elapsed().as_secs_f64();
     eprintln!(
         "[basis] 32-token probe wall {wall32:.2}s at {:.1}s",
@@ -785,7 +785,7 @@ fn basis_rate_qwen05b() {
 
     let t1 = Instant::now();
     let (_, tape) = engine_tape_mode(&engine, &cfg, &tokens, KernelMode::Exact).expect("tape");
-    let mut grams = Grams::new(&cfg).expect("grams");
+    let mut grams = SyrkAcc::new(&cfg).expect("grams");
     grams.accumulate(&tape, &cfg).expect("accumulate");
     let wall_capture = t1.elapsed().as_secs_f64();
     eprintln!(

@@ -567,7 +567,7 @@ pub fn sum_log_column_energies(c: &[i64]) -> i64 {
 /// # Errors
 /// [`BasisError::OutOfRange`] on a bound refusal or a rounded entry; [`BasisError::Shape`] when `O
 /// == 0`.
-fn block_gram(w: &[i64], o: usize, n: usize, blk: usize) -> Result<Vec<i64>, BasisError> {
+fn block_syrk(w: &[i64], o: usize, n: usize, blk: usize) -> Result<Vec<i64>, BasisError> {
     let (ws, k) =
         panel(&copy_block(w, n, 0, blk * GROUP, o, GROUP)).ok_or(BasisError::OutOfRange)?;
     let mut g = wsyrk(&ws, None, o, GROUP).map_err(map_syrk)?;
@@ -577,7 +577,7 @@ fn block_gram(w: &[i64], o: usize, n: usize, blk: usize) -> Result<Vec<i64>, Bas
 
 /// Apply `Jᵀ·G·J` to the 128×128 Gram `g` for the Givens rotation `J = [[c, −s], [s, c]]` on
 /// columns `(a, b)`. `O(GROUP)`.
-fn rotate_gram(g: &mut [i64], a: usize, b: usize, c: i64, s: i64) -> Option<()> {
+fn rotate_syrk(g: &mut [i64], a: usize, b: usize, c: i64, s: i64) -> Option<()> {
     let j = GROUP;
     for r in 0..j {
         if r == a || r == b {
@@ -672,7 +672,7 @@ fn sweep(
                 };
                 let turn = fixed_sin_cos(theta).map_err(|_| BasisError::OutOfRange)?;
                 let (s, c) = (turn.sin, turn.cos);
-                rotate_gram(g, a, b, c, s).ok_or(BasisError::OutOfRange)?;
+                rotate_syrk(g, a, b, c, s).ok_or(BasisError::OutOfRange)?;
                 rotate_block(q, n, off, off + a, off + b, c, s).ok_or(BasisError::OutOfRange)?;
             }
             i += 2 * h;
@@ -708,7 +708,7 @@ fn butterfly_words(w: &[i64], o: usize, n: usize, rule: AngleRule) -> Result<Vec
         q[i * n + i] = ONE;
     }
     for blk in 0..blocks {
-        let mut g = block_gram(w, o, n, blk)?;
+        let mut g = block_syrk(w, o, n, blk)?;
         sweep(&mut q, &mut g, n, blk * GROUP, rule)?;
         if rule == AngleRule::Jacobi {
             let mut prev = sum_log_diag(&g).ok_or(BasisError::OutOfRange)?;
@@ -782,7 +782,7 @@ pub fn eigen_basis(w: &[i64], o: usize, n: usize) -> Result<Vec<i64>, BasisError
     let blocks = expect_blocks(n)?;
     let mut q = vec![0_i64; square(n, n)?];
     for blk in 0..blocks {
-        let (_, vecs) = eigh(&block_gram(w, o, n, blk)?, GROUP).map_err(|err| match err {
+        let (_, vecs) = eigh(&block_syrk(w, o, n, blk)?, GROUP).map_err(|err| match err {
             EighError::NotConverged => BasisError::Eigh("block did not converge".to_string()),
             other => BasisError::Shape(format!("eigh: {other:?}")),
         })?;

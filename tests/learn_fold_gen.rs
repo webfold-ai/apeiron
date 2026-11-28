@@ -52,7 +52,7 @@ use apeiron::learn::fold::fit::fold_fit::{fold_fit, FoldFitConfig};
 use apeiron::learn::fold::layer::driver::DriverCfg;
 use apeiron::learn::fold::run::npy::{chunks, read_npy_i4, split};
 use apeiron::learn::fold::run::transfer::write_student_gguf;
-use apeiron::learn::fold::stats::capture::{Grams, LayerGrams, Normalisation};
+use apeiron::learn::fold::stats::capture::{LayerSyrk, Normalisation, SyrkAcc};
 use apeiron::learn::fold::stats::heldout::held_out;
 use apeiron::learn::fold::stats::lw::lw_intensity;
 use apeiron::learn::fold::stats::parts::LayerCfg;
@@ -168,7 +168,7 @@ enum Stage {
 
 impl Stage {
     /// The stage's mean activation Gram.
-    fn gram(self, g: &LayerGrams) -> &[f64] {
+    fn gram(self, g: &LayerSyrk) -> &[f64] {
         match self {
             Stage::Qkv => &g.qkv,
             Stage::O => &g.o,
@@ -277,12 +277,12 @@ fn set_tensor(l: &mut LayerWeights, name: &str, wp: &[i64]) {
     *slot = wp.to_vec();
 }
 
-// ---- the Grams and the calibration moments ----------------------------------------------------
+// ---- the SyrkAcc and the calibration moments ----------------------------------------------------
 
 /// The Schäfer–Strimmer inputs the tap pass can accumulate beside the Gram: `s4 = Σ_t ‖s_t‖⁴` and
 /// `q = Σ_t s_t⁴` per input coordinate, over the same samples whose scatter is the Gram.
 ///
-/// Time `O(tokens·n)` per stage, space `O(n)`; the scatter itself is the [`Grams`] accumulator's.
+/// Time `O(tokens·n)` per stage, space `O(n)`; the scatter itself is the [`SyrkAcc`] accumulator's.
 #[derive(Clone, Debug, Default)]
 struct StageMom {
     s4: f64,
@@ -332,18 +332,18 @@ impl Moments {
     }
 }
 
-/// Teacher-input Grams over `cal` for the first `only` layers, plus the same pass's calibration
+/// Teacher-input SyrkAcc over `cal` for the first `only` layers, plus the same pass's calibration
 /// moments of layer 0: one tapped prefill per chunk (a fresh `DecodeState`, so a chunk never attends
 /// to its predecessor), folded per layer.
 ///
 /// Temporal `O(Σ_chunks (prefill + tap + Σ_layer t·w²/2))`; spatial `O(only·Σ w²)` words for the
 /// accumulator plus `O(Σ_stage w)` for the moments.
-fn gen_grams(
+fn gen_syrks(
     engine: &Engine,
     cfg: &Config,
     cal: &[Vec<u32>],
     only: usize,
-) -> (Vec<LayerGrams>, Moments, f64) {
+) -> (Vec<LayerSyrk>, Moments, f64) {
     let gcfg = Config {
         n_layer: only,
         ..cfg.clone()
@@ -354,7 +354,7 @@ fn gen_grams(
         cfg.n_embd,
         cfg.n_ff,
     ];
-    let mut grams = Grams::new(&gcfg).expect("grams");
+    let mut grams = SyrkAcc::new(&gcfg).expect("grams");
     let mut moments = Moments::default();
     let t = Instant::now();
     for (i, chunk) in cal.iter().enumerate() {
@@ -654,7 +654,7 @@ fn load_chunks() -> (Vec<Vec<u32>>, Vec<Vec<u32>>, f64) {
 }
 
 /// The cost-equation probe: the unit walls the projection needs, then the projection `T(N)` for
-/// each `N ∈ {2, 4, 8}` — `T = N·t_gram + Σ fits + 7·(N + 4)·t_eval_chunk + 7·(write + open +
+/// each `N ∈ {2, 4, 8}` — `T = N·t_syrk + Σ fits + 7·(N + 4)·t_eval_chunk + 7·(write + open +
 /// readback + quad)` (`AGENTS.md` §10: the projection is written before launch).
 fn probe(
     engine: &Engine,
@@ -665,8 +665,8 @@ fn probe(
     dir: &str,
     t_all: &Instant,
 ) {
-    let (g, _, t_gram2) = gen_grams(engine, cfg, &cal[..2], 1);
-    let (g_ho, _, t_gram4) = gen_grams(engine, cfg, ho, 1);
+    let (g, _, t_syrk2) = gen_syrks(engine, cfg, &cal[..2], 1);
+    let (g_ho, _, t_syrk4) = gen_syrks(engine, cfg, ho, 1);
     let t = Instant::now();
     let (mut tw, _cfg) = Weights::from_engine(engine).expect("teacher weights");
     let t_weights = t.elapsed().as_secs_f64();
@@ -728,18 +728,18 @@ fn probe(
     // q 7.19 s, gate 34.0 s, down 87.5 s; `k`/`v` at `kv_out = 128` and `o` at `q_out` are the `q`
     // shape's `n × n` solve, so the seven fits are `4·7.19 + 2·34.0 + 87.5`.
     let t_fits = 4.0 * 7.19 + 2.0 * 34.0 + 87.5;
-    let _ = (base, t_gram4);
+    let _ = (base, t_syrk4);
     eprintln!(
         "[gen] probe: gram {:.2}s/chunk; held-out 2 chunks {t_2:.2}s, 4 chunks {t_4:.2}s          ({t_eval_chunk:.2}s/chunk, KL2 {:.4e}, top1 {:.4}); quad q {t_q:.2}s, quad down {t_d:.2}s; \
          rss {:.2} GB, wall {:.1}s",
-        t_gram2 / 2.0,
+        t_syrk2 / 2.0,
         from_grid(h2.kl),
         from_grid(h4.top1),
         rss_gb(),
         t_all.elapsed().as_secs_f64()
     );
     for n in [2_usize, 4, 8] {
-        let grams = f64::from(u32::try_from(n).expect("n")) * t_gram2 / 2.0;
+        let grams = f64::from(u32::try_from(n).expect("n")) * t_syrk2 / 2.0;
         let evals = 7.0 * f64::from(u32::try_from(n + N_HO).expect("n")) * t_eval_chunk;
         let sides = 7.0 * (t_write + t_open + t_read) + 4.0 * (t_q + t_d);
         let total = grams + t_fits + evals + sides;
@@ -798,8 +798,8 @@ fn gen_qwen05b() {
         return;
     }
 
-    let (g_cal, moments, t_gcal) = gen_grams(&engine, &config, &cal[..n_cal], 1);
-    let (g_ho, _, t_gho) = gen_grams(&engine, &config, &ho, 1);
+    let (g_cal, moments, t_gcal) = gen_syrks(&engine, &config, &cal[..n_cal], 1);
+    let (g_ho, _, t_gho) = gen_syrks(&engine, &config, &ho, 1);
     eprintln!(
         "[gen] grams: cal {t_gcal:.2}s, held-out {t_gho:.2}s, rss {:.2} GB",
         rss_gb()
@@ -834,11 +834,11 @@ fn gen_qwen05b() {
         } else {
             (0.0, Vec::new())
         };
-        let fit_gram: &[f64] = if lw { &shrunk } else { gram };
+        let fit_syrk: &[f64] = if lw { &shrunk } else { gram };
         let ws = tensor(&tw.layers[0], t.name).to_vec();
         let tag = format!("{arm}-n{n_cal}-l0-{}", t.name);
         let (wp, bits, hit) =
-            fold_saved(&format!("{dir}/fit"), &tag, &ws, fit_gram, t.o, t.n, &base);
+            fold_saved(&format!("{dir}/fit"), &tag, &ws, fit_syrk, t.o, t.n, &base);
         let fit_s = tf.elapsed().as_secs_f64();
         eprintln!(
             "[gen] {arm} {} {}×{}: fit {fit_s:.2}s{}{}",
@@ -1138,7 +1138,7 @@ fn scratch(name: &str) -> String {
     dir
 }
 
-/// The wiring gate: on one dense fixture layer, `teacher tap → Grams → fold_fit → student GGUF →
+/// The wiring gate: on one dense fixture layer, `teacher tap → SyrkAcc → fold_fit → student GGUF →
 /// read-back error → J_in/J_out`, with the disjoint-Gram assertion and the self-replacement case.
 ///
 /// `J_in > 0` requires a fitted `q` whose re-encoded words differ from the teacher's; `J_out` is
@@ -1157,10 +1157,13 @@ fn gen_fixture() {
     let cal: Vec<u32> = (0..GEN_TOK as u32).map(|i| (i * 5 + 3) % vocab).collect();
     let ho: Vec<u32> = (0..GEN_TOK as u32).map(|i| (i * 7 + 11) % vocab).collect();
 
-    let (g_cal, mom, wall) = gen_grams(&engine, &config, std::slice::from_ref(&cal), 1);
-    let (g_ho, _, _) = gen_grams(&engine, &config, std::slice::from_ref(&ho), 1);
+    let (g_cal, mom, wall) = gen_syrks(&engine, &config, std::slice::from_ref(&cal), 1);
+    let (g_ho, _, _) = gen_syrks(&engine, &config, std::slice::from_ref(&ho), 1);
     assert_eq!(g_cal[0].tokens, u64::try_from(GEN_TOK).expect("tokens"));
-    assert_ne!(g_cal[0].qkv, g_ho[0].qkv, "calibration and held-out Grams");
+    assert_ne!(
+        g_cal[0].qkv, g_ho[0].qkv,
+        "calibration and held-out SyrkAcc"
+    );
     let base = DriverCfg::production(engine_layer_cfg(&config), GEN_TOK, 1);
 
     // Fit `q` on the calibration Gram, then build the single-tensor student.

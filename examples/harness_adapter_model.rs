@@ -346,11 +346,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         let g_rest = gram_fold_i8(vec![0i64; d * d], &x_rest, train_rows - 1, d)
             .map_err(|e| format!("apeiron::gram_fold_i8 failed: {e:?}"))?;
-        let gram_exact = g_rest == g2;
-        revoked = Some((max_rev, gram_exact, t3.elapsed().as_secs_f64() * 1000.0));
+        let syrk_exact = g_rest == g2;
+        revoked = Some((max_rev, syrk_exact, t3.elapsed().as_secs_f64() * 1000.0));
         println!(
             "revocation of row {victim}: |delta| max {max_rev:.3e} (was {max_err:.3e}), \
-             gram exact {gram_exact}, {:.1} ms",
+             gram exact {syrk_exact}, {:.1} ms",
             t3.elapsed().as_secs_f64() * 1000.0
         );
     }
@@ -372,7 +372,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     report.insert("chol_residual_max".to_string(), g_q32.to_string());
     if let Some((m, exact, ms)) = revoked {
         report.insert("revoked_delta_max_abs".to_string(), format!("{m:.6e}"));
-        report.insert("revoked_gram_exact".to_string(), exact.to_string());
+        report.insert("revoked_syrk_exact".to_string(), exact.to_string());
         report.insert("revoke_ms".to_string(), format!("{ms:.3}"));
     }
     let json = format!(

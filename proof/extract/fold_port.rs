@@ -50,7 +50,7 @@
 #[path = "../../src/learn/fold/fit/mod.rs"]
 pub mod fit;
 
-/// The real `src/learn/fold/stats/`: the activation Grams, the shrinkage intensities and the
+/// The real `src/learn/fold/stats/`: the activation SyrkAcc, the shrinkage intensities and the
 /// `f64` forward the transfer consumes.
 #[path = "../../src/learn/fold/stats/mod.rs"]
 pub mod stats;

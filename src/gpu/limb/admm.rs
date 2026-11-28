@@ -412,7 +412,7 @@ impl Frame {
             dev_buf(vk, 8 * k * r)?,
             dev_buf(vk, 4)?,
         );
-        let (gram_x, kx) = (dev_buf(vk, 8 * rp * rp)?, dev_buf(vk, 8 * kp * rp)?);
+        let (syrk_x, kx) = (dev_buf(vk, 8 * rp * rp)?, dev_buf(vk, 8 * kp * rp)?);
         let o = dev_buf(
             vk,
             Product::o_bytes(r, r, n, limbs)
@@ -426,7 +426,7 @@ impl Frame {
             [zt[2], zt[1]],
             (r, r, n, limbs),
             o,
-            gram_x,
+            syrk_x,
             &mut ups,
         )?;
         let wz = Product::new(
@@ -464,10 +464,10 @@ impl Frame {
             )
         };
         let maps = [
-            map(0, n, r * n, zx, gram_x, zt[0], &mut ups)?,
-            map(1, 1, r, z, gram_x, hw, &mut ups)?,
-            map(2, 1, 1, z, gram_x, hw, &mut ups)?,
-            map(3, r, r * r, z, gram_x, hw, &mut ups)?,
+            map(0, n, r * n, zx, syrk_x, zt[0], &mut ups)?,
+            map(1, 1, r, z, syrk_x, hw, &mut ups)?,
+            map(2, 1, 1, z, syrk_x, hw, &mut ups)?,
+            map(3, r, r * r, z, syrk_x, hw, &mut ups)?,
             map(4, r, k * r, z, kx, rt[0], &mut ups)?,
             map(5, r, k * r, z, kx, rt[0], &mut ups)?,
         ];

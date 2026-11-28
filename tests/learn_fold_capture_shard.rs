@@ -1,4 +1,4 @@
-//! Calibration shards merge exactly: `Grams::merge` over disjoint token shards equals one
+//! Calibration shards merge exactly: `SyrkAcc::merge` over disjoint token shards equals one
 //! accumulator over all tokens, bit for bit, in any order and with any shard count, and the wire
 //! form round-trips. SYNTHETIC tap rows (seeded integers in a small range), tiny geometry: this
 //! tests the integer algebra of the merge, not model quality.
@@ -8,7 +8,7 @@
 //!
 //! Grade: `tested`.
 
-use apeiron::learn::fold::stats::capture::{CaptureError, Grams};
+use apeiron::learn::fold::stats::capture::{CaptureError, SyrkAcc};
 use apeiron::learn::grad::model::Config;
 
 fn cfg() -> Config {
@@ -52,8 +52,8 @@ fn taps(seed: u64, t: usize, c: &Config) -> Vec<Vec<Vec<Vec<i64>>>> {
         .collect()
 }
 
-fn acc(parts: &[Vec<Vec<Vec<Vec<i64>>>>], c: &Config) -> Grams {
-    let mut g = Grams::new(c).unwrap();
+fn acc(parts: &[Vec<Vec<Vec<Vec<i64>>>>], c: &Config) -> SyrkAcc {
+    let mut g = SyrkAcc::new(c).unwrap();
     for p in parts {
         g.accumulate_tap(p).unwrap();
     }
@@ -67,12 +67,15 @@ fn shard_merge_is_bit_exact_order_free_and_wire_stable() {
     let whole = acc(&shards, &c);
 
     // each shard accumulated on its own "machine", then merged in two different orders
-    let each: Vec<Grams> = shards.iter().map(|s| acc(std::slice::from_ref(s), &c)).collect();
-    let mut fwd = Grams::new(&c).unwrap();
+    let each: Vec<SyrkAcc> = shards
+        .iter()
+        .map(|s| acc(std::slice::from_ref(s), &c))
+        .collect();
+    let mut fwd = SyrkAcc::new(&c).unwrap();
     for g in &each {
         fwd.merge(g).unwrap();
     }
-    let mut rev = Grams::new(&c).unwrap();
+    let mut rev = SyrkAcc::new(&c).unwrap();
     for g in each.iter().rev() {
         rev.merge(g).unwrap();
     }
@@ -89,12 +92,14 @@ fn shard_merge_is_bit_exact_order_free_and_wire_stable() {
     assert_eq!(a, whole, "tree merge differs");
 
     // the wire form round-trips exactly, and merging deserialised shards is the same
-    let mut over_wire = Grams::new(&c).unwrap();
+    let mut over_wire = SyrkAcc::new(&c).unwrap();
     for g in &each {
-        over_wire.merge(&Grams::from_wire(&g.to_wire()).unwrap()).unwrap();
+        over_wire
+            .merge(&SyrkAcc::from_wire(&g.to_wire()).unwrap())
+            .unwrap();
     }
     assert_eq!(over_wire, whole, "merge over the wire differs");
-    assert_eq!(Grams::from_wire(&whole.to_wire()).unwrap(), whole);
+    assert_eq!(SyrkAcc::from_wire(&whole.to_wire()).unwrap(), whole);
 }
 
 #[test]
@@ -116,15 +121,18 @@ fn controls_a_flipped_word_a_wrong_geometry_and_overflow_are_caught() {
     c2.n_ff = 12;
     let mut g = acc(&[s0.clone()], &c);
     let before = g.clone();
-    assert!(matches!(g.merge(&Grams::new(&c2).unwrap()), Err(CaptureError::Shape(_))));
+    assert!(matches!(
+        g.merge(&SyrkAcc::new(&c2).unwrap()),
+        Err(CaptureError::Shape(_))
+    ));
     assert_eq!(g, before);
 
     // truncated / corrupt wire refused
     let w = g.to_wire();
-    assert!(Grams::from_wire(&w[..w.len() - 1]).is_err());
+    assert!(SyrkAcc::from_wire(&w[..w.len() - 1]).is_err());
     let mut junk = w.clone();
     junk[0] = b'X';
-    assert!(Grams::from_wire(&junk).is_err());
+    assert!(SyrkAcc::from_wire(&junk).is_err());
 
     // overflow: merging a shard with itself until a word would pass i64::MAX is refused and
     // leaves the target unchanged

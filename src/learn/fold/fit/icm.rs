@@ -8,7 +8,7 @@
 //!
 //! # Carrier and boundary
 //!
-//! Every value is Q32.32: `x` is `round(x·2³²)` in an `i64`; matrix products, Grams and dots run on
+//! Every value is Q32.32: `x` is `round(x·2³²)` in an `i64`; matrix products, SyrkAcc and dots run on
 //! [`crate::engine::kern::limb`] at [`LIMBS`] limbs (block-floating, the bound in that module's
 //! `bound_ulps`, reported by [`product_bound`]), every other product is exact in `i128`, and
 //! block/pair costs compare as exact Q96.96 `i128`, so an argmin is the integer argmin and a tie goes

@@ -582,7 +582,7 @@ fn metric_scale(hl: &[i64], c: &[i64], n: usize) -> Result<Vec<i64>, StepsError>
 /// # Complexity
 /// Temporal `O(o·n)` transposes and column scales plus `O(o·n²)` word multiply-adds on the kernel
 /// (pooled inside [`limb::gemm_q32`]); spatial `O(o·n)` for the two panels and `O(n²)` output.
-fn weighted_gram(sh: &[i64], w: &[i64], o: usize, n: usize) -> Result<Vec<i64>, StepsError> {
+fn wsyrk_gemm(sh: &[i64], w: &[i64], o: usize, n: usize) -> Result<Vec<i64>, StepsError> {
     let sh_t = transpose_grid(sh, n, o);
     let w_t = col_scale(&sh_t, w, o)?;
     let mut a = limb::gemm_q32(&w_t, n, &sh_t, n, o, LIMBS).map_err(map_limb)?;
@@ -689,7 +689,7 @@ pub fn c_step(
 /// [`StepsError::NotPositiveDefinite`] if the reduced `A` is not SPD.
 ///
 /// # Complexity
-/// Temporal: one [`weighted_gram`] at `O(o·n²)` word multiply-adds on the kernel, one
+/// Temporal: one [`wsyrk_gemm`] at `O(o·n²)` word multiply-adds on the kernel, one
 /// `hadamard_into` at `O(n²)`, one `rhs_grid` at `O(O·n)`, one `chol_solve` at `O(n³/3 + n²)`,
 /// `O(O·n²)` for the `Sh` scan and the transposes. The pooled primitives dispatch inside their own
 /// drivers; the drivers here stay serial (a nested dispatch would deadlock). Spatial: `O(n²)` for
@@ -727,7 +727,7 @@ pub fn c_step_wshl(
     // The row weight carries its own exact power-of-two shift; `1` is the raw unit.
     let gr_g = row_weight(g_row, o)?;
     // A = hl ⊙ (Shᵀ diag(g_row) Sh) on the kernel, column-filled to D·A·D; nothing here is `f64`.
-    let mut a = weighted_gram(&sh, &gr_g, o, n)?;
+    let mut a = wsyrk_gemm(&sh, &gr_g, o, n)?;
     // A production Gram (`2^46` words at `o = 4864`) times the production metric (`2^53`) needs a
     // 67-bit product word, five above `i64`; the exact `2^-s` rescale of the whole system below
     // keeps the solution and leaves a fit whose product already fits (`s = 0`) bit for bit.
@@ -926,7 +926,7 @@ pub fn d_step(
 ///
 /// # Complexity
 /// Temporal: `O(O·n·log 128)` for `G_rot`'s transform (pooled) and `O(n²·log 128)` for `H_rot`
-/// (pooled), one [`weighted_gram`] at `O(o·n²)` on the kernel and `hadamard_into` at `O(n²)`
+/// (pooled), one [`wsyrk_gemm`] at `O(o·n²)` on the kernel and `hadamard_into` at `O(n²)`
 /// (pooled), `rhs_grid` at
 /// `O(O·n)`, `chol_solve` at `O(n³/3 + n²)` (pooled); spatial `O(n²)` for `H_rot`/`A`.
 pub fn d_step_wshl(
@@ -966,7 +966,7 @@ pub fn d_step_wshl(
     shift_in_place(&mut b_scaled, k)?;
     let e = fill_columns(&mut b_scaled, o, n)?;
     let gr_g = row_weight(g_row, o)?;
-    let mut a = weighted_gram(&b_scaled, &gr_g, o, n)?;
+    let mut a = wsyrk_gemm(&b_scaled, &gr_g, o, n)?;
     // The same `2^-s` rescale as [`c_step_wshl`]: `Bᵀ diag(g) B` reaches `2^46` and `H_rot`
     // `2^53` at production, a 67-bit product word.
     let s = product_shift(max_mag(&a), max_mag(&h_rot));

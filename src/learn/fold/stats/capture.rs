@@ -4,20 +4,20 @@
 //!
 //! | source | fn | activations |
 //! |---|---|---|
-//! | the executing engine's prefill tap | [`Grams::accumulate_tap`] | the rows [`crate::engine::Engine::prefill_tap_cols`] records |
-//! | a Q32.32 [`Tape`] (the engine's `KernelMode::Exact` prefill) | [`Grams::accumulate`] | the exact reference rows |
+//! | the executing engine's prefill tap | [`SyrkAcc::accumulate_tap`] | the rows [`crate::engine::Engine::prefill_tap_cols`] records |
+//! | a Q32.32 [`Tape`] (the engine's `KernelMode::Exact` prefill) | [`SyrkAcc::accumulate`] | the exact reference rows |
 //!
 //! Both accumulate, per trunk layer and per linear input, the unweighted scatter
 //! `H = Σ_t x_t x_tᵀ` over the tokens, `x_t` the linear's input row. The engine source is the
 //! production path: it reads the activations the engine actually computes, so the Gram is of the
 //! teacher's own words and not of a second forward's. The [`Tape`] source stays as the exact
 //! reference the engine path is tested against (`tests/learn_fold_capture_engine.rs`).
-//! [`Grams::finish`] mirrors the upper triangle to the lower one and applies the requested
+//! [`SyrkAcc::finish`] mirrors the upper triangle to the lower one and applies the requested
 //! normalisation. The port is the activation-Gram half of the reference `rstar_fast.py` `Gram`
 //! (`~/lanes/port/spec/rstar_fast.py:225-254`), whose four `H:<key>` tensors are
 //! exactly these four inputs (`rstar_fast.py:641-653`).
 //!
-//! | [`LayerGrams`] field | linear | stage ([`crate::engine::step`] tap slot) | width |
+//! | [`LayerSyrk`] field | linear | stage ([`crate::engine::step`] tap slot) | width |
 //! |---|---|---|---|
 //! | `qkv` | Q/K/V projection | `ln1_out` (`attn_norm` output) | `n_embd` |
 //! | `o` | output projection | `attn_out` | `q_out = n_head·head_dim` |
@@ -50,15 +50,15 @@
 //! rounds where the reference does not, so the two sources agree to the measured bound on the
 //! fixture, not bit for bit (`tests/learn_fold_capture_engine.rs`). The reference accumulates `fp32`
 //! (`Gram.acc`, `rstar_fast.py:231`) and its `fp16s` mode fixes a per-column scale from the first
-//! batch (`:238-241`); neither rounding is reproduced. [`Grams::finish`] converts each finished
-//! word to `f64` once, at the `LayerGrams` boundary.
+//! batch (`:238-241`); neither rounding is reproduced. [`SyrkAcc::finish`] converts each finished
+//! word to `f64` once, at the `LayerSyrk` boundary.
 //!
 //! # Measured difference on the fixture
 //!
 //! `tests/learn_fold_capture_engine.rs` runs one dense layer through both sources and prints these
 //! numbers every run. In [`crate::engine::KernelMode::Exact`] the tap rows against the reference
 //! activations (entry-wise relative): `ln1_out` `0`, `attn_out` `2.7e-6`, `ln2_out` `2.0e-7`. In
-//! the production [`crate::engine::KernelMode::Q8Act`] the Grams against the reference Grams
+//! the production [`crate::engine::KernelMode::Q8Act`] the SyrkAcc against the reference SyrkAcc
 //! (difference over the matrix's own scale): `qkv` `1.6e-6`, `o` `4.4e-3`, `gate_up` `1.5e-3`,
 //! `down` `1.1e-2`. The `qkv` input is the residual norm before the first quantised projection, so
 //! it carries only the two forwards' fixed-point difference; the other three carry the 8-bit
@@ -86,7 +86,7 @@
 //! The capture reads Q32.32 `i64` rows only and accumulates in the same carrier; the finished `f64`
 //! Gram is the caller's representation of those words. `rmsnorm`, attention and the dense kernels
 //! are [`crate::learn::grad::model`]'s and the engine's contracts. Not covered: the output-gradient
-//! Grams above, the thread pool's scheduling, and any activation the source does not carry.
+//! SyrkAcc above, the thread pool's scheduling, and any activation the source does not carry.
 
 #![allow(
     clippy::many_single_char_names,
@@ -127,7 +127,7 @@ pub enum CaptureError {
     Overflow,
 }
 
-/// What [`Grams::finish`] hands back for one matrix.
+/// What [`SyrkAcc::finish`] hands back for one matrix.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Normalisation {
     /// The raw scatter `Σ_t x_t x_tᵀ`, unscaled.
@@ -143,13 +143,13 @@ pub enum Normalisation {
     },
 }
 
-/// One layer's four activation Grams, each row-major `w × w` (`[LayerGrams]`'s field docs name the
+/// One layer's four activation SyrkAcc, each row-major `w × w` (`[LayerSyrk]`'s field docs name the
 /// width), plus the token count summed into them.
 ///
 /// The entries are the accumulator's words rendered once by `from_grid`; `tests/learn_fold_basis.rs`
 /// converts them straight back with `to_grid`, so word-valued fields are what that consumer can take.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LayerGrams {
+pub struct LayerSyrk {
     /// `Σ_t ln1_out_t ln1_out_tᵀ`, row-major `n_embd × n_embd`.
     pub qkv: Vec<f64>,
     /// `Σ_t attn_out_t attn_out_tᵀ`, row-major `q_out × q_out`.
@@ -158,13 +158,13 @@ pub struct LayerGrams {
     pub gate_up: Vec<f64>,
     /// `Σ_t m_t m_tᵀ`, row-major `n_ff × n_ff`.
     pub down: Vec<f64>,
-    /// Tokens accumulated into this layer's Grams.
+    /// Tokens accumulated into this layer's SyrkAcc.
     pub tokens: u64,
 }
 
 /// One layer's four Q32.32 accumulators, upper triangle only, plus the token count.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LayerGramQ {
+struct LayerSyrkQ {
     qkv: Vec<i64>,
     o: Vec<i64>,
     gate_up: Vec<i64>,
@@ -174,15 +174,15 @@ struct LayerGramQ {
 
 /// The per-layer activation-Gram accumulator for one calibration pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Grams {
+pub struct SyrkAcc {
     /// Per trunk layer, in forward order, as Q32.32 words.
-    layers: Vec<LayerGramQ>,
+    layers: Vec<LayerSyrkQ>,
     n_embd: usize,
     q_out: usize,
     n_ff: usize,
 }
 
-impl Grams {
+impl SyrkAcc {
     /// The zero accumulator for `cfg`'s geometry.
     ///
     /// # Errors
@@ -191,7 +191,7 @@ impl Grams {
     ///
     /// # Complexity
     /// `O(n_layer)` time; space `O(n_layer·(n_embd² + q_out² + n_ff²))` `i64` words.
-    pub fn new(cfg: &Config) -> Result<Grams, CaptureError> {
+    pub fn new(cfg: &Config) -> Result<SyrkAcc, CaptureError> {
         let n_embd = cfg.n_embd;
         let n_ff = cfg.n_ff;
         if cfg.n_layer == 0 || n_embd == 0 || n_ff == 0 || cfg.n_head == 0 || cfg.head_dim == 0 {
@@ -201,10 +201,10 @@ impl Grams {
         let e2 = square(n_embd)?;
         let q2 = square(q_out)?;
         let f2 = square(n_ff)?;
-        let mut layers: Vec<LayerGramQ> = Vec::with_capacity(cfg.n_layer);
+        let mut layers: Vec<LayerSyrkQ> = Vec::with_capacity(cfg.n_layer);
         let mut l = 0usize;
         while l < cfg.n_layer {
-            layers.push(LayerGramQ {
+            layers.push(LayerSyrkQ {
                 qkv: vec![0; e2],
                 o: vec![0; q2],
                 gate_up: vec![0; e2],
@@ -213,7 +213,7 @@ impl Grams {
             });
             l += 1;
         }
-        Ok(Grams {
+        Ok(SyrkAcc {
             layers,
             n_embd,
             q_out,
@@ -224,7 +224,7 @@ impl Grams {
     /// Fold `tape`'s four per-layer linear inputs into the accumulator, upper triangle only.
     ///
     /// # Errors
-    /// [`CaptureError::Shape`] when `cfg` disagrees with the geometry [`Grams::new`] fixed, when
+    /// [`CaptureError::Shape`] when `cfg` disagrees with the geometry [`SyrkAcc::new`] fixed, when
     /// `tape.layers.len() != cfg.n_layer`, or when a stage buffer is not `tape.t · w`;
     /// [`CaptureError::Overflow`] when a length product, a rounded `i128` product or a word sum
     /// leaves its range.
@@ -241,7 +241,7 @@ impl Grams {
             || cfg.n_layer != self.layers.len()
         {
             return Err(CaptureError::Shape(format!(
-                "config {}×{}×{} / {} layers != Grams {}×{}×{} / {} layers",
+                "config {}×{}×{} / {} layers != SyrkAcc {}×{}×{} / {} layers",
                 cfg.n_embd,
                 q_out,
                 cfg.n_ff,
@@ -283,11 +283,11 @@ impl Grams {
     ///
     /// `rows` is `[layer][stage][column][width]`, the four stage slots [`TAP_LN1_OUT`],
     /// [`TAP_ATTN_OUT`], [`TAP_LN2_OUT`] and [`TAP_M`] the linear inputs. Each stage's columns are
-    /// stacked row-major and folded through [`add_gram_stage`], so every Gram executes on
+    /// stacked row-major and folded through [`add_syrk_stage`], so every Gram executes on
     /// [`syrk_q32`] (AGENTS.md §0 K2).
     ///
     /// # Errors
-    /// [`CaptureError::Shape`] when the layer count or a stage width disagrees with [`Grams::new`]'s
+    /// [`CaptureError::Shape`] when the layer count or a stage width disagrees with [`SyrkAcc::new`]'s
     /// geometry, when the four stage column counts differ, or when a stage is empty (a
     /// single-column prefill records no `m` row, so it cannot feed this path);
     /// [`CaptureError::Overflow`] when a limb product leaves its range or a word leaves `i64`.
@@ -298,7 +298,7 @@ impl Grams {
     pub fn accumulate_tap(&mut self, rows: &[Vec<Vec<Vec<i64>>>]) -> Result<(), CaptureError> {
         if rows.len() != self.layers.len() {
             return Err(CaptureError::Shape(format!(
-                "tap has {} layers, Grams {}",
+                "tap has {} layers, SyrkAcc {}",
                 rows.len(),
                 self.layers.len()
             )));
@@ -329,15 +329,15 @@ impl Grams {
                     )));
                 } else {
                     let acc = &mut self.layers[l];
-                    let mut r = add_gram_stage(&mut acc.qkv, &stages[TAP_LN1_OUT], n_embd, t);
+                    let mut r = add_syrk_stage(&mut acc.qkv, &stages[TAP_LN1_OUT], n_embd, t);
                     if r.is_ok() {
-                        r = add_gram_stage(&mut acc.o, &stages[TAP_ATTN_OUT], q_out, t);
+                        r = add_syrk_stage(&mut acc.o, &stages[TAP_ATTN_OUT], q_out, t);
                     }
                     if r.is_ok() {
-                        r = add_gram_stage(&mut acc.gate_up, &stages[TAP_LN2_OUT], n_embd, t);
+                        r = add_syrk_stage(&mut acc.gate_up, &stages[TAP_LN2_OUT], n_embd, t);
                     }
                     if r.is_ok() {
-                        r = add_gram_stage(&mut acc.down, &stages[TAP_M], n_ff, t);
+                        r = add_syrk_stage(&mut acc.down, &stages[TAP_M], n_ff, t);
                     }
                     if r.is_ok() {
                         r = match u64::try_from(t) {
@@ -372,7 +372,7 @@ impl Grams {
     ///
     /// # Complexity
     /// `O(n_layer·(n_embd² + q_out² + n_ff²))` time, one `i64` copy of the accumulator.
-    pub fn finish(&self, normalisation: Normalisation) -> Result<Vec<LayerGrams>, CaptureError> {
+    pub fn finish(&self, normalisation: Normalisation) -> Result<Vec<LayerSyrk>, CaptureError> {
         let mut out = Vec::with_capacity(self.layers.len());
         let mut l = 0usize;
         let mut res: Result<(), CaptureError> = Ok(());
@@ -406,7 +406,7 @@ impl Grams {
     ///
     /// # Complexity
     /// Two passes over the accumulator words: time `O(n_layer·(n_embd² + q_out² + n_ff²))`, space `O(1)`.
-    pub fn merge(&mut self, other: &Grams) -> Result<(), CaptureError> {
+    pub fn merge(&mut self, other: &SyrkAcc) -> Result<(), CaptureError> {
         if self.n_embd != other.n_embd
             || self.q_out != other.q_out
             || self.n_ff != other.n_ff
@@ -445,7 +445,7 @@ impl Grams {
     /// The shard's wire form: a header (`APGR1`, then `n_layer`, `n_embd`, `q_out`, `n_ff` as
     /// little-endian `u64`), then per layer the token count and the four upper triangles
     /// (`i ≤ j`, row-major) as little-endian `i64` Q32.32 words. The lower triangle is never
-    /// written by [`Grams::accumulate_tap`], so it is not sent.
+    /// written by [`SyrkAcc::accumulate_tap`], so it is not sent.
     ///
     /// # Complexity
     /// Time and space `O(n_layer·(n_embd² + q_out² + n_ff²)/2)` words.
@@ -469,15 +469,15 @@ impl Grams {
         out
     }
 
-    /// Read a shard written by [`Grams::to_wire`].
+    /// Read a shard written by [`SyrkAcc::to_wire`].
     ///
     /// # Errors
     /// [`CaptureError::Shape`] for a wrong magic, a truncated or over-long buffer, or a geometry
     /// whose size does not fit; [`CaptureError::Overflow`] when a length product leaves `usize`.
     ///
     /// # Complexity
-    /// Time and space as [`Grams::to_wire`].
-    pub fn from_wire(bytes: &[u8]) -> Result<Grams, CaptureError> {
+    /// Time and space as [`SyrkAcc::to_wire`].
+    pub fn from_wire(bytes: &[u8]) -> Result<SyrkAcc, CaptureError> {
         let bad = |m: &str| CaptureError::Shape(format!("wire: {m}"));
         if bytes.len() < 5 + 32 || &bytes[..5] != b"APGR1" {
             return Err(bad("magic or header"));
@@ -518,7 +518,7 @@ impl Grams {
             let mut t = [0u8; 8];
             t.copy_from_slice(&bytes[at..at + 8]);
             at += 8;
-            let mut lay = LayerGramQ {
+            let mut lay = LayerSyrkQ {
                 qkv: vec![0; e2],
                 o: vec![0; q2],
                 gate_up: vec![0; e2],
@@ -532,7 +532,12 @@ impl Grams {
             layers.push(lay);
             l += 1;
         }
-        Ok(Grams { layers, n_embd, q_out, n_ff })
+        Ok(SyrkAcc {
+            layers,
+            n_embd,
+            q_out,
+            n_ff,
+        })
     }
 }
 
@@ -585,27 +590,27 @@ fn get_upper(bytes: &[u8], at: &mut usize, m: &mut [i64], w: usize) {
     }
 }
 
-/// One layer's finished Grams: the zero-token refusal, then the four mirrored matrices.
+/// One layer's finished SyrkAcc: the zero-token refusal, then the four mirrored matrices.
 ///
 /// # Errors
 /// [`CaptureError::Shape`] for a normalisation over zero tokens; [`CaptureError::Overflow`] from
 /// [`mirror`].
 ///
 /// # Complexity
-/// `O(n_embd² + q_out² + n_ff²)`; space one layer's `f64` Grams.
+/// `O(n_embd² + q_out² + n_ff²)`; space one layer's `f64` SyrkAcc.
 fn finish_layer(
-    lg: &LayerGramQ,
+    lg: &LayerSyrkQ,
     n_embd: usize,
     q_out: usize,
     n_ff: usize,
     normalisation: Normalisation,
-) -> Result<LayerGrams, CaptureError> {
+) -> Result<LayerSyrk, CaptureError> {
     if lg.tokens == 0 && normalisation != Normalisation::Sum {
         return Err(CaptureError::Shape(
             "normalisation over zero tokens".to_string(),
         ));
     }
-    Ok(LayerGrams {
+    Ok(LayerSyrk {
         qkv: mirror(&lg.qkv, n_embd, normalisation, lg.tokens)?,
         o: mirror(&lg.o, q_out, normalisation, lg.tokens)?,
         gate_up: mirror(&lg.gate_up, n_embd, normalisation, lg.tokens)?,
@@ -683,7 +688,7 @@ fn fold_rows(acc: &mut [i64], x: &[i64], t: usize, w: usize) -> Result<(), Captu
 ///
 /// # Complexity
 /// `O(t·w)` words copied into the transpose plus [`syrk_q32`]'s `O(w²·t·limbs/2)`; space `O(t·w)`.
-fn add_gram_stage(
+fn add_syrk_stage(
     acc: &mut [i64],
     cols: &[Vec<i64>],
     w: usize,

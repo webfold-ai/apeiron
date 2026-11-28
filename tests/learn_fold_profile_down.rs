@@ -285,14 +285,14 @@ fn t_a_transforms_metric_gptq() {
         from_grid(metric(&q(&fx.h), N, fx.rg_q).expect("metric")[0])
     });
     let ws_rot = fwht128(&fx.ws).expect("fwht");
-    let h_gram = unq(&had_gram(&q(&fx.h), N).expect("had_gram"));
+    let h_syrk = unq(&had_gram(&q(&fx.h), N).expect("had_gram"));
     phase(
-        "(3) gptq_e8(ws_rot, h_gram, beam=4)",
+        "(3) gptq_e8(ws_rot, h_syrk, beam=4)",
         gptq_flops(o, n),
         3,
         || {
             from_grid(
-                gptq_e8(&q(&ws_rot), &q(&h_gram), O, N, fx.damp, true, true, 4)
+                gptq_e8(&q(&ws_rot), &q(&h_syrk), O, N, fx.damp, true, true, 4)
                     .expect("gptq")
                     .scale[0],
             )
@@ -373,8 +373,8 @@ fn t_d_corrector() {
     header();
     let hl = metric(&q(&fx.h), N, fx.rg_q).expect("metric");
     let ws_rot = fwht128(&fx.ws).expect("fwht");
-    let h_gram = unq(&had_gram(&q(&fx.h), N).expect("had_gram"));
-    let qe8 = gptq_e8(&q(&ws_rot), &q(&h_gram), O, N, fx.damp, true, true, 4).expect("gptq");
+    let h_syrk = unq(&had_gram(&q(&fx.h), N).expect("had_gram"));
+    let qe8 = gptq_e8(&q(&ws_rot), &q(&h_syrk), O, N, fx.damp, true, true, 4).expect("gptq");
     // The gptq candidate weight wq0 = compose(fwht128(s_rot), scale, ones); delta = ws − wq0.
     let wq0_s = fwht128(&unq(&qe8.s)).expect("fwht");
     let ones_c = vec![1.0_f64; N];
@@ -401,8 +401,8 @@ fn t_e_eigh() {
     header();
     let hl = unq(&metric(&q(&fx.h), N, fx.rg_q).expect("metric"));
     let ws_rot = fwht128(&fx.ws).expect("fwht");
-    let h_gram = unq(&had_gram(&q(&fx.h), N).expect("had_gram"));
-    let qe8 = gptq_e8(&q(&ws_rot), &q(&h_gram), O, N, fx.damp, true, true, 4).expect("gptq");
+    let h_syrk = unq(&had_gram(&q(&fx.h), N).expect("had_gram"));
+    let qe8 = gptq_e8(&q(&ws_rot), &q(&h_syrk), O, N, fx.damp, true, true, 4).expect("gptq");
     let wq0_s = fwht128(&unq(&qe8.s)).expect("fwht");
     let ones_c = vec![1.0_f64; N];
     let wq0 = unq(&compose(&q(&wq0_s), &q(&unq(&qe8.scale)), &q(&ones_c), O, N).expect("compose"));
@@ -541,17 +541,17 @@ fn fnv_f64(xs: &[f64]) -> u64 {
 fn t_h_fixture_receipt() {
     let fx = fixture();
     let ws_rot = fwht128(&fx.ws).expect("fwht");
-    let h_gram = unq(&had_gram(&q(&fx.h), N).expect("had_gram"));
+    let h_syrk = unq(&had_gram(&q(&fx.h), N).expect("had_gram"));
     let dmin = (0..N)
-        .map(|i| h_gram[i * N + i])
+        .map(|i| h_syrk[i * N + i])
         .fold(f64::INFINITY, f64::min);
-    let dmax = (0..N).map(|i| h_gram[i * N + i]).fold(0.0_f64, f64::max);
+    let dmax = (0..N).map(|i| h_syrk[i * N + i]).fold(0.0_f64, f64::max);
     eprintln!(
         "FIX had_gram diag min={dmin:e} max={dmax:e} digest={:016x}",
-        fnv_f64(&h_gram)
+        fnv_f64(&h_syrk)
     );
     eprintln!("FIX ws_rot digest={:016x}", fnv_f64(&ws_rot));
-    let g = gptq_e8(&q(&ws_rot), &q(&h_gram), O, N, fx.damp, true, true, 4).expect("gptq");
+    let g = gptq_e8(&q(&ws_rot), &q(&h_syrk), O, N, fx.damp, true, true, 4).expect("gptq");
     eprintln!(
         "FIX gptq_e8 idx[{}] digest={:016x} scale[{}] digest={:016x} s digest={:016x}",
         g.idx.len(),

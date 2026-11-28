@@ -19,7 +19,7 @@
               exact mirror and the exact f64 division the accumulator performs"
 )]
 
-use apeiron::learn::fold::stats::capture::{CaptureError, Grams, LayerGrams, Normalisation};
+use apeiron::learn::fold::stats::capture::{CaptureError, LayerSyrk, Normalisation, SyrkAcc};
 use apeiron::learn::grad::model::{Config, LayerTape, Tape};
 
 #[path = "support/ridge_oracle.rs"]
@@ -145,7 +145,7 @@ fn slice_layer(lt: &LayerTape, r0: usize, r1: usize) -> LayerTape {
 /// each of the `t` terms rounds by at most half a grid quantum (`2⁻³³` real) and the integer sum adds
 /// nothing; the oracle adds `t` exact `f64` products, each with relative error at most `2⁻⁵³`, so at
 /// most `t·M·2⁻⁵³` with `M = max |x_ti·x_tj|`. The two differ by at most `t·(2⁻³³ + M·2⁻⁵³)`.
-fn naive_gram(x: &[i64], t: usize, w: usize) -> Vec<f64> {
+fn naive_syrk(x: &[i64], t: usize, w: usize) -> Vec<f64> {
     let mut g = vec![0.0f64; w * w];
     for i in 0..w {
         for j in 0..w {
@@ -161,7 +161,7 @@ fn naive_gram(x: &[i64], t: usize, w: usize) -> Vec<f64> {
     g
 }
 
-/// The derived bound of [`naive_gram`]: `t` terms, operands bounded by `m` in magnitude.
+/// The derived bound of [`naive_syrk`]: `t` terms, operands bounded by `m` in magnitude.
 fn tol(t: usize, m: f64) -> f64 {
     t as f64 * (2f64.powi(-33) + m * 2f64.powi(-53))
 }
@@ -174,8 +174,8 @@ fn close(a: &[f64], b: &[f64], tol: f64) {
     }
 }
 
-/// All four Grams of two finished layer lists are equal.
-fn layers_close(a: &[LayerGrams], b: &[LayerGrams], tol: f64) {
+/// All four SyrkAcc of two finished layer lists are equal.
+fn layers_close(a: &[LayerSyrk], b: &[LayerSyrk], tol: f64) {
     assert_eq!(a.len(), b.len());
     for (x, y) in a.iter().zip(b) {
         close(&x.qkv, &y.qkv, tol);
@@ -187,29 +187,29 @@ fn layers_close(a: &[LayerGrams], b: &[LayerGrams], tol: f64) {
 }
 
 #[test]
-fn gram_equals_independent_xtx() {
+fn syrk_equals_independent_xtx() {
     let c = cfg();
     let mut s = 11u64;
     let tape = two_layer_tape(&mut s, 3);
-    let mut g = Grams::new(&c).unwrap();
+    let mut g = SyrkAcc::new(&c).unwrap();
     g.accumulate(&tape, &c).unwrap();
     let fin = g.finish(Normalisation::Sum).unwrap();
     assert_eq!(fin.len(), L);
     for (fl, lt) in fin.iter().zip(&tape.layers) {
-        close(&fl.qkv, &naive_gram(&lt.ln1_out, 3, E), tol(3, 9.0));
-        close(&fl.o, &naive_gram(&lt.attn_out, 3, QW), tol(3, 9.0));
-        close(&fl.gate_up, &naive_gram(&lt.ln2_out, 3, E), tol(3, 9.0));
-        close(&fl.down, &naive_gram(&lt.m, 3, FF), tol(3, 9.0));
+        close(&fl.qkv, &naive_syrk(&lt.ln1_out, 3, E), tol(3, 9.0));
+        close(&fl.o, &naive_syrk(&lt.attn_out, 3, QW), tol(3, 9.0));
+        close(&fl.gate_up, &naive_syrk(&lt.ln2_out, 3, E), tol(3, 9.0));
+        close(&fl.down, &naive_syrk(&lt.m, 3, FF), tol(3, 9.0));
         assert_eq!(fl.tokens, 3);
     }
 }
 
 #[test]
-fn gram_is_symmetric_and_psd() {
+fn syrk_is_symmetric_and_psd() {
     let c = cfg();
     let mut s = 23u64;
     let tape = two_layer_tape(&mut s, 3);
-    let mut g = Grams::new(&c).unwrap();
+    let mut g = SyrkAcc::new(&c).unwrap();
     g.accumulate(&tape, &c).unwrap();
     let fin = g.finish(Normalisation::Sum).unwrap();
     for fl in &fin {
@@ -249,10 +249,10 @@ fn blocks_add_like_concatenated_rows() {
             .map(|l| slice_layer(&whole.layers[l], 2, 3))
             .collect(),
     );
-    let mut split = Grams::new(&c).unwrap();
+    let mut split = SyrkAcc::new(&c).unwrap();
     split.accumulate(&first, &c).unwrap();
     split.accumulate(&second, &c).unwrap();
-    let mut one = Grams::new(&c).unwrap();
+    let mut one = SyrkAcc::new(&c).unwrap();
     one.accumulate(&whole, &c).unwrap();
     let split_fin = split.finish(Normalisation::Sum).unwrap();
     let one_fin = one.finish(Normalisation::Sum).unwrap();
@@ -269,7 +269,7 @@ fn mean_divides_by_tokens_and_mean_diagonal_is_one() {
     let c = cfg();
     let mut s = 53u64;
     let tape = two_layer_tape(&mut s, 3);
-    let mut g = Grams::new(&c).unwrap();
+    let mut g = SyrkAcc::new(&c).unwrap();
     g.accumulate(&tape, &c).unwrap();
     let sum = g.finish(Normalisation::Sum).unwrap();
     let mean = g.finish(Normalisation::Mean).unwrap();
@@ -311,7 +311,7 @@ fn shape_refusals() {
     let mut s = 71u64;
 
     // A tape with fewer layers than the config.
-    let mut g = Grams::new(&c).unwrap();
+    let mut g = SyrkAcc::new(&c).unwrap();
     let short = tape_from(2, vec![one_layer(&mut s, 2)]);
     assert!(matches!(
         g.accumulate(&short, &c),
@@ -344,7 +344,7 @@ fn shape_refusals() {
     ));
 
     // The mean over no tokens is undefined.
-    let empty = Grams::new(&c).unwrap();
+    let empty = SyrkAcc::new(&c).unwrap();
     assert!(matches!(
         empty.finish(Normalisation::Mean),
         Err(CaptureError::Shape(_))
@@ -353,8 +353,8 @@ fn shape_refusals() {
     // A `q_out` that leaves `usize`, and a zero model dimension.
     let mut big = cfg();
     big.n_head = usize::MAX;
-    assert!(matches!(Grams::new(&big), Err(CaptureError::Overflow)));
+    assert!(matches!(SyrkAcc::new(&big), Err(CaptureError::Overflow)));
     let mut zero = cfg();
     zero.n_embd = 0;
-    assert!(matches!(Grams::new(&zero), Err(CaptureError::Shape(_))));
+    assert!(matches!(SyrkAcc::new(&zero), Err(CaptureError::Shape(_))));
 }

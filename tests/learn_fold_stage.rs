@@ -174,7 +174,7 @@ impl Ref {
         }
     }
 
-    /// `Σ XᵀX`, `Σ (Xw)ᵀ(Xw)`, the weighted cross-Grams and the unweighted sums, in `f64`.
+    /// `Σ XᵀX`, `Σ (Xw)ᵀ(Xw)`, the weighted cross-SyrkAcc and the unweighted sums, in `f64`.
     fn add_slab(&mut self, x: &[f64], w: &[f64], ys: &[&[f64]], y_ts: &[Option<&[f64]>]) {
         let rows = w.len();
         let n = self.n;
@@ -485,8 +485,8 @@ fn hm_w_applies_weights_linearly() {
             xs[t * n + i] *= w[t].sqrt();
         }
     }
-    let sqrt_gram = matmul(&transpose(&xs, rows, n), &xs, n, rows, n);
-    assert!(max_abs_diff(&words(&acc.hm_w), &sqrt_gram) > 1e-6);
+    let sqrt_syrk = matmul(&transpose(&xs, rows, n), &xs, n, rows, n);
+    assert!(max_abs_diff(&words(&acc.hm_w), &sqrt_syrk) > 1e-6);
 }
 
 // ---------------------------------------------------------------------------

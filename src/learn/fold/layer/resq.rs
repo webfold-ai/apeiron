@@ -8,12 +8,12 @@
 //!
 //! Every value is a Q32.32 `i64` word: [`ResqInputs`], [`ResqSolution`] and [`rescale_hier`]'s
 //! `rh`/`s` arguments included, so nothing here reads or writes an `f64`. Products are the pooled
-//! [`gemm_nt`]/[`gemm_nn`], Grams [`wsyrk`], the Hadamard [`hadamard_into`], `rhs = GoC·1`
+//! [`gemm_nt`]/[`gemm_nn`], SyrkAcc [`wsyrk`], the Hadamard [`hadamard_into`], `rhs = GoC·1`
 //! [`row_dot_fixed`], and the solve [`chol_solve`] with its exact `sqrt(A_ii)` Jacobi column
 //! scaling. An operand above `2³⁶` raw (`16` real) is scaled by one exact power of two and shifted
 //! back; no `f64` division, no `crate::learn::ridge`.
 //!
-//! `G` and `P_mat` are Grams, so `G ⊙ P_mat` is PSD (Schur product theorem) and `GoP + lam·I` is
+//! `G` and `P_mat` are SyrkAcc, so `G ⊙ P_mat` is PSD (Schur product theorem) and `GoP + lam·I` is
 //! positive-definite for `lam > 0`; a non-positive pivot is [`ResqError::NotPositiveDefinite`].
 //!
 //! A shape against the declared dims, a zero `inter`/`n`/`hidden`, and any checked integer leaving
@@ -476,7 +476,7 @@ mod call_site_k5 {
         unfix(&c.map_err(|_| ResqError::Overflow)?, ka + kb)
     }
 
-    fn port_gram(x: &[i64], o: usize, n: usize, limbs: u32) -> Result<Vec<i64>, ResqError> {
+    fn port_syrk(x: &[i64], o: usize, n: usize, limbs: u32) -> Result<Vec<i64>, ResqError> {
         let (xs, k) = fit(x)?;
         let xt = transpose(&xs, o, n);
         let prepared = prepare(&xt, n, o, limbs).map_err(|_| ResqError::Overflow)?;
@@ -577,7 +577,7 @@ mod call_site_k5 {
             inputs.wq_g,
             inputs.wq_u,
         );
-        let g = port_gram(down, hidden, inter, limbs)?;
+        let g = port_syrk(down, hidden, inter, limbs)?;
         let mut p_mat = vec![0_i64; inter2];
         let mut c_mat = vec![0_i64; inter2];
         for slab in inputs.x_slabs {

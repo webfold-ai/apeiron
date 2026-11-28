@@ -11,5 +11,5 @@ pub mod fit;
 pub mod layer;
 /// Run glue: the `Q32.32` engine weights below the `f64` fold driver, in both directions.
 pub mod run;
-/// Statistics: activation Grams, held-out KL, layer-wise intensity and the exact byte budget.
+/// Statistics: activation SyrkAcc, held-out KL, layer-wise intensity and the exact byte budget.
 pub mod stats;

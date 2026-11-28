@@ -11,7 +11,7 @@
 //! Limitation, stated exactly: the two-block table is a hand-built sequence of per-block conditional
 //! tables fed to the real helpers, not the full `e8_joint_icm_2plane` trajectory — driving that
 //! entry to a *cross-block* local minimum needs an `o × n` payload, the in-block codebook geometry
-//! and the three Hadamard Grams arranged so the coupling has that minimum, which this test does not
+//! and the three Hadamard SyrkAcc arranged so the coupling has that minimum, which this test does not
 //! construct. The annealed entry's own run here is a wiring check (it returns valid planes), not a
 //! claim about a fitted model.
 //!

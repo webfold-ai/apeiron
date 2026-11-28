@@ -4,7 +4,7 @@
 //! Positive tests on small Gaussian matrices (rank formula against the bit budget, the export's
 //! dense form, the wide-matrix transpose path, loss falling with the iteration count), and one
 //! ignored stage that fits the teacher's linears of `Qwen3.5-0.8B` under the cached calibration
-//! Grams and writes `l{l}.{kind}-nq{tag}.i64` for `learn_gate_code`'s `gate_code_kl`.
+//! SyrkAcc and writes `l{l}.{kind}-nq{tag}.i64` for `learn_gate_code`'s `gate_code_kl`.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -30,10 +30,10 @@ use apeiron::learn::nanoquant::{
 use apeiron::learn::solve::q32::{from_grid, to_grid, GRID_BOUND};
 
 /// The teacher image: `Qwen3.5-0.8B` binary16. Overridable by `APEIRON_NQ_MODEL`, so a second
-/// model (`Qwen3-0.6B-Base`, 28 layers) fits against its own Grams without editing this default.
+/// model (`Qwen3-0.6B-Base`, 28 layers) fits against its own SyrkAcc without editing this default.
 const MODEL_DEFAULT: &str = "~/kld08/qwen08b-f16.gguf";
-/// Where the calibration Grams, the factors and the fitted words are cached. Overridable by
-/// `APEIRON_NQ_CACHE`; the producer is `learn_gate_code`'s `grams_cached`, whose directory is its
+/// Where the calibration SyrkAcc, the factors and the fitted words are cached. Overridable by
+/// `APEIRON_NQ_CACHE`; the producer is `learn_gate_code`'s `syrks_cached`, whose directory is its
 /// own `CACHE` const, so a cache for a second model is those `g{l}.{tag}.*` files copied under
 /// the tag it wrote.
 const CACHE_DEFAULT: &str = "~/kld08/gatecode-tok";
@@ -65,9 +65,9 @@ fn factor_tag() -> String {
 }
 
 /// The calibration Gram tag in the cache, `APEIRON_NQ_GRAM_TAG` (default `c6x29`): the
-/// `calib`/`extra` pair `learn_gate_code`'s `grams_cached` writes as `g{l}.c{calib}x{extra}.*.i64`.
+/// `calib`/`extra` pair `learn_gate_code`'s `syrks_cached` writes as `g{l}.c{calib}x{extra}.*.i64`.
 /// Board : the model, cache and tag knobs let a second model be fitted.
-fn gram_tag() -> String {
+fn syrk_tag() -> String {
     std::env::var("APEIRON_NQ_GRAM_TAG").unwrap_or_else(|_| String::from("c6x29"))
 }
 
@@ -246,7 +246,7 @@ fn latents_carry_the_signs_and_tune_lowers_the_h_energy() {
 /// keeps the column inside the block-exponent range. The coordinate is dead, so it carries no
 /// weight in `tr(EHEᵀ)`.
 #[test]
-fn dead_gram_coordinate_does_not_refuse() {
+fn dead_syrk_coordinate_does_not_refuse() {
     let (o, n, r) = (96, 64, 32);
     let w = words(&gauss(o * n, 7, 0.05));
     let h = gram(n, 256, 5);
@@ -684,7 +684,7 @@ fn cmp_line(
 #[test]
 #[ignore = "opens the teacher and runs the ADMM per tensor; run explicitly"]
 fn nq_fit() {
-    let (model, cache, gtag) = (model_path(), cache_dir(), gram_tag());
+    let (model, cache, gtag) = (model_path(), cache_dir(), syrk_tag());
     let engine = Engine::open(&model).expect("open teacher");
     let cfg = Config::from_engine(&engine).expect("config");
     std::fs::create_dir_all(&cache).expect("cache dir");
@@ -827,7 +827,7 @@ fn nq_fit() {
 #[test]
 #[ignore = "opens the teacher and sketches the cached Gram; run explicitly"]
 fn nq_sketch_share() {
-    let (cache, gtag) = (cache_dir(), gram_tag());
+    let (cache, gtag) = (cache_dir(), syrk_tag());
     let engine = Engine::open(&model_path()).expect("open teacher");
     let cfg = Config::from_engine(&engine).expect("config");
     let l = env_usize("APEIRON_NQ_LAYERS", 23);
